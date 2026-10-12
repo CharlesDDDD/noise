@@ -1,0 +1,23 @@
+[project]
+name = "noise"
+version = "0.1.0"
+description = "Pretraining speedrun for zeroth-order methods: a fixed model and dataset, no backpropagation."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch==2.10.0",
+    "numpy",
+    "tokenizers==0.23.1",
+    "datasets==4.8.4",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
