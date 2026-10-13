@@ -51,7 +51,6 @@ and `val.pt` of the [Dust repo](https://github.com/qlabs-eng/dust). Both are che
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 train/val/run.py         # track 1
-uv run torchrun --standalone --nproc_per_node=8 train/val/anvil.py
 uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py    # track 2
 uv run torchrun --standalone --nproc_per_node=8 train/val/eggroll.py
 ```
@@ -63,18 +62,18 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 
 ### Track 1: validation loss
 
-| # | Val loss | Description | Time | Script |
+| # | Val loss | Description | Time | Contributors |
 | - | - | - | - | - |
-| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5.33 h | [`train/val/eggroll.py`](train/val/eggroll.py) |
-| 2 | 5.058 | Dust w/ SGD, 16k population | 1.32 h | [`dust.py`](https://github.com/qlabs-eng/dust/blob/main/dust.py) |
-| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | [`train/val/run.py`](train/val/run.py) |
-| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere, 24k population, lr cooldown | 1.78 h | [`train/val/anvil.py`](train/val/anvil.py) |
+| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5.33 h | - |
+| 2 | 5.058 | Dust w/ SGD, 16k population | 1.32 h | - |
+| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
+| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere, 24k population, lr cooldown | 1.78 h | [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ### Track 2: speedrun to 4.2
 
-| # | Val loss | Description | Time | Script |
+| # | Val loss | Description | Time | Contributors |
 | - | - | - | - | - |
-| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | [`train/speedrun/run.py`](train/speedrun/run.py) |
+| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
 
 ## What backprop gets
 
@@ -89,8 +88,9 @@ The goal is to beat backprop by a large margin.
 
 ## Submitting
 
-Open a PR that adds the new single-file training script to its track's folder in [`train/`](train/), with its
-log. A record must beat the current one in its track under the rules above; the training script is the record.
+Open a PR that changes its track's training script in place, [`train/val/run.py`](train/val/run.py) or
+[`train/speedrun/run.py`](train/speedrun/run.py), with the run's log (`config.json`, `metrics.jsonl` and `result.json` from `logs/`) in the `log/` folder next to it. A record must beat the current one
+in its track under the rules above; the training script is the record.
 
 ## Citation
 
