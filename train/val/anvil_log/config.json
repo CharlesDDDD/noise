@@ -1,0 +1,60 @@
+{
+  "script": "/home/dev/noise/train/val/anvil.py",
+  "world": 8,
+  "batch": 8,
+  "steps": 610,
+  "seed": 0,
+  "recipe": {
+    "writers": [
+      384,
+      384,
+      384,
+      384,
+      384,
+      384,
+      384,
+      384
+    ],
+    "hidden": [
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768
+    ],
+    "hubs": [
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768
+    ],
+    "embedding": 3072,
+    "head": 73728,
+    "local": {
+      "q": 576,
+      "v": 576,
+      "gate": 192,
+      "k": 2496,
+      "ve": 6912
+    },
+    "nrep": 16,
+    "lr": 0.0015,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "gamma": 0.98,
+    "first_gamma": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25
+  },
+  "torch_version": "2.10.0+cu128"
+}
