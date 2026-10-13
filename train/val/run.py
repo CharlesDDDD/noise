@@ -194,7 +194,12 @@ class DUST:
                 sites = {key: jitter.get(site.format(i)) for key, site in SITES.items()} if i == entry else {}
                 x = block_forward(x, self.weights[i], None if ve is None else ve.repeat(n, 1, 1), cos, sin,
                                   model.window_sizes[i][0], **sites)
-            loss = head_loss(x, model.lm_head.weight, self.y.repeat(n, 1), model.config.vocab_size)
+            # The final norm, head and loss in float32. A draw moves a token's loss by about 1e-2, while bfloat16
+            # logits (soft-capped at 15) round by up to about 6e-2, differently in every draw: in the deeper blocks
+            # the rounding was most of the reward's variance. The clean loss's own rounding is common to all draws.
+            with torch.autocast(self.device.type, enabled=False):
+                weight = model.lm_head.weight.float()
+                loss = head_loss(x.float(), weight, self.y.repeat(n, 1), model.config.vocab_size)
         return loss.view(n, self.batch, length)
 
     def direct_errors(self, sites, draws, sigma, entry=None, gamma=0.0):

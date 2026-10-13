@@ -1,5 +1,5 @@
 {
-  "script": "/home/dev/noise/train/val/anvil.py",
+  "script": "/workspace/train/val/anvil.py",
   "world": 8,
   "batch": 8,
   "steps": 610,
