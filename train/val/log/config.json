@@ -1,5 +1,5 @@
 {
-  "script": "/workspace/train/val/anvil.py",
+  "script": "/workspace/noise/train/val/run.py",
   "world": 8,
   "batch": 8,
   "steps": 610,
@@ -36,7 +36,6 @@
       768
     ],
     "embedding": 3072,
-    "head": 73728,
     "local": {
       "q": 576,
       "v": 576,
@@ -45,7 +44,7 @@
       "ve": 6912
     },
     "nrep": 16,
-    "lr": 0.0015,
+    "lr": 0.003,
     "betas": [
       0.7,
       0.95
