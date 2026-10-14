@@ -202,22 +202,20 @@ class DUST:
         return torch.randint(0, 2, shape, device=self.device, generator=generator).to(self.dtype) * 2 - 1
 
     def orthogonal_noise(self, site, draws, chunk, n, b, t, d, dtype=None):
-        """Draws start..start + n of this step's world * draws at `site`. At each token, draw i is row
-        (offset + i) mod d of the Hadamard matrix under the token's sign pattern for cycle i // d (the same on
-        every GPU, so the GPUs' draws are orthogonal to each other too; a fresh pattern every d draws), flipped by
-        the draw's own sign so that distinct draws are uncorrelated and the chunk centering shrinks the estimate
-        uniformly, as with Gaussian draws. E[a a^T] = I."""
-        if site not in self.frames:  # this step's row offsets per token and sign patterns per cycle
-            self.frames[site] = torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator), {}
-        offset, patterns = self.frames[site]
-        start = self.rank * draws + chunk * n
-        index = torch.arange(start, start + n, device=self.device)
-        for cycle in range(start // d, (start + n - 1) // d + 1):
-            if cycle not in patterns:  # every GPU draws the same patterns, in the same order
-                patterns[cycle] = self.signs(b, t, d, shared=True)
-        signs = torch.stack([patterns[c] for c in (index // d).tolist()])  # (n, b, t, d)
-        rows = (offset.unsqueeze(0) + index[:, None, None]) % d
-        a = hadamard(d, self.device, self.dtype)[rows] * signs * self.signs(n, b, t, 1)
+        """Draws start..start + n of this step's world * draws at `site`. Draw i at a token is row (offset + i)
+        mod d of the Hadamard matrix under the sign pattern of cycle i // d: the patterns (one per cycle of d
+        draws, drawn up front in the same order on every GPU) and the tokens' row offsets are shared by the
+        GPUs, so a token's draws are orthogonal across chunks and GPUs within each cycle, and the independent
+        offsets leave the tokens' errors uncorrelated. Each draw's own sign flip keeps distinct draws
+        uncorrelated, so the chunk centering shrinks the estimate uniformly, as with Gaussian draws. E[a a^T] = I."""
+        if site not in self.frames:  # this step's frame at the site
+            cycles = -(-self.world * draws // d)
+            self.frames[site] = (self.signs(cycles, d, shared=True),
+                                 torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator))
+        patterns, offset = self.frames[site]
+        index = self.rank * draws + chunk * n + torch.arange(n, device=self.device)
+        rows = (offset.unsqueeze(0) + index[:, None, None]) % d  # (n, b, t)
+        a = hadamard(d, self.device, self.dtype)[rows] * patterns[index // d][:, None, None, :] * self.signs(n, b, t, 1)
         return a if dtype in (None, self.dtype) else a.to(dtype)
 
     def losses(self, x, y):
