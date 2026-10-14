@@ -1,6 +1,6 @@
 {
-  "val_loss": 4.03530289145077,
-  "train_seconds": 6233.94,
+  "val_loss": 3.9830297967966866,
+  "train_seconds": 9388.65,
   "steps": 610,
   "tokens": 9994240
 }
