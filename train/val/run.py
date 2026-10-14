@@ -5,8 +5,7 @@ Three changes to Dust's estimator (the optimizer is the ANVIL II record's; its A
   a token's loss depends on its own logits alone, so all of them are probed at once on the cached logits, with
   no draws and no sampling variance.
 - Orthogonal draws: a token's draws over the step are rows of a sign-flipped Hadamard matrix, orthogonal across
-  chunks and GPUs, so K draws recover K directions of the credit exactly. Sites with more draws than
-  coordinates (k, ve, the token embedding) are cut to one sweep of their 512 coordinates.
+  chunks and GPUs, so K draws recover K directions of the credit exactly.
 - The MLP hidden layer is jittered only at live units (pre-activation > 0): a dead unit's credit is zero.
 
 Launch: torchrun --standalone --nproc_per_node=8 train/val/run.py
@@ -53,13 +52,12 @@ class Recipe:
 
 
 def recipe(scale):
-    """The tuned 16k Adam cell, with every draw count scaled; k, ve and the token embedding are capped at one
-    sweep of their 512 coordinates, which orthogonal draws recover exactly."""
+    """The tuned 16k Adam cell, with every draw count scaled."""
     count = lambda k: max(64, round(k * scale / 64) * 64)
     return Recipe(
         writers=[count(256)] * 8, hidden=[count(512)] * 8, hubs=[count(512)] * 8,
-        embedding=min(count(2048), 512),
-        local=dict(q=count(384), v=count(384), gate=count(128), k=min(count(1664), 512), ve=min(count(4608), 512)),
+        embedding=count(2048),
+        local=dict(q=count(384), v=count(384), gate=count(128), k=count(1664), ve=count(4608)),
         nrep=16, lr=0.003, warmdown=0.3,
     )
 
