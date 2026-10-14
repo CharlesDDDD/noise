@@ -111,15 +111,21 @@ def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=No
 
 @torch.compile
 def coordinate_differences(raw, y, sigma):
-    """Central differences of each token's soft-capped cross-entropy along each of its own raw logits, over
-    2 sigma: with p = softmax(z), moving logit j to z_j' changes log Z by log1p(p_j (exp(z_j' - z_j) - 1)), and
-    the target logit's own term by -(z_y' - z_y). Zero at ignored tokens (y < 0)."""
+    """Finite differences of each token's loss along each of its own logits: for every token and every logit j,
+    the loss with raw logit j moved up by sigma minus the loss with it moved down by sigma, over 2 sigma.
+
+    Each of the two is a full forward evaluation of the soft-capped cross-entropy at the moved logit, written in
+    closed form: moving one logit changes the partition function Z = sum_k exp(z_k) by one term, so the moved
+    loss differs from the clean loss by log(Z - exp(z_j) + exp(z_j')) - log Z = log1p(exp(z_j) / Z * expm1(z_j' - z_j))
+    in the partition and by -(z_j' - z_j) at the target logit. Nothing is differentiated: exp(z_j) / Z are the
+    clean forward's probabilities, used only to evaluate the perturbed losses. Zero at ignored tokens (y < 0)."""
     cap = lambda v: 15 * torch.tanh(v / 15)
     z, up, down = cap(raw.float()), cap(raw.float() + sigma), cap(raw.float() - sigma)
-    p = torch.softmax(z, -1)
-    change = torch.log1p(p * torch.expm1(up - z)) - torch.log1p(p * torch.expm1(down - z))
+    weight = torch.softmax(z, -1)  # exp(z_j) / Z of the clean forward
+    moved_loss = lambda new: torch.log1p(weight * torch.expm1(new - z))  # loss(z_j -> new) - loss(z), partition
+    change = moved_loss(up) - moved_loss(down)
     target = y.clamp(min=0).unsqueeze(-1)
-    change = change.scatter_add(-1, target, -(up - down).gather(-1, target))
+    change = change.scatter_add(-1, target, -(up - down).gather(-1, target))  # the target logit's own term
     return change / (2 * sigma) * (y >= 0).unsqueeze(-1)
 
 
