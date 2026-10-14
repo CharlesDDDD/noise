@@ -1,5 +1,13 @@
 """Track 1: Dust with ANVIL II on the block matrices and Adam elsewhere, without backpropagation.
 
+Three changes to Dust's estimator (the optimizer is the ANVIL II record's; its Adam rate is doubled):
+- The head's output error by central differences along every logit of every token (coordinate_differences):
+  a token's loss depends on its own logits alone, so all of them are probed at once on the cached logits, with
+  no draws and no sampling variance.
+- Orthogonal draws: a token's draws over the step are rows of a sign-flipped Hadamard matrix, orthogonal across
+  chunks and GPUs, so K draws recover K directions of the credit exactly.
+- The MLP hidden layer is jittered only at live units (pre-activation > 0): a dead unit's credit is zero.
+
 Launch: torchrun --standalone --nproc_per_node=8 train/val/run.py
 """
 import argparse
@@ -32,7 +40,6 @@ class Recipe:
     hidden: list[int]       # mlp.c_fc
     hubs: list[int]         # attention output
     embedding: int
-    head: int
     local: dict[str, int]   # attention internals
     nrep: int               # draws per batched forward
     lr: float               # Adam; embeddings 300x, mixing scalars 30x
@@ -49,9 +56,9 @@ def recipe(scale):
     count = lambda k: max(64, round(k * scale / 64) * 64)
     return Recipe(
         writers=[count(256)] * 8, hidden=[count(512)] * 8, hubs=[count(512)] * 8,
-        embedding=count(2048), head=max(2048, round(49152 * scale / 2048) * 2048),
+        embedding=count(2048),
         local=dict(q=count(384), v=count(384), gate=count(128), k=count(1664), ve=count(4608)),
-        nrep=16, lr=0.0015, warmdown=0.3,
+        nrep=16, lr=0.003, warmdown=0.3,
     )
 
 
@@ -102,6 +109,41 @@ def block_forward(x, w, ve, cos, sin, window, o=None, attn=None, fc=None, mlp=No
     return x + add(F.linear(F.relu(hidden).square(), w['out']), mlp)
 
 
+@torch.compile
+def coordinate_differences(raw, y, sigma):
+    """Finite differences of each token's loss along each of its own logits: for every token and every logit j,
+    the loss with raw logit j moved up by sigma minus the loss with it moved down by sigma, over 2 sigma.
+
+    Each of the two is a full forward evaluation of the soft-capped cross-entropy at the moved logit, written in
+    closed form: moving one logit changes the partition function Z = sum_k exp(z_k) by one term, so the moved
+    loss differs from the clean loss by log(Z - exp(z_j) + exp(z_j')) - log Z = log1p(exp(z_j) / Z * expm1(z_j' - z_j))
+    in the partition and by -(z_j' - z_j) at the target logit. Nothing is differentiated: exp(z_j) / Z are the
+    clean forward's probabilities, used only to evaluate the perturbed losses. Zero at ignored tokens (y < 0)."""
+    cap = lambda v: 15 * torch.tanh(v / 15)
+    z, up, down = cap(raw.float()), cap(raw.float() + sigma), cap(raw.float() - sigma)
+    weight = torch.softmax(z, -1)  # exp(z_j) / Z of the clean forward
+    moved_loss = lambda new: torch.log1p(weight * torch.expm1(new - z))  # loss(z_j -> new) - loss(z), partition
+    change = moved_loss(up) - moved_loss(down)
+    target = y.clamp(min=0).unsqueeze(-1)
+    change = change.scatter_add(-1, target, -(up - down).gather(-1, target))  # the target logit's own term
+    return change / (2 * sigma) * (y >= 0).unsqueeze(-1)
+
+
+HADAMARDS = {}
+
+
+def hadamard(d, device, dtype):
+    """The Sylvester Hadamard matrix of order d (a power of two), entries +-1, built once per process."""
+    if (d, device, dtype) not in HADAMARDS:
+        if d & (d - 1):
+            raise ValueError(f'Orthogonal draws need a power-of-two width, not {d}.')
+        H = torch.ones(1, 1, device=device)
+        while H.shape[0] < d:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        HADAMARDS[d, device, dtype] = H.to(dtype)  # +-1 is exact in bfloat16
+    return HADAMARDS[d, device, dtype]
+
+
 def average_ranks(tensor):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
@@ -113,10 +155,12 @@ class DUST:
     """Forward-only gradient estimator: caches activations, then reruns from the jittered block."""
 
     def __init__(self, model, recipe, seed=0, rank=0, world=1):
-        self.model, self.recipe, self.world = model, recipe, world
+        self.model, self.recipe, self.world, self.rank = model, recipe, world, rank
         self.device = next(model.parameters()).device
         self.dtype = torch.bfloat16 if self.device.type == 'cuda' else torch.float32
         self.generator = torch.Generator(self.device).manual_seed(seed + 3 + 7777 * rank)
+        self.shared_generator = torch.Generator(self.device).manual_seed(seed + 5)  # the same on every GPU
+        self.frames = {}
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
         self.inputs, self.outputs, self.blocks = {}, {}, {}
         self.weights = [dict(q=b.attn.c_q.weight, k=b.attn.c_k.weight, v=b.attn.c_v.weight,
@@ -125,13 +169,9 @@ class DUST:
                         for b in model.transformer.h]
         self.capturing = False
 
-        counts = recipe.writers + recipe.hidden + recipe.hubs + [recipe.embedding, recipe.head]
-        counts += list(recipe.local.values())
+        counts = recipe.writers + recipe.hidden + recipe.hubs + [recipe.embedding] + list(recipe.local.values())
         if any(k % world for k in counts) or 8 % world:
             raise ValueError('Every draw count must split evenly across the GPUs.')
-        head, slabs = recipe.head // world, model.config.vocab_size // 256
-        if head // chunk_size(head, recipe.nrep) % slabs:
-            raise ValueError('Head draws must visit each 256-column slab equally on every GPU.')
 
         self.hooks = [m.register_forward_hook(self.output_hook(n)) for n, m in self.modules.items()]
         for layer, block in enumerate(model.transformer.h):
@@ -162,6 +202,28 @@ class DUST:
     def noise(self, *shape, dtype=None):
         return torch.randn(*shape, device=self.device, dtype=dtype or self.dtype, generator=self.generator)
 
+    def signs(self, *shape, shared=False):
+        """Random +-1 in the draw dtype, from the GPU's own generator or the one shared by all GPUs."""
+        generator = self.shared_generator if shared else self.generator
+        return torch.randint(0, 2, shape, device=self.device, generator=generator).to(self.dtype) * 2 - 1
+
+    def orthogonal_noise(self, site, draws, chunk, n, b, t, d, dtype=None):
+        """Draws start..start + n of this step's world * draws at `site`. Draw i at a token is row (offset + i)
+        mod d of the Hadamard matrix under the sign pattern of cycle i // d: the patterns (one per cycle of d
+        draws, drawn up front in the same order on every GPU) and the tokens' row offsets are shared by the
+        GPUs, so a token's draws are orthogonal across chunks and GPUs within each cycle, and the independent
+        offsets leave the tokens' errors uncorrelated. Each draw's own sign flip keeps distinct draws
+        uncorrelated, so the chunk centering shrinks the estimate uniformly, as with Gaussian draws. E[a a^T] = I."""
+        if site not in self.frames:  # this step's frame at the site
+            cycles = -(-self.world * draws // d)
+            self.frames[site] = (self.signs(cycles, d, shared=True),
+                                 torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator))
+        patterns, offset = self.frames[site]
+        index = self.rank * draws + chunk * n + torch.arange(n, device=self.device)
+        rows = (offset.unsqueeze(0) + index[:, None, None]) % d  # (n, b, t)
+        a = hadamard(d, self.device, self.dtype)[rows] * patterns[index // d][:, None, None, :] * self.signs(n, b, t, 1)
+        return a if dtype in (None, self.dtype) else a.to(dtype)
+
     def losses(self, x, y):
         with self.autocast():
             return self.model(x, y, loss_reduction='none').view_as(y).float()
@@ -169,6 +231,7 @@ class DUST:
     def capture(self, x, y):
         self.x, self.y = x, y
         self.batch, self.length = x.shape
+        self.frames.clear()  # this step's draw frames
         self.capturing = True
         try:
             self.clean_loss = self.losses(x, y)
@@ -204,12 +267,17 @@ class DUST:
 
     def direct_errors(self, sites, draws, sigma, entry=None, gamma=0.0):
         """Output errors from one-sided loss drops, centered per chunk."""
-        n = chunk_size(draws, self.recipe.nrep)
+        n, b, t = chunk_size(draws, self.recipe.nrep), self.batch, self.length
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
-        errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
+        errors = {s: torch.zeros(b, t, width(s), device=self.device) for s in sites}
+        # the MLP hidden layer is jittered only at live units: a dead unit's credit is zero (the ReLU is flat),
+        # so its share of the jitter would only add noise to the estimate at that unit
+        live = {s: (self.outputs[s] > 0).to(self.dtype) for s in sites if s.endswith('mlp.c_fc')}
 
-        for _ in range(draws // n):
-            noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
+        for chunk in range(draws // n):
+            noise = {s: self.orthogonal_noise(s, draws, chunk, n, b, t, width(s)).flatten(0, 1) for s in sites}
+            for s, mask in live.items():
+                noise[s] = (noise[s].view(n, b, t, -1) * mask).flatten(0, 1)
             perturbed_loss = self.rerun(n, entry, {s: sigma * a for s, a in noise.items()})
 
             reward = self.clean_loss.unsqueeze(0) - perturbed_loss
@@ -225,44 +293,16 @@ class DUST:
 
         return {s: error / draws for s, error in errors.items()}
 
-    def head_error(self, draws, sigma=0.1):
-        """Head error by jittering one 256-column logit slab at a time."""
-        n, b, t = chunk_size(draws, self.recipe.nrep), self.batch, self.length
-        raw = self.outputs['lm_head']
-        vocab, slab = self.model.config.vocab_size, 256
-        slabs = vocab // slab
-        logits = 15 * torch.tanh(raw[..., :vocab].float() / 15)
-        slab_sums = logits.exp().view(b, t, slabs, slab).sum(-1)
-        total = slab_sums.sum(-1)
-        target = self.y.clamp(min=0)
-        clean_target = logits.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-        target = target.repeat(n, 1)
-        error = torch.zeros_like(raw, dtype=torch.float32)
+    def head_error(self, sigma=0.1):
+        """The head's output error by a central difference of every token's loss along each of its own logits.
 
-        for chunk in range(draws // n):
-            block = chunk % slabs
-            lo = block * slab
-            a = self.noise(n * b, t, slab)
-            changed = raw[..., lo:lo + slab].float().repeat(n, 1, 1) + sigma * a.float()
-            changed = 15 * torch.tanh(changed / 15)
-            partition = (total - slab_sums[..., block]).repeat(n, 1) + changed.exp().sum(-1)
-            in_slab = (target >= lo) & (target < lo + slab)
-            target_logit = torch.where(
-                in_slab,
-                changed.gather(
-                    -1, (target - lo).clamp(0, slab - 1).unsqueeze(-1),
-                ).squeeze(-1),
-                clean_target.repeat(n, 1),
-            )
-            loss = (partition.log() - target_logit).view(n, b, t)
-            reward = torch.where(self.y.unsqueeze(0) != -1, self.clean_loss.unsqueeze(0) - loss, 0)
-            if b > 1:
-                reward = reward - reward.mean(1, keepdim=True)
-            error[..., lo:lo + slab] -= torch.einsum(
-                'nbt,nbtd->btd', (reward / sigma).to(self.dtype), a.view(n, b, t, slab),
-            ).float()
-
-        return error / (draws // slabs)
+        A token's loss depends on its own logits alone, and moving one raw logit changes the partition function
+        by one term, so every coordinate of every token is probed at once, elementwise on the cached logits:
+        no draws and no sampling variance, only the O(sigma^2) error of the difference.
+        """
+        raw = self.outputs['lm_head'][..., :self.model.config.vocab_size]
+        error = coordinate_differences(raw, self.y, sigma)
+        return F.pad(error, (0, self.outputs['lm_head'].shape[-1] - raw.shape[-1]))
 
     def local_errors(self, kind, draws, targets, sigma=0.1):
         """Attention-internal errors, scored against the attention-output targets."""
@@ -300,9 +340,9 @@ class DUST:
             credit = ((lag >= 0) & (lag <= window)).float() * self.recipe.gamma ** lag.clamp(min=0)
             clean[i] = q, k, z, ve, qp, kp, values, baseline, credit
 
-        for _ in range(draws // n):
+        for chunk in range(draws // n):
             for i in layers:
-                a = self.noise(n, b, t, width, dtype=torch.float32)
+                a = self.orthogonal_noise(sites[i], draws, chunk, n, b, t, width, dtype=torch.float32)
                 q, k, z, ve, qp, kp, values, baseline, credit = clean[i]
                 window = self.model.window_sizes[i][0]
                 divisor = sigma
@@ -395,7 +435,7 @@ class DUST:
             error = self.direct_errors([site], r.hubs[layer] // world, sigma, layer, gamma)[site]
             targets[layer] = average_ranks(error)
 
-        gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
+        gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error())
         for kind, count in r.local.items():
             for site, error in self.local_errors(kind, count // world, targets).items():
                 gradients[site + '.weight'] = self.reassemble(site, error)

@@ -69,6 +69,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
 | 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1.78 h | [@Lazarus-931](https://github.com/Lazarus-931) |
 | 5 | 4.082 | FP32 head in the direct draws reruns | 1.82 h | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1.73 h | [@JaydenTeoh](https://github.com/JaydenTeoh) |
 
 ### Track 2: speedrun to 4.2
 
