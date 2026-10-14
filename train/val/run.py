@@ -7,6 +7,11 @@ Three changes to Dust's estimator (the optimizer is the ANVIL II record's; its A
 - Orthogonal draws: a token's draws over the step are rows of a sign-flipped Hadamard matrix, orthogonal across
   chunks and GPUs, so K draws recover K directions of the credit exactly.
 - The MLP hidden layer is jittered only at live units (pre-activation > 0): a dead unit's credit is zero.
+- An associative memory of credit: each direct site and attention output keeps a ridge regression M from the
+  head's output error at a token (the realized error, which the coordinate head gives exactly) to the site's
+  own output error, fitted on past steps' estimates. Its prediction mu = alpha M c is a control variate: the
+  draws estimate only delta - mu (the predicted part of each reward is subtracted) and mu is added back, so the
+  estimate keeps Dust's expectation for any mu while its variance falls by what the memory predicts.
 
 Launch: torchrun --standalone --nproc_per_node=8 train/val/run.py
 """
@@ -49,6 +54,9 @@ class Recipe:
     first_gamma: float = 0.3  # reward-to-go decay for block 0
     anvil_lr: float = 0.023
     anvil_wd: float = 2.25
+    memory_beta: float = 0.9  # decay of the memory's running sums of estimates and of the key covariance
+    mesa_ridge: float = 0.1   # ridge of the memory's read-out, in units of the key covariance's mean variance
+    alpha_beta: float = 0.8   # running average over steps of the prior's scale fit
 
 
 def recipe(scale):
@@ -168,6 +176,11 @@ class DUST:
                              proj=b.attn.c_proj.weight, fc=b.mlp.c_fc.weight, out=b.mlp.c_proj.weight)
                         for b in model.transformer.h]
         self.capturing = False
+        # The credit memory: per site its running sums S (estimates x keys) and the prior's scale alpha with its
+        # fit statistics; the key covariance P, shared by every site since the key is the head's error at a token.
+        self.memory, self.alpha, self.fits, self.calibration, self.estimates, self.shared = {}, {}, {}, {}, {}, {}
+        self.prior_sites = [n for n in self.modules if n.endswith(('attn.c_proj', 'mlp.c_proj', 'mlp.c_fc'))]
+        self.prior_sites += ['transformer.wte'] + [f'o@{layer}' for layer in range(model.config.n_layer)]
 
         counts = recipe.writers + recipe.hidden + recipe.hubs + [recipe.embedding] + list(recipe.local.values())
         if any(k % world for k in counts) or 8 % world:
@@ -265,14 +278,71 @@ class DUST:
                 loss = head_loss(x.float(), weight, self.y.repeat(n, 1), model.config.vocab_size)
         return loss.view(n, self.batch, length)
 
-    def direct_errors(self, sites, draws, sigma, entry=None, gamma=0.0):
-        """Output errors from one-sided loss drops, centered per chunk."""
+    def memory_matrix(self, site):
+        """The site's memory M = S (P + ridge)^-1, the ridge regression of past estimates on past keys; None
+        before any write. One Cholesky factorization per step serves every site, since P is shared."""
+        memory = self.memory.get(site)
+        if memory is None:
+            return None
+        P = self.shared['P']
+        ridge = self.recipe.mesa_ridge * P.diagonal().mean()
+        if self.shared.get('chol_of') is not P:
+            self.shared['chol'] = torch.linalg.cholesky(P + ridge * torch.eye(len(P), device=P.device))
+            self.shared['chol_of'] = P
+        return torch.cholesky_solve(memory['S'].T, self.shared['chol']).T
+
+    def retrieve(self, sites):
+        """Each site's retrieval M c from the memory as it stood before this step's estimates, c the head's
+        output error at each token (zero where the target is ignored)."""
+        retrieved = {}
+        for site in sites:
+            m = self.memory_matrix(site)
+            if m is not None:
+                retrieved[site] = F.linear(self.head_credit, m.float())
+        return retrieved
+
+    def remember(self, valid_tokens):
+        """Write this step's GPU-averaged estimates into each site's memory: S = EMA(sum_t delta_t c_t^T / tokens),
+        and once per step P = EMA(sum_t c_t c_t^T / tokens), the keys' covariance."""
+        r, c = self.recipe, self.head_credit
+        C = average_ranks(c.flatten(0, 1).T @ c.flatten(0, 1)) / valid_tokens
+        self.shared['P'] = r.memory_beta * self.shared.get('P', torch.zeros_like(C)) + (1 - r.memory_beta) * C
+        for site in self.prior_sites:
+            G = average_ranks(torch.einsum('btd,btk->dk', self.estimates[site], c)) / valid_tokens
+            memory = self.memory.setdefault(site, {})
+            memory['S'] = r.memory_beta * memory.get('S', torch.zeros_like(G)) + (1 - r.memory_beta) * G
+
+    def calibrate(self):
+        """Average the fits over GPUs and set each site's alpha for the next step: alpha = <r, estimate> / |r|^2,
+        with the estimate undone of centering's 1 - 1/n shrinkage, is unbiased for the variance-optimal scale,
+        since the estimate's noise is independent of the retrieval r; numerator and denominator are averaged
+        over steps (alpha_beta) separately."""
+        sites = list(self.fits)
+        if not sites:
+            return
+        fits = average_ranks(torch.stack([self.fits[s] for s in sites])).tolist()
+        for site, (dot, retrieved) in zip(sites, fits):
+            if retrieved > 0:
+                beta = self.recipe.alpha_beta
+                old_dot, old_retrieved = self.calibration.get(site, (dot, retrieved))
+                self.calibration[site] = beta * old_dot + (1 - beta) * dot, beta * old_retrieved + (1 - beta) * retrieved
+                self.alpha[site] = self.calibration[site][0] / self.calibration[site][1]
+        self.fits.clear()
+
+    def direct_errors(self, sites, draws, sigma, entry=None, gamma=0.0, retrieved=None):
+        """Output errors from one-sided loss drops, centered per chunk. With retrievals from the memory, the
+        draws estimate the residual delta - mu around the prior mu = alpha M c, and the prior is added back."""
+        retrieved = retrieved or {}
+        priors = {s: self.alpha[s] * r for s, r in retrieved.items() if s in self.alpha}
         n, b, t = chunk_size(draws, self.recipe.nrep), self.batch, self.length
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(b, t, width(s), device=self.device) for s in sites}
         # the MLP hidden layer is jittered only at live units: a dead unit's credit is zero (the ReLU is flat),
         # so its share of the jitter would only add noise to the estimate at that unit
         live = {s: (self.outputs[s] > 0).to(self.dtype) for s in sites if s.endswith('mlp.c_fc')}
+        for s, mask in live.items():  # the prior is masked like the draws: a dead unit's credit is zero
+            if s in priors:
+                priors[s] = priors[s] * mask.float()
 
         for chunk in range(draws // n):
             noise = {s: self.orthogonal_noise(s, draws, chunk, n, b, t, width(s)).flatten(0, 1) for s in sites}
@@ -285,13 +355,27 @@ class DUST:
                 reward = reward - reward.mean(0, keepdim=True)
             if gamma:
                 reward = reward_to_go(reward, gamma)
+            if priors:
+                # The loss drop the prior predicts is -sigma a.mu, summed over the jittered sites; adding back its
+                # negation leaves the reward of the residual. Centered like the reward it corrects.
+                predicted = sigma * sum(torch.einsum('nbtd,btd->nbt', noise[s].view(n, b, t, -1), mu.to(self.dtype))
+                                        for s, mu in priors.items()).float()
+                reward = reward + (predicted - predicted.mean(0, keepdim=True) if n > 1 else predicted)
             for site, a in noise.items():
                 errors[site] -= torch.einsum(
                     'nbt,nbtd->btd', reward.to(self.dtype),
                     a.view(n, self.batch, self.length, -1),
                 ).float() / sigma
 
-        return {s: error / draws for s, error in errors.items()}
+        # Centering over n draws scales the estimate's mean by 1 - 1/n; the prior is scaled to match, so the
+        # estimate has Dust's expectation for any mu.
+        kept = 1 - 1 / n if n > 1 else 1.0
+        errors = {s: error / draws + kept * priors.get(s, 0) for s, error in errors.items()}
+        self.estimates.update({s: e for s, e in errors.items() if s in self.prior_sites})  # for the memory's writes
+        for site, r in retrieved.items():  # least-squares fit on the retrieval, for the next steps' alpha
+            target = errors[site] / kept  # unshrunk: the reward correction should cancel sigma a.delta itself
+            self.fits[site] = torch.stack([(r * target).sum(), (r * r).sum()])
+        return errors
 
     def head_error(self, sigma=0.1):
         """The head's output error by a central difference of every token's loss along each of its own logits.
@@ -412,6 +496,10 @@ class DUST:
         self.capture(x, y)
         r, world, layers = self.recipe, self.world, self.model.config.n_layer
         gradients = {}
+        # The head first: its output error at each token is the memory's key
+        head = self.head_error()
+        self.head_credit = head[..., :self.model.config.vocab_size]
+        gradients['lm_head.weight'] = self.reassemble('lm_head', head)
         for layer in range(layers):
             prefix = f'transformer.h.{layer}.'
             gamma = r.first_gamma if layer == 0 else 0.0
@@ -420,11 +508,12 @@ class DUST:
                 ([prefix + 'mlp.c_fc'], r.hidden[layer]),
             ]
             for sites, count in groups:
-                for site, error in self.direct_errors(sites, count // world, 0.4, layer, gamma).items():
+                retrieved = self.retrieve(sites)
+                for site, error in self.direct_errors(sites, count // world, 0.4, layer, gamma, retrieved).items():
                     gradients[site + '.weight'] = self.reassemble(site, error)
 
         site = 'transformer.wte'
-        error = self.direct_errors([site], r.embedding // world, 0.8)[site]
+        error = self.direct_errors([site], r.embedding // world, 0.8, retrieved=self.retrieve([site]))[site]
         gradients[site + '.weight'] = self.reassemble(site, error)
 
         targets = {}
@@ -432,14 +521,14 @@ class DUST:
             site = f'o@{layer}'
             sigma = 0.4 if layer < layers // 2 else 0.8
             gamma = r.first_gamma if layer == 0 else 0.0
-            error = self.direct_errors([site], r.hubs[layer] // world, sigma, layer, gamma)[site]
+            error = self.direct_errors([site], r.hubs[layer] // world, sigma, layer, gamma, self.retrieve([site]))[site]
             targets[layer] = average_ranks(error)
 
-        gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error())
         for kind, count in r.local.items():
             for site, error in self.local_errors(kind, count // world, targets).items():
                 gradients[site + '.weight'] = self.reassemble(site, error)
         gradients.update(self.scalar_gradients(8 // world))
+        self.calibrate()  # the next step's alpha
 
         valid_tokens = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
@@ -448,6 +537,7 @@ class DUST:
             if not torch.isfinite(gradient).all():
                 raise FloatingPointError(f'Non-finite estimate for {name}')
             parameter.grad = gradient
+        self.remember(valid_tokens)  # after this step's estimates, so a retrieval never sees its own step
         optimizer.step()
         return self.clean_loss[y != -1].mean().item()
 
