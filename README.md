@@ -78,6 +78,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | # | Val loss | Description | Time | Contributors |
 | - | - | - | - | - |
 | 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
+| 2 | 4.180 | Track 1 record at 5k population | 0.36 h | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
 
 ## What backprop gets
 

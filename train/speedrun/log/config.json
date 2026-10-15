@@ -1,0 +1,63 @@
+{
+  "script": "/home/ubuntu/noise-scaling/src/train/speedrun/run.py",
+  "world": 8,
+  "batch": 8,
+  "steps": 610,
+  "seed": 0,
+  "target": 4.2,
+  "recipe": {
+    "writers": [
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64,
+      64
+    ],
+    "hidden": [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ],
+    "hubs": [
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128,
+      128
+    ],
+    "embedding": 640,
+    "local": {
+      "q": 128,
+      "v": 128,
+      "gate": 64,
+      "k": 512,
+      "ve": 1408
+    },
+    "nrep": 16,
+    "lr": 0.003,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "gamma": 0.98,
+    "first_gamma": 0.3,
+    "anvil_lr": 0.023,
+    "anvil_wd": 2.25,
+    "memory_beta": 0.9,
+    "mesa_ridge": 0.1,
+    "alpha_beta": 0.8
+  },
+  "torch_version": "2.10.0+cu128"
+}
