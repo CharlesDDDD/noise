@@ -70,7 +70,7 @@ def recipe(scale):
     )
 
 
-RECIPE = recipe(1.5)
+RECIPE = recipe(1.0)
 
 
 def chunk_size(draws, cap):
