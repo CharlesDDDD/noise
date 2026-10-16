@@ -64,21 +64,21 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 
 | # | Val loss | Description | Time | Contributors |
 | - | - | - | - | - |
-| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5.33 h | - |
-| 2 | 5.058 | Dust w/ SGD, 16k population | 1.32 h | - |
-| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
-| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1.78 h | [@Lazarus-931](https://github.com/Lazarus-931) |
-| 5 | 4.082 | FP32 head in the direct draws reruns | 1.82 h | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1.73 h | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 7 | 4.008 | Associative credit memory as a prior for the draws | 1.76 h | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 8 | 3.991 | Reduce population to 16k | 1.20 h | [@serdardoesml](https://github.com/serdardoesml) |
+| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5 h 20 min | - |
+| 2 | 5.058 | Dust w/ SGD, 16k population | 1 h 19 min | - |
+| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | - |
+| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1 h 47 min | [@Lazarus-931](https://github.com/Lazarus-931) |
+| 5 | 4.082 | FP32 head in the direct draws reruns | 1 h 49 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1 h 44 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
 
 ### Track 2: speedrun to 4.2
 
 | # | Val loss | Description | Time | Contributors |
 | - | - | - | - | - |
-| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1.76 h | - |
-| 2 | 4.180 | Track 1 record at 5k population | 0.36 h | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
+| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | - |
+| 2 | 4.180 | Track 1 record at 5k population | 22 min | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
 
 ## What backprop gets
 
