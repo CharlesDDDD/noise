@@ -1,62 +1,57 @@
 {
-  "script": "/home/ubuntu/noise-scaling/src/train/val/run.py",
+  "script": "/root/noise/train/boostcut/run.py",
   "world": 8,
-  "batch": 8,
-  "steps": 610,
+  "preset": "38m",
+  "model": {
+    "sequence_len": 2048,
+    "vocab_size": 4096,
+    "n_layer": 8,
+    "n_head": 8,
+    "n_kv_head": 8,
+    "n_embd": 512,
+    "window_pattern": "SSSL"
+  },
   "seed": 0,
+  "switch": 0.3,
+  "boost_steps": 366,
+  "cut_steps": 427,
+  "boost_batch": 4,
+  "cut_batch": 8,
+  "train_file": "train.pt",
+  "train_rows": 4880,
   "recipe": {
-    "writers": [
-      256,
-      256,
-      256,
-      256,
-      256,
-      256,
-      256,
-      256
-    ],
-    "hidden": [
-      512,
-      512,
-      512,
-      512,
-      512,
-      512,
-      512,
-      512
-    ],
-    "hubs": [
-      512,
-      512,
-      512,
-      512,
-      512,
-      512,
-      512,
-      512
-    ],
-    "embedding": 2048,
-    "local": {
-      "q": 384,
-      "v": 384,
-      "gate": 128,
-      "k": 1664,
-      "ve": 4608
-    },
-    "nrep": 16,
     "lr": 0.003,
     "betas": [
       0.7,
       0.95
     ],
     "warmdown": 0.3,
-    "gamma": 0.98,
-    "first_gamma": 0.3,
     "anvil_lr": 0.023,
-    "anvil_wd": 2.25,
-    "memory_beta": 0.9,
-    "mesa_ridge": 0.1,
-    "alpha_beta": 0.8
+    "anvil_wd": 2.25
   },
+  "settings": {
+    "sigma": 0.005,
+    "probes": 0,
+    "fc_k": 256,
+    "fc_sigma": 0.05,
+    "local": {
+      "q": 64,
+      "k": 320,
+      "v": 512,
+      "gate": 64
+    },
+    "nrep": 64,
+    "emb_chunk": 16,
+    "scalar_step": 0.01,
+    "chunk": 134217728,
+    "boost_exact_keys": true,
+    "chain_sigma": 0.01,
+    "route_k": 128,
+    "chain_tokens": 64,
+    "cut_exact_keys": true,
+    "key_sigma": 0.003,
+    "key_chunk": 8
+  },
+  "polar_margin": 1.1,
   "torch_version": "2.10.0+cu128"
 }
