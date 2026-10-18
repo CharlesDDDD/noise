@@ -12,28 +12,34 @@ perturbation at the site it trains, or one local step from such a measurement:
   logits are the clean logits plus a precomputed direction, rescaled by the moved stream's own RMS: each probe is one
   soft-capped cross-entropy of the actual head, evaluated at the moved stream.
 - Writers (attention and MLP output projections): their output credit is the readout credit where they write.
-- Attention outputs (hubs): probed along the attention output, through the output projection, to the same readout.
+- Attention outputs (hubs): one local step from the measured readout credit, as the MLP hidden units: a move of the
+  attention output moves the stream by the output projection times it, scored against the credit there. Probing the
+  readout along those moves instead gives the same credit (cosine 0.99997 on a trained checkpoint) at a third more
+  readout probes.
 - MLP hidden units: one local step from the measured readout credit. Each token's 256 largest units move along a
   full order-256 Hadamard cycle; each move's change of the block output, through relu^2 and the output projection,
   is scored against that credit.
-- Queries, keys, values and value-embedding gates: one local step from the measured hub credit (the record's local
-  errors), scored per head. Keys, values and gates carry their scores back to the moved positions with a matched
-  filter: query s's score counts for key t in proportion to A[s, t] / max A[s, :], from the clean attention. Values
-  and gates move the output through the clean attention probabilities (the attention is linear in its values).
-  Value embeddings reuse the value draws: a value move is a value-embedding move scaled by the gate.
+- Queries: one local step from the measured hub credit (the record's local errors), scored per head.
+- Keys: the same local step by single-key experiments, as Track 1's Boost: each raw key coordinate moves alone, and
+  each query's attention changes in one term, evaluated exactly, with no interference between positions.
+- Values and value-embedding gates: the record's local step in closed form. The record moved every value along its
+  own orthogonal code, carried the moves through the clean attention probabilities (the attention is linear in its
+  values) and each query's score back with the matched filter A[s, t] / max A[s, :]; the mean over the draws is
+  sum_s A[s, t]^2 / max A[s, :] times query s's hub credit, computed here without draws. Value embeddings: a value
+  move is a value-embedding move scaled by the gate.
 - Token embedding: the first attention stage's readout along each token's own path. Every query sees the clean keys
   and values of the other positions and its own moved ones, so each token's measurement is its own.
 - Head: the record's coordinate differences at the final readout and at every intermediate readout.
 - Residual mixing scalars: central differences of their attention stage's readout loss, in float32.
 
-Four sequences per update: the two GPUs of each sequence split its probe directions, draws and scalars, and add
+Four sequences per update: the two GPUs of each sequence split its probe directions, draws, blocks and scalars, and add
 their partial credits with one all-reduce per readout. The model, init, optimizer (ANVIL II on the block matrices,
 Adam elsewhere), learning rates, schedule shape and data order are the record's.
 
 Launch: torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 """
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import json
 import math
 import os
@@ -51,7 +57,7 @@ from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, flex, has_v
 from utils.prepare_data import TRAIN_ROWS, load_rows
 
 BATCH = 4  # sequences per update; 1,220 updates per epoch
-UPDATES = 1050  # the first 4,200 of the 4,880 sequences already reach TARGET: the run stops there
+UPDATES = 900  # the first 3,600 of the 4,880 sequences already reach TARGET: the run stops there
 SEED = 0
 TARGET = 4.2  # validation loss to reach; the run counts only if its final weights reach it
 WIDTH = 512
@@ -77,10 +83,10 @@ class Settings:
     sigma: float = 0.005        # readout probe step, relative to the probed vector's RMS at that token
     fc_k: int = 256             # MLP units probed per token (a power of two)
     fc_sigma: float = 0.05      # their step, relative to the token's pre-activation RMS
-    # attention-internal draws. Keys rerun the attention in whole chunks of nrep draws: of each GPU's 160 key draws,
-    # 128 run (the estimate's scale does not matter to ANVIL's orthogonalized update)
-    local: dict = field(default_factory=lambda: dict(q=64, k=320, v=512, gate=64))
+    queries: int = 64           # query draws
     nrep: int = 64              # draws per batched attention rerun
+    key_sigma: float = 0.003    # exact keys: step of a single raw key coordinate, relative to the key's RMS
+    key_chunk: int = 8          # exact keys: directions per batched evaluation
     emb_chunk: int = 16         # embedding probes per batched rerun
     scalar_step: float = 0.01   # central-difference step of the mixing scalars
     chunk: int = 2 ** 30        # elements per probe chunk (tokens x probes x vocab): few, large launches
@@ -182,19 +188,6 @@ def head_scores(out, baseline, hub):
 
 
 @torch.compile(dynamic=False)
-def value_scores(change, hub):
-    """change (b, h, t, n, hd): each draw's attention output change; hub (b, t, h, hd); returns (b, h, t, n)."""
-    return (change.float() * hub.float().permute(0, 2, 1, 3).unsqueeze(3)).sum(-1)
-
-
-@torch.compile(dynamic=False)
-def heads_first(move):
-    """(n, b, t, h, hd) -> (b, h, t, n * hd) in bfloat16: the draws as columns of each head's value matrix."""
-    n, b, t, h, hd = move.shape
-    return move.to(torch.bfloat16).permute(1, 3, 2, 0, 4).reshape(b, h, t, n * hd)
-
-
-@torch.compile(dynamic=False)
 def code_estimate(credited, a):
     """sum over draws of each position's credited score times its code: credited (b, h, t, n), a (n, b, t, h, w);
     returns (b, t, h, w) float."""
@@ -202,14 +195,14 @@ def code_estimate(credited, a):
 
 
 @torch.compile(dynamic=False)
-def hidden_scores(ut, st, Hk, cols, g):
+def hidden_scores(ut, st, Hk, gk):
     """Top units ut (m, k) moved by +-st along the rows of Hk; each move's change of the block output (through
-    relu^2 and the units' output vectors cols (m, k, W)) scored against the measured readout credit g (m, W)."""
+    relu^2 and the units' output vectors) scored against the measured readout credit g. The score of a change c of
+    the units is g . (cols^T c) = (cols g) . c, so gk (m, k) = cols g, each unit's output vector dotted with the
+    credit, is formed once per token instead of each move's (W,) change of the stream."""
     moved = st.unsqueeze(-1) * Hk  # (m, k probes, k units)
     change = F.relu(ut.unsqueeze(1) + moved).square() - F.relu(ut.unsqueeze(1) - moved).square()
-    stream_change = torch.bmm(change.to(torch.bfloat16), cols)  # (m, probes, W)
-    scored = torch.bmm(stream_change, g.to(torch.bfloat16).unsqueeze(-1)).squeeze(-1).float()
-    return scored / (2 * st)
+    return (change * gk.unsqueeze(1)).sum(-1) / (2 * st)
 
 
 @torch.compile(dynamic=False)
@@ -238,6 +231,24 @@ def stage_readout(x0, out, mix, wproj, weight, y):
     """The first attention stage's readout loss per token: stream mix * x0 plus the attention module's output."""
     xmid = mix * x0 + F.linear(out.reshape(x0.shape).float(), wproj)
     return readout_losses(xmid.reshape(-1, xmid.shape[-1]), weight, y)
+
+
+@torch.compile(dynamic=False)
+def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
+    """Single-key experiments, each evaluated exactly: the raw key at position t moves by steps_t e_j and nothing
+    else moves, so each query's attention changes in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
+    a' = a exp(dl). Scored against each query's target (C[s, t] = hub_s . (v_t - o_s)): one local step, as the
+    record's coordinate head scores single-logit moves. The processed key's change is formed exactly before the
+    logit product. qp, kp, k_raw (h, T, d); steps (h, T, 1); cos, sin (T, d/2); A, C (h, T, T), A zero outside the
+    window; basis (J, d). Returns (h, T, J)."""
+    d = k_raw.shape[-1]
+    moved = k_raw.unsqueeze(1) + steps.unsqueeze(1) * basis[None, :, None, :]
+    x1, x2 = moved[..., :d // 2], moved[..., d // 2:]
+    moved = torch.cat([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], -1)
+    dk = moved * torch.rsqrt(moved.square().mean(-1, keepdim=True) + EPS) - kp.unsqueeze(1)
+    dl = torch.einsum('hsd,hjtd->hjst', qp, dk) / d ** 0.5
+    change = A[:, None] * torch.expm1(dl)
+    return (change / (1 + change) * C[:, None]).sum(2).transpose(1, 2) / steps
 
 
 class Capture:
@@ -358,21 +369,18 @@ class Boost:
         orthogonal, |row|^2 = 512)."""
         return hadamard(WIDTH, self.device, torch.float32) * self.signs(WIDTH)
 
-    def probe(self, x, y, mix=None, probed=None):
-        """Each token's readout credit in the probed space, measured along a full cycle of the step's basis.
+    def probe(self, x, y):
+        """Each token's readout credit in the stream, measured along a full cycle of the step's basis.
 
-        x (n, WIDTH): the clean streams at the readout (float32). Probe j moves the probed vector by step along basis
-        row h_j; the stream moves by step * M h_j, with M the map from the probed vector to the stream (the identity,
-        or an output projection). probed: the probed vector per token (its RMS sets the step); defaults to x.
-        Returns (n, WIDTH): sum_j d_j h_j / WIDTH with d_j the measured directional derivative. The GPUs of a
+        x (n, WIDTH): the clean streams at the readout (float32). Probe j moves the stream by step along basis row
+        h_j. Returns (n, WIDTH): sum_j d_j h_j / WIDTH with d_j the measured directional derivative. The GPUs of a
         sequence each take a slice of the cycle and add their parts."""
         weight = self.model.lm_head.weight.float()[:self.model.config.vocab_size]
         H = self.basis()
-        stream_dirs = H.T if mix is None else mix.float() @ H.T  # (WIDTH, WIDTH): column j is M h_j
-        C = (weight @ stream_dirs).T.contiguous()  # (WIDTH, V): row j is W M h_j
-        dir_sq = stream_dirs.square().sum(0)  # |M h_j|^2
-        probed = x if probed is None else probed
-        steps = self.s.sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        stream_dirs = H.T  # (WIDTH, WIDTH): column j is h_j
+        C = (weight @ stream_dirs).T.contiguous()  # (WIDTH, V): row j is W h_j
+        dir_sq = stream_dirs.square().sum(0)  # |h_j|^2
+        steps = self.s.sigma * x.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
         n, vocab = x.shape[0], C.shape[1]
         # a draw of per-token row offsets that the full cycle does not use, kept so the generator's stream is the
         # development runs' (boost_v10_b4)
@@ -428,36 +436,10 @@ class Boost:
             derivative[..., j0:j0 + n] = ((moved - clean) / steps.squeeze(-1)).permute(1, 2, 0)
         return (derivative @ H / WIDTH).reshape(b * t, WIDTH)
 
-    def attention_maps(self, i):
-        """Layer i's clean attention probabilities A[b, h, s, t] (from the cached queries and keys) and the matched
-        filter K[b, h, t, s] = A[s, t] / max_t' A[s, t'] that carries query s's score to key position t. Cached for
-        the step."""
-        if i in self.maps:
-            return self.maps[i]
-        d, model = self.capture, self.model
-        cfg = model.config
-        b, t = d.batch, d.length
-        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
-        cos, sin = model.cos[:, :t].float(), model.sin[:, :t].float()
-        prefix = f'transformer.h.{i}.attn.'
-        q, k = (norm(apply_rotary_emb(d.outputs[prefix + name].float().view(b, t, h, hd), cos, sin))
-                for name in ('c_q', 'c_k'))
-        logits = q.transpose(1, 2) @ k.transpose(1, 2).transpose(-1, -2) / math.sqrt(hd)  # [b, h, s, t]
-        positions = torch.arange(t, device=self.device)
-        lag = positions[:, None] - positions[None, :]
-        window = model.window_sizes[i][0]
-        logits = logits.masked_fill(~((lag >= 0) & (lag <= window)), float('-inf'))
-        A = logits.softmax(-1)
-        del logits
-        K = (A / A.amax(-1, keepdim=True)).transpose(-1, -2)
-        self.maps[i] = (A.to(torch.bfloat16), K.to(torch.bfloat16).contiguous())
-        return self.maps[i]
-
-    def query_key_errors(self, kind, draws, targets):
-        """Query or key credit, one local step from the measured hub credit, scored per head: each draw moves every
-        position's raw query (or key), the attention reruns with the moves (one-sided, step 0.1), and each query's
-        output change is scored against its hub credit. Key scores reach the moved positions through the matched
-        filter."""
+    def query_errors(self, draws, targets):
+        """Query credit, one local step from the measured hub credit, scored per head: each draw moves every
+        position's raw query, the attention reruns with the moves (one-sided, step 0.1), and each query's output
+        change is scored against its hub credit."""
         d, model = self.capture, self.model
         cfg = model.config
         L, b, t = cfg.n_layer, d.batch, d.length
@@ -470,8 +452,7 @@ class Boost:
         errors = {}
         for i in range(L):
             prefix = f'transformer.h.{i}.attn.'
-            site = prefix + 'c_' + kind
-            A, K = self.attention_maps(i)
+            site = prefix + 'c_q'
             window = model.window_sizes[i][0]
             q_raw, k_raw, v_raw = (d.outputs[prefix + 'c_' + name].float().view(b, t, h, hd) for name in 'qkv')
             ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, hd) if has_ve(i, L) else None
@@ -481,58 +462,88 @@ class Boost:
             target = targets[i].view(b, t, h, hd)
             baseline = attention(qp.to(dt), kp.to(dt), values.to(dt), window)  # (b, t, h, hd)
             rep = lambda z_: z_.to(dt).unsqueeze(0).expand(n, -1, -1, -1, -1).reshape(n * b, t, h, hd)
-            fixed, vals = rep(kp if kind == 'q' else qp), rep(values)
-            raw = q_raw if kind == 'q' else k_raw
+            fixed, vals = rep(kp), rep(values)
             estimate = torch.zeros(b, t, h, hd, device=self.device)
             for c in range(draws // chunk):
                 a = d.orthogonal_noise(site, draws, c, n, b, t, cfg.n_embd).view(n, b, t, h, hd)
-                moved = moved_heads(raw, a, sigma, cos, sin)
-                qa, ka = (moved, fixed) if kind == 'q' else (fixed, moved)
-                out = attention(qa, ka, vals, window).view(n, b, t, h, hd)
+                moved = moved_heads(q_raw, a, sigma, cos, sin)
+                out = attention(moved, fixed, vals, window).view(n, b, t, h, hd)
                 score = head_scores(out, baseline, target)  # (b, h, t, n): one-sided change . hub credit
-                if kind == 'k':
-                    score = (K.to(dt) @ score.to(dt)).float()
                 estimate += code_estimate(score, a)
             errors[site] = (estimate / (draws * sigma)).reshape(b, t, cfg.n_embd)
         return errors
 
-    def value_errors(self, kind, draws, targets):
-        """Credit of the values ('v') or value-embedding gates ('gate'), one local step from the measured hub credit:
-        every position's value moves along its own orthogonal code, the attention (linear in its values, with the
-        clean probabilities) carries the moves to every query's output, each query's output change is scored per
-        head against its hub credit, and the matched filter carries the scores back to the moved positions."""
+    def key_errors(self, targets):
+        """Key credit, one local step from the targets, by single-key experiments (key_scores): exact up to the
+        one-sided step, with no interference between positions. The GPUs of a sequence split the directions."""
+        d, model, s = self.capture, self.model, self.s
+        cfg = model.config
+        L, b, t = cfg.n_layer, d.batch, d.length
+        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
+        cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
+        rot = lambda z: torch.cat([z[..., :hd // 2] * cos + z[..., hd // 2:] * sin,
+                                   z[..., :hd // 2] * -sin + z[..., hd // 2:] * cos], -1)
+        unit = lambda z: z * torch.rsqrt(z.square().mean(-1, keepdim=True) + EPS)
+        pos = torch.arange(t, device=self.device)
+        lag = pos[:, None] - pos[None, :]
+        eye = torch.eye(hd, device=self.device)
+        lo, hi = self.share(hd)
+        errors = {}
+        for i in range(L):
+            prefix = f'transformer.h.{i}.attn.'
+            allowed = ((lag >= 0) & (lag <= model.window_sizes[i][0])).float()
+            credit_all = torch.zeros(b, h, t, hd, device=self.device)
+            for r in range(b):
+                heads = lambda name: d.outputs[prefix + name][r].float().view(t, h, hd).transpose(0, 1)
+                q_raw, k_raw, values = heads('c_q'), heads('c_k'), heads('c_v')
+                if has_ve(i, L):
+                    ve = d.outputs[f'value_embeds.{i}'][r].float().view(t, h, hd).transpose(0, 1)
+                    gate = 2 * torch.sigmoid(d.outputs[prefix + 've_gate'][r].float().view(t, h)).T.unsqueeze(-1)
+                    values = values + gate * ve
+                qp, kp = unit(rot(q_raw)), unit(rot(k_raw))
+                logits = (qp @ kp.transpose(1, 2)) / hd ** 0.5
+                A = torch.softmax(logits.masked_fill(allowed == 0, float('-inf')), -1)
+                hub = targets[i][r].view(t, h, hd).transpose(0, 1)
+                C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
+                steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+                for j0 in range(lo, hi, s.key_chunk):
+                    j1 = min(j0 + s.key_chunk, hi)
+                    credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
+            errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
+        return errors
+
+    def value_errors(self, targets):
+        """Values and value-embedding gates, the record's local step in closed form. A value move at position t
+        reaches query s's output as A[s, t] times the move (the attention is linear in its values, with the clean
+        probabilities A), is scored per head against s's hub credit and carried back to t by the matched filter
+        A[s, t] / max A[s, :]. The record drew orthogonal moves (E[a a^T] = I); their mean, sum_s A[s, t]^2 /
+        max A[s, :] hub_s, is computed here without draws. A gate move a at t moves the value by slope(z_t) a ve_t
+        (the record's central difference, odd in a = +-1), so the gate's credit is slope(z_t) ve_t . (value credit).
+        The GPUs of a sequence take alternate blocks."""
         d, model = self.capture, self.model
         cfg = model.config
-        b, t = d.batch, d.length
+        L, b, t = cfg.n_layer, d.batch, d.length
         h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
-        bf = torch.bfloat16
+        cos, sin = model.cos[:, :t].float(), model.sin[:, :t].float()
+        positions = torch.arange(t, device=self.device)
+        lag = positions[:, None] - positions[None, :]
         errors = {}
-        n = min(64, draws)
-        for i in range(cfg.n_layer):
-            if kind == 'gate' and not has_ve(i, cfg.n_layer):
-                continue
-            A, K = self.attention_maps(i)
-            hub = targets[i].view(b, t, h, hd)
-            site = f'transformer.h.{i}.attn.c_v' if kind == 'v' else f'transformer.h.{i}.attn.ve_gate'
-            width = h if kind == 'gate' else cfg.n_embd
-            w = width // h
-            estimate = torch.zeros(b, t, h, w, device=self.device)
-            if kind == 'gate':
-                z = d.outputs[f'transformer.h.{i}.attn.ve_gate'].float()
+        for i in range(self.part, L, self.split):
+            prefix = f'transformer.h.{i}.attn.'
+            q, k = (norm(apply_rotary_emb(d.outputs[prefix + name].float().view(b, t, h, hd), cos, sin)).transpose(1, 2)
+                    for name in ('c_q', 'c_k'))
+            logits = q @ k.transpose(-1, -2) / math.sqrt(hd)  # [b, h, s, t]
+            window = model.window_sizes[i][0]
+            A = logits.masked_fill(~((lag >= 0) & (lag <= window)), float('-inf')).softmax(-1)
+            del logits
+            hub = targets[i].view(b, t, h, hd).transpose(1, 2)
+            credit = ((A * A / A.amax(-1, keepdim=True)).transpose(-1, -2) @ hub).transpose(1, 2)  # (b, t, h, hd)
+            errors[prefix + 'c_v'] = credit.reshape(b, t, cfg.n_embd)
+            if has_ve(i, L):
+                z = d.outputs[prefix + 've_gate'].float()
                 ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, hd)
-            for chunk in range(draws // n):
-                a = d.orthogonal_noise(site, draws, chunk, n, b, t, width, dtype=torch.float32)
-                if kind == 'v':
-                    move = a.view(n, b, t, h, hd)
-                else:  # a gate move, through the sigmoid (central difference) and the value embedding
-                    eps = 0.1
-                    slope = (torch.sigmoid(z + eps * a) - torch.sigmoid(z - eps * a)) / eps
-                    move = slope.unsqueeze(-1) * ve
-                change = (A @ heads_first(move)).view(b, h, t, n, hd)  # the attention output's change, per draw
-                score = value_scores(change, hub)  # (b, h, t, n), scored per head against the hub credit
-                credited = (K @ score.to(bf)).float()  # carried back to the moved positions
-                estimate += code_estimate(credited, a.view(n, b, t, h, w))
-            errors[site] = (estimate / draws).reshape(b, t, width)
+                slope = (torch.sigmoid(z + 0.1) - torch.sigmoid(z - 0.1)) / 0.1
+                errors[prefix + 've_gate'] = slope * (ve * credit).sum(-1)
         return errors
 
     def hidden_credit(self, u, g, out_weight):
@@ -547,15 +558,14 @@ class Boost:
         top = u.topk(k, dim=-1, sorted=False).indices
         uk = u.gather(1, top)
         steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)  # (n, 1)
-        columns = out_weight.to(torch.bfloat16).T.contiguous()  # (HIDDEN, WIDTH): row i is unit i's output vector
+        unit_scores = g @ out_weight.float()  # (n, HIDDEN): each unit's output vector dotted with the credit
         credit = torch.zeros_like(u)
         lo, hi = self.share(k)
         Hs = Hk[lo:hi]  # this GPU's moves (rows) of the cycle; the parts' credits add
         per = max(1, 2 ** 26 // (k * WIDTH))
         for t0 in range(0, u.shape[0], per):
-            ut, st, tt, gt = uk[t0:t0 + per], steps[t0:t0 + per], top[t0:t0 + per], g[t0:t0 + per]
-            cols = F.embedding(tt, columns)  # (m, k, WIDTH): each token's top units' output vectors
-            derivative = hidden_scores(ut, st, Hs, cols, gt)  # (m, probes)
+            ut, st, tt = uk[t0:t0 + per], steps[t0:t0 + per], top[t0:t0 + per]
+            derivative = hidden_scores(ut, st, Hs, unit_scores[t0:t0 + per].gather(1, tt))  # (m, probes)
             credit[t0:t0 + per].scatter_(1, tt, derivative @ Hs / k)
         return credit
 
@@ -597,7 +607,7 @@ class Boost:
             att_in = d.inputs[p + 'attn.c_proj'].flatten(0, 1)  # the attention output (hub)
             g_mid = self.probe(xm, yf)
             gradients[p + 'attn.c_proj.weight'] = g_mid.T @ att_in
-            hub = self.probe(xm, yf, mix=block.attn.c_proj.weight, probed=att_in)
+            hub = g_mid @ block.attn.c_proj.weight.float()
             targets[i] = hub.view(b, t, WIDTH)
             # MLP stage: the readout right after the MLP
             g_out = self.probe(xo, yf)
@@ -610,25 +620,22 @@ class Boost:
                     normed = stream * torch.rsqrt(stream.square().mean(-1, keepdim=True) + EPS)
                     error = coordinate_differences(normed @ weight.T, yf, 0.1)
                     gradients['lm_head.weight'][:weight.shape[0]] += error.T @ normed
-        # attention internals: one local step from the measured hub credit; each GPU of a sequence takes its share of
-        # the draws, and the group averages
-        self.maps = {}
-        for kind, count in s.local.items():
-            if kind in ('v', 'gate'):
-                local = self.value_errors(kind, count // self.split, targets)
-            else:
-                local = self.query_key_errors(kind, count // self.split, targets)
-            local = {site: error / self.split for site, error in local.items()}
-            for site, error in local.items():
-                gradients[site + '.weight'] = d.reassemble(site, error)
-                if kind == 'v' and has_ve(int(site.split('.')[2]), L):
-                    # the same draws, read as moves of the value embedding: a value move a is a value-embedding
-                    # move a / gate, so the value-embedding credit is the gate times the value credit
-                    i = int(site.split('.')[2])
-                    gate = 2 * torch.sigmoid(d.outputs[f'transformer.h.{i}.attn.ve_gate'].float())
-                    heads = gate.shape[-1]
-                    ve_error = (error.view(b, t, heads, -1) * gate.unsqueeze(-1)).view(b, t, -1)
-                    gradients[f'value_embeds.{i}.weight'] = d.reassemble(f'value_embeds.{i}', ve_error)
+        # attention internals: one local step from the measured hub credit; the GPUs of a sequence split the query
+        # draws (and average), the key directions and the blocks of the values (and add)
+        internals = {site: error / self.split
+                     for site, error in self.query_errors(s.queries // self.split, targets).items()}
+        internals.update(self.key_errors(targets))
+        internals.update(self.value_errors(targets))
+        for site, error in internals.items():
+            gradients[site + '.weight'] = d.reassemble(site, error)
+            if site.endswith('c_v') and has_ve(int(site.split('.')[2]), L):
+                # a value move a is a value-embedding move a / gate, so the value-embedding credit is the gate times
+                # the value credit
+                i = int(site.split('.')[2])
+                gate = 2 * torch.sigmoid(d.outputs[f'transformer.h.{i}.attn.ve_gate'].float())
+                heads = gate.shape[-1]
+                ve_error = (error.view(b, t, heads, -1) * gate.unsqueeze(-1)).view(b, t, -1)
+                gradients[f'value_embeds.{i}.weight'] = d.reassemble(f'value_embeds.{i}', ve_error)
         # token embedding: the first attention stage's readout along each token's own path
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         emb = self.embedding_block0(e, yf.view(b, t), x)
