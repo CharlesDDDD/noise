@@ -72,6 +72,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1 h 44 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
 | 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
 | 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
+| 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [@spicylemonade](https://github.com/spicylemonade) |
 
 ### Track 2: speedrun to 4.2
 
