@@ -1,8 +1,8 @@
 {
-  "script": "/root/noise/train/sub_boost/run.py",
+  "script": "/root/noise/train/speedrun/run.py",
   "world": 8,
   "batch": 4,
-  "steps": 1220,
+  "steps": 1050,
   "seed": 0,
   "target": 4.2,
   "recipe": {
@@ -28,7 +28,7 @@
     "nrep": 64,
     "emb_chunk": 16,
     "scalar_step": 0.01,
-    "chunk": 134217728
+    "chunk": 1073741824
   },
   "torch_version": "2.10.0+cu128"
 }
