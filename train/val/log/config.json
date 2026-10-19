@@ -47,7 +47,7 @@
     "boost_exact_keys": true,
     "chain_sigma": 0.01,
     "route_k": 128,
-    "chain_tokens": 64,
+    "chain_tokens": 256,
     "cut_exact_keys": true,
     "own_query": true,
     "query_keys": 64,
