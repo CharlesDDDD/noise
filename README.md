@@ -73,6 +73,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
 | 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
 | 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [@spicylemonade](https://github.com/spicylemonade) |
+| 10 | 3.914 | Exact values and gates, bf16 chain, batched ANVIL | 5 min | [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ### Track 2: speedrun to 4.2
 
@@ -82,6 +83,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 2 | 4.180 | Track 1 record at 5k population | 22 min | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
 | 3 | 4.184 | Compile the probe construction | 21 min | [@pculaf](https://github.com/pculaf) |
 | 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [@spicylemonade](https://github.com/spicylemonade) |
+| 5 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1.4 min | [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ## What backprop gets
 
