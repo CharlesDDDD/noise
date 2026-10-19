@@ -87,7 +87,7 @@ class Settings:
     # Cut
     chain_sigma: float = 0.01
     route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 16; HIDDEN: no restriction)
-    chain_tokens: int = 64
+    chain_tokens: int = 256
     cut_exact_keys: bool = True
     own_query: bool = True      # Cut: a move also reaches its own token's later attentions through its own query
     query_keys: int = 64        # own_query: keys per token per head whose logits move (0: all keys)
@@ -334,10 +334,10 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
                 delta = delta + query_change(inputs[b], delta, pos, rels[b], w_q[b], keys[b], values[b], w_proj_t[b],
                                              cos, sin, windows[b])
         dz = norm_difference(mids[b], delta)
-        dh = torch.bmm(dz, w_fc[b][idx[b]].transpose(1, 2))
+        dh = torch.bmm(dz.to(torch.bfloat16), w_fc[b][idx[b]].transpose(1, 2)).float()
         h = hs[b].unsqueeze(1)
         up, down = F.relu(h + dh), F.relu(h)
-        delta = delta + torch.bmm((up - down) * (up + down), w_out_t[b][idx[b]])
+        delta = delta + torch.bmm(((up - down) * (up + down)).to(torch.bfloat16), w_out_t[b][idx[b]]).float()
     sq = xL.square().sum(-1, keepdim=True)
     dots = torch.einsum('md,mpd->mp', xL, delta)
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / WIDTH + EPS)
@@ -858,8 +858,8 @@ class Cut(Boost):
         vocab = model.config.vocab_size
         weight = model.lm_head.weight.float()[:vocab]
         weight_t = weight.T.to(torch.bfloat16).contiguous()
-        w_fc = [blk.mlp.c_fc.weight.float() for blk in model.transformer.h]
-        w_out_t = [blk.mlp.c_proj.weight.float().T.contiguous() for blk in model.transformer.h]
+        w_fc = [blk.mlp.c_fc.weight.bfloat16() for blk in model.transformer.h]
+        w_out_t = [blk.mlp.c_proj.weight.bfloat16().T.contiguous() for blk in model.transformer.h]
         lam_r, lam_0 = model.resid_lambdas.float(), model.x0_lambdas.float()
         xL = outs[-1]
         base = xL @ weight.T
@@ -1087,19 +1087,57 @@ MAPS = (
 RUN = (1194, 240, 50, 514)  # PR #360's total, warmup, cooldown and engage steps; scaled to the run length
 
 
-def polar(g):
-    """Approximate orthogonalization with six quintic maps."""
-    tall = g.size(0) > g.size(1)
-    x = g.T if tall else g
-    x = (x / (POLAR_MARGIN * x.norm() + 1e-6)).bfloat16()
+def newton_schulz(x):
+    """The record's six quintic maps on a stack (B, n, n) of square matrices, in bfloat16."""
+    x = x.bfloat16()
     for a, b, c in MAPS:
-        s = x @ x.T
+        s = x @ x.transpose(1, 2)
         x = a * x + (b * s + c * s @ s) @ x
-    return (x.T if tall else x).float()
+    return x
+
+
+def gram_newton_schulz(x, restarts=(2, 4)):
+    """The same maps on wide matrices (n < m), iterated on the n x n Gram matrix (Gram Newton-Schulz, Dao lab 2026).
+    R is rebuilt from Q X before the maps in `restarts` to bound the float16 error."""
+    x = x.half()
+    eye = torch.eye(x.size(1), device=x.device, dtype=x.dtype).expand(x.size(0), -1, -1)
+    R, Q = x @ x.transpose(1, 2), eye
+    for t, (a, b, c) in enumerate(MAPS):
+        if t in restarts:
+            x = Q @ x
+            R, Q = x @ x.transpose(1, 2), eye
+        Z = b * R + c * R @ R
+        Q = Q @ Z + a * Q
+        RZ = R @ Z + a * R
+        R = Z @ RZ + a * RZ
+    return Q @ x
+
+
+def polar(g):
+    """Approximate orthogonalization of a stack (B, r, c) of same-shape matrices."""
+    tall = g.size(1) > g.size(2)
+    x = g.transpose(1, 2) if tall else g
+    x = x / (POLAR_MARGIN * x.norm(dim=(1, 2), keepdim=True) + 1e-6)
+    x = (newton_schulz(x) if x.size(1) == x.size(2) else gram_newton_schulz(x)).float()
+    return x.transpose(1, 2) if tall else x
+
+
+@torch.compile(dynamic=False)
+def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd, lanes: int,
+                 ratio: float):
+    """One ANVIL II step for a stack of same-shape matrices; updates fast, slow and energy in place."""
+    fast.lerp_(g, 1 - fast_beta)
+    slow.lerp_(g, 1 - slow_beta)
+    update = polar(g.lerp(weight * fast + (1 - weight) * slow, beta))
+    energy.lerp_(update.square().mean(lanes + 1, keepdim=True), 1 - lane_beta)
+    gained = update * energy.clamp_min(1e-10).rsqrt()
+    update = gained * (update.norm(dim=(1, 2), keepdim=True) / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
+    decay = (slow * w >= 0) * w * (wd * lr)
+    return w - lr * ratio * (update + decay)
 
 
 class Anvil(torch.optim.Optimizer):
-    """ANVIL II from modded-nanogpt PR #360."""
+    """ANVIL II from modded-nanogpt PR #360, applied to all same-shape matrices at once."""
 
     def __init__(self, params, lr, weight_decay, steps, lane_beta=0.9, beta_min=0.85, beta_max=0.93,
                  slow_beta=0.98, fast_beta=0.85, fast_weight=0.4385):
@@ -1107,7 +1145,7 @@ class Anvil(torch.optim.Optimizer):
         self.total, self.warmup, self.cooldown, self.engage = (round(k * steps / RUN[0]) for k in RUN)
         self.lane_beta, self.beta_min, self.beta_max = lane_beta, beta_min, beta_max
         self.slow_beta, self.fast_beta, self.fast_weight = slow_beta, fast_beta, fast_weight
-        self.t = 0
+        self.t, self.stacks = 0, {}
 
     def rail_beta(self):
         lo, hi, cool = self.beta_min, self.beta_max, self.total - self.cooldown
@@ -1117,29 +1155,44 @@ class Anvil(torch.optim.Optimizer):
             return hi - (hi - lo) * (self.t - cool) / self.cooldown
         return hi
 
+    def stacked_state(self, shape, params):
+        """The moving averages of one shape group as stacked tensors. Each parameter's state holds views into them,
+        so the Boost -> Cut handoff, which copies per-parameter state, carries them over."""
+        stack = self.stacks.get(shape)
+        if stack is not None and all(self.state[p].get('fast') is not None for p in params):
+            return stack
+        lanes = 1 if shape[0] >= shape[1] else 0
+        weights = torch.stack([p.float() for p in params])
+
+        def gathered(key, like):
+            held = [self.state[p].get(key) for p in params]
+            return torch.stack(held).clone() if all(h is not None for h in held) else torch.zeros_like(like)
+
+        stack = dict(fast=gathered('fast', weights), slow=gathered('slow', weights),
+                     energy=gathered('energy', weights.mean(lanes + 1, keepdim=True)))
+        for i, p in enumerate(params):
+            self.state[p].update(fast=stack['fast'][i], slow=stack['slow'][i], energy=stack['energy'][i])
+        self.stacks[shape] = stack
+        return stack
+
     @torch.no_grad()
     def step(self):
         beta, engaged = self.rail_beta(), self.t >= self.engage
         fast_beta, weight = (self.fast_beta, self.fast_weight) if engaged else (beta, 1.0)
+        device = self.param_groups[0]['params'][0].device
+        value = lambda v: torch.tensor(float(v), device=device)
         for group in self.param_groups:
             lr, wd = group['lr'], group['weight_decay']
+            by_shape = {}
             for p in group['params']:
-                g = p.grad.float()
-                lanes = 1 if p.size(0) >= p.size(1) else 0
-                state = self.state[p]
-                if not state:
-                    state.update(fast=torch.zeros_like(g), slow=torch.zeros_like(g),
-                                 energy=torch.zeros_like(g.mean(lanes, keepdim=True)))
-                fast, slow, energy = state['fast'], state['slow'], state['energy']
-                fast.lerp_(g, 1 - fast_beta)
-                slow.lerp_(g, 1 - self.slow_beta)
-                update = polar(g.lerp(weight * fast + (1 - weight) * slow, beta))
-                energy.lerp_(update.square().mean(lanes, keepdim=True), 1 - self.lane_beta)
-                gained = update * energy.clamp_min(1e-10).rsqrt()
-                update = gained * (update.norm() / gained.norm().clamp_min(1e-10))
-                w = p.float()
-                decay = (slow * w >= 0) * w * (wd * lr)
-                p.copy_(w - lr * max(1, p.size(0) / p.size(1)) ** 0.5 * (update + decay))
+                by_shape.setdefault(tuple(p.shape), []).append(p)
+            for shape, params in by_shape.items():
+                stack = self.stacked_state(shape, params)
+                new = anvil_update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
+                                   stack['fast'], stack['slow'], stack['energy'], value(beta), value(fast_beta),
+                                   value(self.slow_beta), value(weight), value(self.lane_beta), value(lr), value(wd),
+                                   1 if shape[0] >= shape[1] else 0, max(1, shape[0] / shape[1]) ** 0.5)
+                torch._foreach_copy_(params, list(new.to(params[0].dtype).unbind(0)))
         self.t += 1
 
 
