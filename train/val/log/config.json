@@ -1,5 +1,5 @@
 {
-  "script": "/root/noise/train/boostcut/run.py",
+  "script": "/home/seunghoo/workspace/noise/train/val/run.py",
   "world": 8,
   "preset": "38m",
   "model": {
@@ -49,6 +49,8 @@
     "route_k": 128,
     "chain_tokens": 64,
     "cut_exact_keys": true,
+    "own_query": true,
+    "query_keys": 64,
     "key_sigma": 0.003,
     "key_chunk": 8
   },
