@@ -311,7 +311,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     scale (m, P) the step each difference is divided by; e, x0, xL (m, W); mids per block (m, W); idx, hs per block
     (m, k) unit indices and clean pre-activations; w_fc per block (H, W); w_out_t per block (H, W); weight_t (W, V);
     base (m, V) clean top-stream logits before the norm; target_logit_w (m, W). own: None (every attention held),
-    or (pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows) with per-block key windows, and then
+    or ('window', pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows) with per-block key windows, or
+    ('routed', pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, (cos, sin)) along strong keys, and then
     every block the move enters also changes its own token's attention through its own query (query_change).
     Returns (m, P)."""
     L = len(mids)
@@ -324,12 +325,12 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
         if b > first:
             delta = lam_r[b] * delta + (lam_0[b] * dx0 if dx0 is not None else 0)
         if own is not None and (site < 0 or b > first):  # the move is at the block's input: its own query moves
-            if len(own) == 9:  # strong keys only
-                pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
+            if own[0] == 'routed':  # strong keys only
+                _, pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
                 delta = delta + query_change_routed(inputs[b], delta, pos, w_q[b], top_keys[b], top_values[b],
                                                     top_p[b], rest[b], w_proj_t[b], cos_sin[0], cos_sin[1])
             else:
-                pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
+                _, pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
                 delta = delta + query_change(inputs[b], delta, pos, rels[b], w_q[b], keys[b], values[b], w_proj_t[b],
                                              cos, sin, windows[b])
         dz = norm_difference(mids[b], delta)
@@ -885,12 +886,12 @@ class Cut(Boost):
                     prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
                     move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1), -h * prev, -h * x0[sl].unsqueeze(1)], 1)
                     scale = torch.cat([scale, torch.full_like(scale[:, :2], h), torch.full_like(scale[:, :2], -h)], 1)
-                if own is None or len(own) == 9:
-                    own_sl = None if own is None else (own[0][sl],) + tuple([z[sl] for z in part] for part in own[1:2]) \
-                        + (own[2],) + tuple([z[sl] for z in part] for part in own[3:7]) + own[7:]
+                if own is None or own[0] == 'routed':
+                    own_sl = None if own is None else ('routed', own[1][sl], [z[sl] for z in own[2]], own[3]) + tuple(
+                        [z[sl] for z in part] for part in own[4:8]) + own[8:]
                 else:
                     own_sl = self.own_query_window(own, t0, min(t0 + m, n))
-                derivative = (chain_chunk if own is None or len(own) == 9 else chain_chunk_own)(
+                derivative = (chain_chunk if own is None or own[0] == 'routed' else chain_chunk_own)(
                     site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                     [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl],
                     own_sl)
@@ -956,7 +957,7 @@ class Cut(Boost):
             top_values.append(vtop.transpose(0, 1).contiguous())
             top_p.append(p.transpose(0, 1).contiguous())
             rests.append(rest.transpose(0, 1).contiguous())
-        return (pos, inputs, w_q, top_keys, top_values, top_p, rests, w_proj_t, (cos, sin))
+        return ('routed', pos, inputs, w_q, top_keys, top_values, top_p, rests, w_proj_t, (cos, sin))
 
     @staticmethod
     def own_query_window(own, t0, t1):
@@ -972,7 +973,7 @@ class Cut(Boost):
             rels.append(pos[t0:t1] - start)
             ks.append(k[:, start:start + length])
             vs.append(v[:, start:start + length])
-        return (pos[t0:t1], rels, [z[t0:t1] for z in inputs], w_q, ks, vs, w_proj_t, cos, sin, windows)
+        return ('window', pos[t0:t1], rels, [z[t0:t1] for z in inputs], w_q, ks, vs, w_proj_t, cos, sin, windows)
 
     @torch.no_grad()
     def estimate(self, x, y):
