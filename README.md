@@ -66,30 +66,30 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 
 ### Track 1: validation loss
 
-| # | Val loss | Description | Time | Contributors |
-| - | - | - | - | - |
-| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5 h 20 min | - |
-| 2 | 5.058 | Dust w/ SGD, 16k population | 1 h 19 min | - |
-| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | - |
-| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1 h 47 min | [@Lazarus-931](https://github.com/Lazarus-931) |
-| 5 | 4.082 | FP32 head in the direct draws reruns | 1 h 49 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1 h 44 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
-| 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [@spicylemonade](https://github.com/spicylemonade) |
-| 10 | 3.896 | Own queries in Cut: each move also reaches its token's later attention through its own query | 10 min | [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931) |
+| # | Val loss | Description | Time | Script | Contributors |
+| - | - | - | - | - | - |
+| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5 h 20 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/val/eggroll.py) | - |
+| 2 | 5.058 | Dust w/ SGD, 16k population | 1 h 19 min | [Script](https://github.com/qlabs-eng/dust/blob/b20f7c03eac630b6441ba6f254128c1761dc45ad/dust.py) | - |
+| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/val/run.py) | - |
+| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1 h 47 min | [Script](https://github.com/qlabs-eng/noise/blob/a0c6faab203800fdffd8d21aa9a1076955846c8f/train/val/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
+| 5 | 4.082 | FP32 head in the direct draws reruns | 1 h 49 min | [Script](https://github.com/qlabs-eng/noise/blob/e66fad8c5ededde3efb18782fbdc17df11ed2534/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1 h 44 min | [Script](https://github.com/qlabs-eng/noise/blob/394a7db72a42fe43e168a2d864343bd55e0fb440/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/cda030253c923eaa55f4645d400cce0a4e8b0025/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
+| 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [Script](https://github.com/qlabs-eng/noise/blob/e64f3ac70b3c0bb3df3f95e423b1ef5ad208fc4b/train/val/run.py) | [@serdardoesml](https://github.com/serdardoesml) |
+| 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [Script](https://github.com/qlabs-eng/noise/blob/c8834a6ca99173a49b6d4fa557f241f2b1125ab2/train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
+| 10 | 3.896 | Own queries in Cut: each move also reaches its token's later attention through its own query | 10 min | [Script](https://github.com/qlabs-eng/noise/blob/75fbcb5030660f80819e4e6624a8509483294446/train/val/run.py) | [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ### Track 2: speedrun to 4.2
 
-| # | Val loss | Description | Time | Contributors |
-| - | - | - | - | - |
-| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | - |
-| 2 | 4.180 | Track 1 record at 5k population | 22 min | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
-| 3 | 4.184 | Compile the probe construction | 21 min | [@pculaf](https://github.com/pculaf) |
-| 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [@spicylemonade](https://github.com/spicylemonade) |
-| 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [@Euraba](https://github.com/Euraba) |
-| 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [@Euraba](https://github.com/Euraba) |
-| 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [@Lazarus-931](https://github.com/Lazarus-931) |
+| # | Val loss | Description | Time | Script | Contributors |
+| - | - | - | - | - | - |
+| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/speedrun/run.py) | - |
+| 2 | 4.180 | Track 1 record at 5k population | 22 min | [Script](https://github.com/qlabs-eng/noise/blob/254d02e021e5438e7909e21e8c6e85c71f0be7b0/train/speedrun/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
+| 3 | 4.184 | Compile the probe construction | 21 min | [Script](https://github.com/qlabs-eng/noise/blob/3ab01f01b79dfc509985c17723a4683de42afa16/train/speedrun/run.py) | [@pculaf](https://github.com/pculaf) |
+| 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [Script](https://github.com/qlabs-eng/noise/blob/7749eb125f40f634472fb59bb88022e4d8da429d/train/speedrun/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
+| 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [Script](https://github.com/qlabs-eng/noise/blob/cb06760d590b2112de2e876875c9e545f8c9dd10/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
+| 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [Script](https://github.com/qlabs-eng/noise/blob/300034eebc22d88b277e155e75e71bfe5fda68cf/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
+| 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [Script](https://github.com/qlabs-eng/noise/blob/2b592c572f2a103a8990a222cb316d9909577704/train/speedrun/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ## What backprop gets
 
