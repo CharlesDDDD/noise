@@ -27,9 +27,24 @@ is still its own experiment. The estimand becomes the attention-cut gradient plu
 change is formed as a difference throughout (the query's change, its qk-norm's change, then the attention's change as
 p expm1(ds - dlse)), so rounding scales with the change. Only each token's top 64 keys per head by its clean attention
 move their logits; the other logits are held, and their keys' share of the output rescales exactly by exp(-dlse).
+This entry moves each token's top 256 keys per head (the record before it: 64).
+
+Exact values (on by default, as in the track 2 record). Values and value-embedding gates by single-value experiments
+evaluated in closed form: moving position t's value moves query s's output by A[s, t] times the move, so the value
+credit is sum_s A[s, t] target_s, a linear map of the measured target; a gate's credit then takes its one step through
+the sigmoid (a central difference).
+
+Value path (on by default). Cut's estimand leaves out every path through another token's attention. One of them stays
+inside the no-backprop line: block i's measured mid-stream credit reaches each token's input stream through the
+block's values by linear maps only (W_proj^T, the clean attention A^T, W_v^T), then takes its one nonlinear step back
+through the block's RMS norm (a central forward difference along it). The identity path carries that credit down to
+the earlier blocks' streams, scaled by the residual scalars (linear). Having stepped once, it is used only where no
+further nonlinear step follows: the writers (attn.c_proj, mlp.c_proj) and the values. The MLP hidden layer, queries,
+keys and gates take their step from the measured credit alone.
 
 The model, init, optimizer (ANVIL II on block matrices, Adam elsewhere), rates and schedule shape are the Noise
-record's. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
+record's, except ANVIL at 1.6x its rate on its fast rail alone, Boost on the first 20% of the epoch, and Cut's MLP
+routes on each token's top quarter of the hidden units. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
 the weights, the optimizer state and the data order.
 
     torchrun --standalone --nproc_per_node=8 train/val/run.py                                        # benchmark model
@@ -66,8 +81,9 @@ class Recipe:
     lr: float = 0.003       # Adam; embeddings 300x, mixing scalars 30x
     betas: tuple = (0.7, 0.95)
     warmdown: float = 0.3   # final fraction of the epoch with linear lr decay
-    anvil_lr: float = 0.023
+    anvil_lr: float = 0.037
     anvil_wd: float = 2.25
+    fast_weight: float = 1.0  # ANVIL's fast rail alone (PR #360's blend: 0.4385)
 
 
 @dataclass
@@ -86,13 +102,15 @@ class Settings:
     boost_exact_keys: bool = True
     # Cut
     chain_sigma: float = 0.01
-    route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 16; HIDDEN: no restriction)
+    route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 4; HIDDEN: no restriction)
     chain_tokens: int = 256
     cut_exact_keys: bool = True
     own_query: bool = True      # Cut: a move also reaches its own token's later attentions through its own query
-    query_keys: int = 64        # own_query: keys per token per head whose logits move (0: all keys)
+    query_keys: int = 256       # own_query: keys per token per head whose logits move (0: all keys)
     key_sigma: float = 0.003
     key_chunk: int = 8
+    exact_values: bool = True   # values and gates by single-value experiments evaluated in closed form
+    value_path: bool = True     # Cut: the measured mid-stream credit also reaches each block's input through its values
 
 
 # ---------------------------------------------------------------------------------------------------------- helpers
@@ -251,6 +269,15 @@ def norm_difference(x, delta):
     inv0 = torch.rsqrt(sq / WIDTH + EPS)
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / WIDTH + EPS)
     return delta * inv.unsqueeze(-1) + x.unsqueeze(1) * (inv - inv0).unsqueeze(-1)
+
+
+def norm_move(x, v, sigma=0.01):
+    """(norm(x + s v) - norm(x - s v)) / 2s per token, s = sigma * rms(x) / rms(v): the RMS norm's change along v by a
+    central forward difference (its Jacobian is symmetric, so this is the one step back through it)."""
+    s = sigma * (x.square().mean(-1, keepdim=True) / v.square().mean(-1, keepdim=True).clamp_min(1e-30)).sqrt()
+    up = norm_difference(x, (s * v).unsqueeze(1))[:, 0]
+    down = norm_difference(x, (-s * v).unsqueeze(1))[:, 0]
+    return (up - down) / (2 * s)
 
 
 def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, window):
@@ -673,6 +700,30 @@ class Boost:
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
 
+    def exact_value_errors(self, kind, targets):
+        """Values or value-embedding gates by single-value experiments, evaluated exactly: moving position t's value
+        moves query s's output by A[s, t] times the move, so the credit is sum_s A[s, t] hub_s."""
+        d, model = self.capture, self.model
+        cfg = model.config
+        b, t = d.batch, d.length
+        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
+        errors = {}
+        for i in range(cfg.n_layer):
+            if kind == 'gate' and not has_ve(i, cfg.n_layer):
+                continue
+            A, _ = self.attention_maps(i)
+            hub = targets[i].view(b, t, h, hd).transpose(1, 2).float()
+            credit = (A.float().transpose(-1, -2) @ hub).transpose(1, 2)
+            if kind == 'v':
+                errors[f'transformer.h.{i}.attn.c_v'] = credit.reshape(b, t, h * hd)
+            else:
+                z = d.outputs[f'transformer.h.{i}.attn.ve_gate'].float()
+                ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, hd)
+                step = 0.1
+                slope = (torch.sigmoid(z + step) - torch.sigmoid(z - step)) / step
+                errors[f'transformer.h.{i}.attn.ve_gate'] = slope * (credit * ve).sum(-1)
+        return errors
+
     def value_errors(self, kind, draws, targets):
         """Values ('v') or value-embedding gates ('gate') by the record's local step: every position's value moves
         along its own code, the attention (linear in its values, with the clean probabilities) carries the moves to
@@ -740,7 +791,7 @@ class Boost:
         weight = model.lm_head.weight.float()[:model.config.vocab_size]
         return readout_losses(xmid.float().flatten(0, 1), weight, y.flatten())
 
-    def internals(self, gradients, targets, b, t, exact_keys):
+    def internals(self, gradients, targets, b, t, exact_keys, value_targets=None):
         """Queries, keys, values, gates and value embeddings, one local step from the targets."""
         d, s, L = self.capture, self.s, self.model.config.n_layer
         self.maps = {}
@@ -749,6 +800,10 @@ class Boost:
                 continue
             if kind == 'k' and exact_keys:
                 local = self.exact_key_errors(targets)  # each GPU of a sequence fills its share of directions
+            elif kind in ('v', 'gate') and s.exact_values:
+                local = self.exact_value_errors(kind, value_targets if (kind == 'v' and value_targets) else targets)
+                if self.part:  # every GPU of a sequence forms them in full: kept by its first GPU only
+                    local = {site: torch.zeros_like(error) for site, error in local.items()}
             else:
                 draws = count // self.split
                 local = self.value_errors(kind, draws, targets) if kind in ('v', 'gate') else \
@@ -932,6 +987,29 @@ class Cut(Boost):
             windows.append(model.window_sizes[i][0])
         return (torch.arange(T, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
 
+    def value_path_credit(self, chain, b, t):
+        """Extra credit at each block's output: block i's measured mid-stream credit reaches its input stream through
+        its values (every query's target weighted by its clean attention to the token, then W_v^T; all linear) and one
+        step through the RMS norm (a central forward difference); the identity path carries it down, times the
+        residual scalars. Returns {block: (n, W)}."""
+        model, d = self.model, self.capture
+        cfg = model.config
+        L, h = cfg.n_layer, cfg.n_head
+        hd = WIDTH // h
+        lam_r = model.resid_lambdas.float()
+        self.maps = {}  # this step's attention maps (internals() starts afresh too)
+        vp = {}
+        for i in range(1, L):
+            attn = model.transformer.h[i].attn
+            A, _ = self.attention_maps(i)  # (b, h, query, key)
+            hub = (chain[i] @ attn.c_proj.weight.float()).view(b, t, h, hd).transpose(1, 2)
+            ev = (A.float().transpose(-1, -2) @ hub).transpose(1, 2).reshape(b * t, WIDTH)
+            vp[i] = norm_move(d.blocks[i].float().flatten(0, 1), ev @ attn.c_v.weight.float())
+        extra = {L - 1: torch.zeros_like(chain[0])}
+        for j in reversed(range(L - 1)):
+            extra[j] = lam_r[j + 1] * (vp[j + 1] + extra[j + 1])
+        return extra
+
     @staticmethod
     def strong_keys(own, k):
         """own_query's inputs restricted to each token's top k keys per head by its clean attention: their keys,
@@ -1007,15 +1085,20 @@ class Cut(Boost):
         chain = self.chain_credits(e, x0, mids, outs, routes, yf)
         self.tick('chain')
         lam_r = model.resid_lambdas.float()
-        targets = {}
+        targets, value_targets = {}, {}
+        extra = self.value_path_credit(chain, b, t) if s.value_path else None
+        self.tick('value_path')
         scalars = torch.zeros(2, L, device=self.device)
         for i in range(L):
             p = f'transformer.h.{i}.'
             block = model.transformer.h[i]
             d_mid = chain[i]
             d_out = lam_r[i + 1] * chain[i + 1] if i < L - 1 else g_top
-            gradients[p + 'attn.c_proj.weight'] = d_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
-            gradients[p + 'mlp.c_proj.weight'] = d_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
+            x_mid, x_out = (d_mid, d_out) if extra is None else (d_mid + extra[i], d_out + extra[i])
+            gradients[p + 'attn.c_proj.weight'] = x_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
+            gradients[p + 'mlp.c_proj.weight'] = x_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
+            if extra is not None:
+                value_targets[i] = (x_mid @ block.attn.c_proj.weight.float()).view(b, t, WIDTH)
             u = d.outputs[p + 'mlp.c_fc'].float().flatten(0, 1)
             hidden = self.hidden_credit(u, d_out, block.mlp.c_proj.weight)
             gradients[p + 'mlp.c_fc.weight'] = hidden.T @ d.inputs[p + 'mlp.c_fc'].flatten(0, 1)
@@ -1024,7 +1107,7 @@ class Cut(Boost):
             scalars[:, i] = chain['lam', i]
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         self.tick('writers_hidden')
-        self.internals(gradients, targets, b, t, s.cut_exact_keys)
+        self.internals(gradients, targets, b, t, s.cut_exact_keys, value_targets or None)
         self.tick('local')
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, WIDTH))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
@@ -1221,7 +1304,7 @@ def make_optimizer(model, recipe, steps):
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW([{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
                              betas=recipe.betas, eps=1e-8, weight_decay=0.0)
-    return Optimizers(Anvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps), adam)
+    return Optimizers(Anvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps, fast_weight=recipe.fast_weight), adam)
 
 
 @torch.no_grad()
@@ -1257,8 +1340,8 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('logs/val'))
     parser.add_argument('--preset', choices=sorted(PRESETS), default='38m')
     parser.add_argument('--seed', type=int, default=SEED)
-    parser.add_argument('--switch', type=float, default=0.3, help='Fraction of the epoch trained by Boost.')
-    parser.add_argument('--route-k', type=int, default=0, help='Cut: MLP units per token per block (0: hidden/16).')
+    parser.add_argument('--switch', type=float, default=0.2, help='Fraction of the epoch trained by Boost.')
+    parser.add_argument('--route-k', type=int, default=0, help='Cut: MLP units per token per block (0: hidden/4).')
     parser.add_argument('--estimator', choices=('cut', 'dfa'), default='cut', help='Phase 2 (dfa: the direct '
                         'feedback alignment baseline).')
     parser.add_argument('--keys', choices=('exact', 'sampled'), default='exact', help='Cut\'s keys.')
@@ -1271,7 +1354,7 @@ def main():
                         '(0: a full cycle; fewer: the forward-gradient local-loss baseline).')
     parser.add_argument('--own-query', action=argparse.BooleanOptionalAction, default=True, help='Cut: a move also '
                         'reaches its own token\'s later attentions through its own query (keys and values held clean).')
-    parser.add_argument('--query-keys', type=int, default=64, help='own_query: keys per token per head whose logits '
+    parser.add_argument('--query-keys', type=int, default=256, help='own_query: keys per token per head whose logits '
                         'move (0: all keys).')
     parser.add_argument('--chain-tokens', type=int, default=0)
     parser.add_argument('--key-chunk', type=int, default=0)
@@ -1290,7 +1373,7 @@ def main():
     HIDDEN = 4 * WIDTH
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
-    settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
+    settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 4,
                         cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
                         own_query=args.own_query, query_keys=args.query_keys)
     if args.boost_probes:

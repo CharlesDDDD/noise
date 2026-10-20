@@ -78,6 +78,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [Script](https://github.com/qlabs-eng/noise/blob/e64f3ac70b3c0bb3df3f95e423b1ef5ad208fc4b/train/val/run.py) | [@serdardoesml](https://github.com/serdardoesml) |
 | 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [Script](https://github.com/qlabs-eng/noise/blob/c8834a6ca99173a49b6d4fa557f241f2b1125ab2/train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
 | 10 | 3.896 | Own queries in Cut: each move also reaches its token's later attention through its own query | 10 min | [Script](https://github.com/qlabs-eng/noise/blob/75fbcb5030660f80819e4e6624a8509483294446/train/val/run.py) | [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931) |
+| 11 | 3.830 | Exact values, and a value path in Cut: each block's measured credit also reaches its inputs through its values (linear) and one RMS-norm step | 14 min | [Script](train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
 
 ### Track 2: speedrun to 4.2
 

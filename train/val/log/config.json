@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/ar/runs/pr19_s0/src/train/val/run.py",
+  "script": "/home/chunyuan/noise/train/val/run.py",
   "world": 8,
   "preset": "38m",
   "model": {
@@ -12,9 +12,9 @@
     "window_pattern": "SSSL"
   },
   "seed": 0,
-  "switch": 0.3,
-  "boost_steps": 366,
-  "cut_steps": 427,
+  "switch": 0.2,
+  "boost_steps": 244,
+  "cut_steps": 488,
   "boost_batch": 4,
   "cut_batch": 8,
   "train_file": "train.pt",
@@ -26,8 +26,9 @@
       0.95
     ],
     "warmdown": 0.3,
-    "anvil_lr": 0.023,
-    "anvil_wd": 2.25
+    "anvil_lr": 0.037,
+    "anvil_wd": 2.25,
+    "fast_weight": 1.0
   },
   "settings": {
     "sigma": 0.005,
@@ -46,13 +47,15 @@
     "chunk": 134217728,
     "boost_exact_keys": true,
     "chain_sigma": 0.01,
-    "route_k": 128,
+    "route_k": 512,
     "chain_tokens": 256,
     "cut_exact_keys": true,
     "own_query": true,
-    "query_keys": 64,
+    "query_keys": 256,
     "key_sigma": 0.003,
-    "key_chunk": 8
+    "key_chunk": 8,
+    "exact_values": true,
+    "value_path": true
   },
   "polar_margin": 1.1,
   "torch_version": "2.10.0+cu128"
