@@ -1,8 +1,8 @@
 {
-  "script": "/root/noise/train/speedrun/run.py",
+  "script": "/home/dev/pr/train/speedrun/run.py",
   "world": 8,
-  "batch": 4,
-  "steps": 900,
+  "batch": 8,
+  "steps": 610,
   "seed": 0,
   "target": 4.2,
   "recipe": {
@@ -19,13 +19,11 @@
     "sigma": 0.005,
     "fc_k": 256,
     "fc_sigma": 0.05,
-    "queries": 64,
+    "query_draws": 64,
     "nrep": 64,
+    "chunk": 134217728,
     "key_sigma": 0.003,
-    "key_chunk": 8,
-    "emb_chunk": 16,
-    "scalar_step": 0.01,
-    "chunk": 1073741824
+    "key_chunk": 8
   },
   "torch_version": "2.10.0+cu128"
 }

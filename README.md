@@ -84,6 +84,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [@spicylemonade](https://github.com/spicylemonade) |
 | 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [@Euraba](https://github.com/Euraba) |
 | 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [@Euraba](https://github.com/Euraba) |
+| 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [@Lazarus-931](https://github.com/Lazarus-931) |
 
 ## What backprop gets
 
