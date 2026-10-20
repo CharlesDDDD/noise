@@ -43,6 +43,8 @@ class Recipe:
 
 @dataclass
 class Settings:
+    fast_keys: bool = False
+    fast_hidden: bool = False
     sigma: float = 0.005        # top-stream probe step, relative to the stream's RMS at that token
     fc_k: int = 256             # MLP units moved per token for the hidden credit
     fc_sigma: float = 0.05
@@ -145,6 +147,35 @@ def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
     dl = torch.einsum('hsd,hjtd->hjst', qp, dk) / d ** 0.5
     change = A[:, None] * torch.expm1(dl)
     return (change / (1 + change) * C[:, None]).sum(2).transpose(1, 2) / steps
+
+
+@torch.compile(dynamic=False)
+def factored_key(qp, k_raw, steps, cos, sin, A, C, j, qr):
+    """The finite coordinate-key probe, sharing q @ rotated_key across directions."""
+    d = k_raw.shape[-1]
+    half = d // 2
+    x1, x2 = k_raw.chunk(2, -1)
+    r = torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], -1)
+    clean = r.square().sum(-1, keepdim=True) + d * EPS
+    jj = j % half
+    rho = (cos.square() + sin.square())[:, jj].T
+    kj = k_raw[:, :, j].transpose(1, 2)
+    st = steps.transpose(1, 2)
+    # Retain the complete finite change in the norm, including the squared step.
+    eta = rho[None] * (2 * st * kj + st.square()) / clean.transpose(1, 2)
+    a0 = torch.rsqrt(clean / d).transpose(1, 2)
+    da = a0 * torch.expm1(-.5 * torch.log1p(eta))
+    a = a0 + da
+    q1 = qp[:, :, jj].transpose(1, 2)
+    q2 = qp[:, :, jj + half].transpose(1, 2)
+    c, s = cos[:, jj].T, sin[:, jj].T
+    sparse = torch.where((j < half)[None, :, None, None],
+        q1[:, :, :, None] * c[None, :, None, :] - q2[:, :, :, None] * s[None, :, None, :],
+        q1[:, :, :, None] * s[None, :, None, :] + q2[:, :, :, None] * c[None, :, None, :])
+    dl = (qr[:, None] * da[:, :, None, :] + st[:, :, None, :] * a[:, :, None, :] * sparse) / (d ** .5)
+    # This is the full finite attention response, not a softmax derivative.
+    change = A[:, None] * torch.expm1(dl)
+    return ((change / (1 + change) * C[:, None]).sum(2) / st).transpose(1, 2)
 
 
 class Capture:
@@ -363,9 +394,18 @@ class IdentityPath:
                 hub = targets[i][r].view(t, h, hd).transpose(0, 1)
                 C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
                 steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+                qr = None
+                if s.fast_keys:
+                    first, second = k_raw.chunk(2, -1)
+                    rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
+                    qr = qp @ rotated.transpose(-1, -2)
                 for j0 in range(lo, hi, s.key_chunk):
                     j1 = min(j0 + s.key_chunk, hi)
-                    credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
+                    if s.fast_keys:
+                        directions = torch.arange(j0, j1, device=self.device)
+                        credit_all[r, :, :, j0:j1] = factored_key(qp, k_raw, steps, cos, sin, A, C, directions, qr)
+                    else:
+                        credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
             self.key_credit[i] = credit_all
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
@@ -397,6 +437,16 @@ class IdentityPath:
     def hidden_credit(self, u, g, out_weight):
         """MLP hidden credit, one local step from the measured credit g at the block output: each token's fc_k
         largest units move along a sign-flipped Hadamard cycle, through relu^2 and the output projection."""
+        if self.s.fast_hidden:
+            k = self.s.fc_k
+            self.signs(k)  # preserve the removed sign draw
+            top = u.topk(k, dim=-1, sorted=False).indices
+            uk = u.gather(1, top)
+            steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+            slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
+            projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
+            selected = projection.gather(1, top) * slope
+            return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
         k = self.s.fc_k
         Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
         top = u.topk(k, dim=-1, sorted=False).indices
@@ -656,6 +706,9 @@ def make_optimizer(model, recipe, steps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
+    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--fast-keys', action='store_true', help='Factor the same finite coordinate-key probes.')
+    parser.add_argument('--fast-hidden', action='store_true', help='Reassociate finite hidden probes on unchanged support.')
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
@@ -671,7 +724,7 @@ def main():
     torch.set_float32_matmul_precision('high')
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
-    recipe, settings, config = Recipe(), Settings(), GPTConfig()
+    recipe, settings, config = Recipe(), Settings(fast_keys=args.fast_keys, fast_hidden=args.fast_hidden), GPTConfig()
 
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
@@ -682,13 +735,13 @@ def main():
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
-            script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED, target=TARGET,
+            script=__file__, world=world, batch=BATCH, steps=steps, seed=args.seed, target=TARGET,
             recipe=asdict(recipe), settings=asdict(settings), torch_version=torch.__version__,
         ), indent=2) + '\n')
 
     def init():
-        model = make_model(device, SEED, config)
-        return model, make_optimizer(model, recipe, steps), IdentityPath(model, settings, SEED, rank, world)
+        model = make_model(device, args.seed, config)
+        return model, make_optimizer(model, recipe, steps), IdentityPath(model, settings, args.seed, rank, world)
 
     def set_rate(optimizer, step):
         left = (steps - step + 1) / steps

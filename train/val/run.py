@@ -72,6 +72,8 @@ class Recipe:
 
 @dataclass
 class Settings:
+    fast_keys: bool = False
+    fast_hidden: bool = False
     # Boost
     sigma: float = 0.005        # readout probe step, relative to the probed vector's RMS at that token
     probes: int = 0             # directions per token per readout (0: a full cycle, exact; fewer: a forward-gradient
@@ -375,6 +377,35 @@ def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
 
 # ---------------------------------------------------------------------------------------------------- the clean pass
 
+@torch.compile(dynamic=False)
+def factored_key(qp, k_raw, steps, cos, sin, A, C, j, qr):
+    """The finite coordinate-key probe, sharing q @ rotated_key across directions."""
+    d = k_raw.shape[-1]
+    half = d // 2
+    x1, x2 = k_raw.chunk(2, -1)
+    r = torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], -1)
+    clean = r.square().sum(-1, keepdim=True) + d * EPS
+    jj = j % half
+    rho = (cos.square() + sin.square())[:, jj].T
+    kj = k_raw[:, :, j].transpose(1, 2)
+    st = steps.transpose(1, 2)
+    # Retain the complete finite change in the norm, including the squared step.
+    eta = rho[None] * (2 * st * kj + st.square()) / clean.transpose(1, 2)
+    a0 = torch.rsqrt(clean / d).transpose(1, 2)
+    da = a0 * torch.expm1(-.5 * torch.log1p(eta))
+    a = a0 + da
+    q1 = qp[:, :, jj].transpose(1, 2)
+    q2 = qp[:, :, jj + half].transpose(1, 2)
+    c, s = cos[:, jj].T, sin[:, jj].T
+    sparse = torch.where((j < half)[None, :, None, None],
+        q1[:, :, :, None] * c[None, :, None, :] - q2[:, :, :, None] * s[None, :, None, :],
+        q1[:, :, :, None] * s[None, :, None, :] + q2[:, :, :, None] * c[None, :, None, :])
+    dl = (qr[:, None] * da[:, :, None, :] + st[:, :, None, :] * a[:, :, None, :] * sparse) / (d ** .5)
+    # This is the full finite attention response, not a softmax derivative.
+    change = A[:, None] * torch.expm1(dl)
+    return ((change / (1 + change) * C[:, None]).sum(2) / st).transpose(1, 2)
+
+
 class Capture:
     """The clean forward's cached activations, and the record's orthogonal draws and coordinate head."""
 
@@ -666,9 +697,18 @@ class Boost:
                 hub = targets[i][r].view(t, h, hd).transpose(0, 1)
                 C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
                 steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+                qr = None
+                if s.fast_keys:
+                    first, second = k_raw.chunk(2, -1)
+                    rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
+                    qr = qp @ rotated.transpose(-1, -2)
                 for j0 in range(lo, hi, s.key_chunk):
                     j1 = min(j0 + s.key_chunk, hi)
-                    credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
+                    if s.fast_keys:
+                        directions = torch.arange(j0, j1, device=self.device)
+                        credit_all[r, :, :, j0:j1] = factored_key(qp, k_raw, steps, cos, sin, A, C, directions, qr)
+                    else:
+                        credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
             self.key_credit[i] = credit_all
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
@@ -714,6 +754,16 @@ class Boost:
     def hidden_credit(self, u, g, out_weight):
         """MLP hidden credit, one local step from the measured credit g at the block output: each token's fc_k
         largest units move along a sign-flipped Hadamard cycle, through relu^2 and the output projection."""
+        if self.s.fast_hidden:
+            k = self.s.fc_k
+            self.signs(k)  # preserve the removed sign draw
+            top = u.topk(k, dim=-1, sorted=False).indices
+            uk = u.gather(1, top)
+            steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+            slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
+            projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
+            selected = projection.gather(1, top) * slope
+            return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
         k = self.s.fc_k
         Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
         top = u.topk(k, dim=-1, sorted=False).indices
@@ -1254,6 +1304,8 @@ def main():
     global WIDTH, HIDDEN
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
+    parser.add_argument('--fast-keys', action='store_true', help='Factor the same finite coordinate-key probes.')
+    parser.add_argument('--fast-hidden', action='store_true', help='Reassociate finite hidden probes on unchanged support.')
     parser.add_argument('--output', type=Path, default=Path('logs/val'))
     parser.add_argument('--preset', choices=sorted(PRESETS), default='38m')
     parser.add_argument('--seed', type=int, default=SEED)
@@ -1290,7 +1342,7 @@ def main():
     HIDDEN = 4 * WIDTH
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
-    settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
+    settings = Settings(fast_keys=args.fast_keys, fast_hidden=args.fast_hidden, fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
                         cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
                         own_query=args.own_query, query_keys=args.query_keys)
     if args.boost_probes:
