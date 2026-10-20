@@ -212,15 +212,6 @@ def code_estimate(credited, a):
 
 
 @torch.compile(dynamic=False)
-def hidden_scores(ut, st, Hk, cols, g):
-    moved = st.unsqueeze(-1) * Hk
-    change = F.relu(ut.unsqueeze(1) + moved).square() - F.relu(ut.unsqueeze(1) - moved).square()
-    stream_change = torch.bmm(change.to(torch.bfloat16), cols)
-    scored = torch.bmm(stream_change, g.to(torch.bfloat16).unsqueeze(-1)).squeeze(-1).float()
-    return scored / (2 * st)
-
-
-@torch.compile(dynamic=False)
 def embedding_moves(e, steps, rows, sign, wq, wk, wv, cos, sin):
     n, (b, t, width) = rows.shape[0], e.shape
     hd = 2 * cos.shape[-1]
@@ -356,21 +347,32 @@ KEY_BUCKET = 256  # own_query: key windows are cut to multiples of this, to boun
 
 
 @torch.compile(dynamic=False)
-def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
-    """Single-key experiments, each evaluated exactly: the raw key at position t moves by steps_t e_j and nothing
-    else moves, so each query's attention changes in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
-    a' = a exp(dl). Scored against each query's target (C[s, t] = hub_s . (v_t - o_s)): one local step, as the
-    record's coordinate head scores single-logit moves. The processed key's change is formed exactly before the
-    logit product. qp, kp, k_raw (h, T, d); steps (h, T, 1); cos, sin (T, d/2); A, C (h, T, T), A zero outside the
-    window; basis (J, d). Returns (h, T, J)."""
+def key_scores(qp, k_raw, steps, cos, sin, A, C, j, qr):
+    """The finite coordinate-key probe, sharing q @ rotated_key across directions."""
     d = k_raw.shape[-1]
-    moved = k_raw.unsqueeze(1) + steps.unsqueeze(1) * basis[None, :, None, :]
-    x1, x2 = moved[..., :d // 2], moved[..., d // 2:]
-    moved = torch.cat([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], -1)
-    dk = moved * torch.rsqrt(moved.square().mean(-1, keepdim=True) + EPS) - kp.unsqueeze(1)
-    dl = torch.einsum('hsd,hjtd->hjst', qp, dk) / d ** 0.5
+    half = d // 2
+    x1, x2 = k_raw.chunk(2, -1)
+    r = torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], -1)
+    clean = r.square().sum(-1, keepdim=True) + d * EPS
+    jj = j % half
+    rho = (cos.square() + sin.square())[:, jj].T
+    kj = k_raw[:, :, j].transpose(1, 2)
+    st = steps.transpose(1, 2)
+    # Retain the complete finite change in the norm, including the squared step.
+    eta = rho[None] * (2 * st * kj + st.square()) / clean.transpose(1, 2)
+    a0 = torch.rsqrt(clean / d).transpose(1, 2)
+    da = a0 * torch.expm1(-.5 * torch.log1p(eta))
+    a = a0 + da
+    q1 = qp[:, :, jj].transpose(1, 2)
+    q2 = qp[:, :, jj + half].transpose(1, 2)
+    c, s = cos[:, jj].T, sin[:, jj].T
+    sparse = torch.where((j < half)[None, :, None, None],
+        q1[:, :, :, None] * c[None, :, None, :] - q2[:, :, :, None] * s[None, :, None, :],
+        q1[:, :, :, None] * s[None, :, None, :] + q2[:, :, :, None] * c[None, :, None, :])
+    dl = (qr[:, None] * da[:, :, None, :] + st[:, :, None, :] * a[:, :, None, :] * sparse) / (d ** .5)
+    # This is the full finite attention response, not a softmax derivative.
     change = A[:, None] * torch.expm1(dl)
-    return (change / (1 + change) * C[:, None]).sum(2).transpose(1, 2) / steps
+    return ((change / (1 + change) * C[:, None]).sum(2) / st).transpose(1, 2)
 
 
 # ---------------------------------------------------------------------------------------------------- the clean pass
@@ -646,7 +648,6 @@ class Boost:
         unit = lambda z: z * torch.rsqrt(z.square().mean(-1, keepdim=True) + EPS)
         pos = torch.arange(t, device=self.device)
         lag = pos[:, None] - pos[None, :]
-        eye = torch.eye(hd, device=self.device)
         lo, hi = self.share(hd)
         errors, self.key_credit = {}, {}
         for i in range(L):
@@ -666,9 +667,13 @@ class Boost:
                 hub = targets[i][r].view(t, h, hd).transpose(0, 1)
                 C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
                 steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+                first, second = k_raw.chunk(2, -1)
+                rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
+                qr = qp @ rotated.transpose(-1, -2)
                 for j0 in range(lo, hi, s.key_chunk):
                     j1 = min(j0 + s.key_chunk, hi)
-                    credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
+                    directions = torch.arange(j0, j1, device=self.device)
+                    credit_all[r, :, :, j0:j1] = key_scores(qp, k_raw, steps, cos, sin, A, C, directions, qr)
             self.key_credit[i] = credit_all
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
@@ -715,21 +720,14 @@ class Boost:
         """MLP hidden credit, one local step from the measured credit g at the block output: each token's fc_k
         largest units move along a sign-flipped Hadamard cycle, through relu^2 and the output projection."""
         k = self.s.fc_k
-        Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
+        self.signs(k)  # preserve the removed sign draw
         top = u.topk(k, dim=-1, sorted=False).indices
         uk = u.gather(1, top)
         steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-        columns = out_weight.to(torch.bfloat16).T.contiguous()
-        credit = torch.zeros_like(u)
-        lo, hi = self.share(k)
-        Hs = Hk[lo:hi]
-        per = max(1, 2 ** 26 // (k * WIDTH))
-        for t0 in range(0, u.shape[0], per):
-            ut, st, tt, gt = uk[t0:t0 + per], steps[t0:t0 + per], top[t0:t0 + per], g[t0:t0 + per]
-            cols = F.embedding(tt, columns)
-            derivative = hidden_scores(ut, st, Hs, cols, gt)
-            credit[t0:t0 + per].scatter_(1, tt, derivative @ Hs / k)
-        return credit
+        slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
+        projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
+        selected = projection.gather(1, top) * slope
+        return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
 
     def stage_losses(self, i, lam_r, lam_0, x_prev, x0, ve, y):
         model, block = self.model, self.model.transformer.h[i]

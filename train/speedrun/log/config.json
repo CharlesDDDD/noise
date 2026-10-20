@@ -1,5 +1,5 @@
 {
-  "script": "/home/dev/pr/train/speedrun/run.py",
+  "script": "/home/ubuntu/ar/runs/pr24s_s0/src/train/val/run.py",
   "world": 8,
   "batch": 8,
   "steps": 610,

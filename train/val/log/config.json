@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/ar/runs/pr19_s0/src/train/val/run.py",
+  "script": "/home/ubuntu/ar/runs/pr24v_s0/src/train/val/run.py",
   "world": 8,
   "preset": "38m",
   "model": {

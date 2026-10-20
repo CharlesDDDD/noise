@@ -90,6 +90,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [Script](https://github.com/qlabs-eng/noise/blob/cb06760d590b2112de2e876875c9e545f8c9dd10/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
 | 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [Script](https://github.com/qlabs-eng/noise/blob/300034eebc22d88b277e155e75e71bfe5fda68cf/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
 | 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [Script](https://github.com/qlabs-eng/noise/blob/2b592c572f2a103a8990a222cb316d9909577704/train/speedrun/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
+| 8 | 4.174 | Factored finite key and hidden probes | 1 min 2 s | [Script](https://github.com/qlabs-eng/noise/blob/90073fae22811409c1496b8b2339d90c5e311652/train/speedrun/run.py) | [@jon123boss](https://github.com/jon123boss) |
 
 ## What backprop gets
 
