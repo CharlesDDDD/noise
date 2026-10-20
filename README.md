@@ -82,6 +82,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 2 | 4.180 | Track 1 record at 5k population | 22 min | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
 | 3 | 4.184 | Compile the probe construction | 21 min | [@pculaf](https://github.com/pculaf) |
 | 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [@spicylemonade](https://github.com/spicylemonade) |
+| 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [@Euraba](https://github.com/Euraba) |
 
 ## What backprop gets
 

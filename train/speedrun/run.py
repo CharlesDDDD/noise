@@ -51,11 +51,14 @@ from utils.model import GPT, GPTConfig, attention, apply_rotary_emb, flex, has_v
 from utils.prepare_data import TRAIN_ROWS, load_rows
 
 BATCH = 4  # sequences per update; 1,220 updates per epoch
+UPDATES = 1050  # the first 4,200 of the 4,880 sequences already reach TARGET: the run stops there
 SEED = 0
 TARGET = 4.2  # validation loss to reach; the run counts only if its final weights reach it
 WIDTH = 512
 EPS = torch.finfo(torch.float32).eps
 torch._dynamo.config.cache_size_limit = 64
+torch._inductor.config.max_autotune = True  # kernels tuned while compiling, in the untimed warmup
+torch._inductor.config.coordinate_descent_tuning = True
 
 
 @dataclass
@@ -63,7 +66,7 @@ class Recipe:
     """The record's optimizer settings."""
     lr: float = 0.003       # Adam; embeddings 300x, mixing scalars 30x
     betas: tuple = (0.7, 0.95)
-    warmdown: float = 0.3   # final fraction of the epoch with linear lr decay
+    warmdown: float = 0.3   # final fraction of the run with linear lr decay
     anvil_lr: float = 0.023
     anvil_wd: float = 2.25
 
@@ -80,7 +83,7 @@ class Settings:
     nrep: int = 64              # draws per batched attention rerun
     emb_chunk: int = 16         # embedding probes per batched rerun
     scalar_step: float = 0.01   # central-difference step of the mixing scalars
-    chunk: int = 2 ** 27        # elements per probe chunk (tokens x probes x vocab)
+    chunk: int = 2 ** 30        # elements per probe chunk (tokens x probes x vocab): few, large launches
 
 
 @torch.compile
@@ -812,7 +815,7 @@ def main():
 
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
-    steps = min(len(training) // BATCH, args.steps or len(training))
+    steps = min(len(training) // BATCH, args.steps or UPDATES)
     per = max(1, BATCH // world)  # sequences per GPU group
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
