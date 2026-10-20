@@ -43,8 +43,6 @@ class Recipe:
 
 @dataclass
 class Settings:
-    fast_keys: bool = False
-    fast_hidden: bool = False
     sigma: float = 0.005        # top-stream probe step, relative to the stream's RMS at that token
     fc_k: int = 256             # MLP units moved per token for the hidden credit
     fc_sigma: float = 0.05
@@ -123,34 +121,7 @@ def code_estimate(credited, a):
 
 
 @torch.compile(dynamic=False)
-def hidden_scores(ut, st, Hk, cols, g):
-    moved = st.unsqueeze(-1) * Hk
-    change = F.relu(ut.unsqueeze(1) + moved).square() - F.relu(ut.unsqueeze(1) - moved).square()
-    stream_change = torch.bmm(change.to(torch.bfloat16), cols)
-    scored = torch.bmm(stream_change, g.to(torch.bfloat16).unsqueeze(-1)).squeeze(-1).float()
-    return scored / (2 * st)
-
-
-@torch.compile(dynamic=False)
-def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
-    """Single-key experiments, each evaluated exactly: the raw key at position t moves by steps_t e_j and nothing
-    else moves, so each query's attention changes in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
-    a' = a exp(dl). Scored against each query's target (C[s, t] = hub_s . (v_t - o_s)): one local step, as the
-    record's coordinate head scores single-logit moves. The processed key's change is formed exactly before the
-    logit product. qp, kp, k_raw (h, T, d); steps (h, T, 1); cos, sin (T, d/2); A, C (h, T, T), A zero outside the
-    window; basis (J, d). Returns (h, T, J)."""
-    d = k_raw.shape[-1]
-    moved = k_raw.unsqueeze(1) + steps.unsqueeze(1) * basis[None, :, None, :]
-    x1, x2 = moved[..., :d // 2], moved[..., d // 2:]
-    moved = torch.cat([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], -1)
-    dk = moved * torch.rsqrt(moved.square().mean(-1, keepdim=True) + EPS) - kp.unsqueeze(1)
-    dl = torch.einsum('hsd,hjtd->hjst', qp, dk) / d ** 0.5
-    change = A[:, None] * torch.expm1(dl)
-    return (change / (1 + change) * C[:, None]).sum(2).transpose(1, 2) / steps
-
-
-@torch.compile(dynamic=False)
-def factored_key(qp, k_raw, steps, cos, sin, A, C, j, qr):
+def key_scores(qp, k_raw, steps, cos, sin, A, C, j, qr):
     """The finite coordinate-key probe, sharing q @ rotated_key across directions."""
     d = k_raw.shape[-1]
     half = d // 2
@@ -374,7 +345,6 @@ class IdentityPath:
         unit = lambda z: z * torch.rsqrt(z.square().mean(-1, keepdim=True) + EPS)
         pos = torch.arange(t, device=self.device)
         lag = pos[:, None] - pos[None, :]
-        eye = torch.eye(hd, device=self.device)
         lo, hi = 0, hd
         errors, self.key_credit = {}, {}
         for i in range(L):
@@ -394,18 +364,13 @@ class IdentityPath:
                 hub = targets[i][r].view(t, h, hd).transpose(0, 1)
                 C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
                 steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-                qr = None
-                if s.fast_keys:
-                    first, second = k_raw.chunk(2, -1)
-                    rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
-                    qr = qp @ rotated.transpose(-1, -2)
+                first, second = k_raw.chunk(2, -1)
+                rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
+                qr = qp @ rotated.transpose(-1, -2)
                 for j0 in range(lo, hi, s.key_chunk):
                     j1 = min(j0 + s.key_chunk, hi)
-                    if s.fast_keys:
-                        directions = torch.arange(j0, j1, device=self.device)
-                        credit_all[r, :, :, j0:j1] = factored_key(qp, k_raw, steps, cos, sin, A, C, directions, qr)
-                    else:
-                        credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
+                    directions = torch.arange(j0, j1, device=self.device)
+                    credit_all[r, :, :, j0:j1] = key_scores(qp, k_raw, steps, cos, sin, A, C, directions, qr)
             self.key_credit[i] = credit_all
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
@@ -437,30 +402,15 @@ class IdentityPath:
     def hidden_credit(self, u, g, out_weight):
         """MLP hidden credit, one local step from the measured credit g at the block output: each token's fc_k
         largest units move along a sign-flipped Hadamard cycle, through relu^2 and the output projection."""
-        if self.s.fast_hidden:
-            k = self.s.fc_k
-            self.signs(k)  # preserve the removed sign draw
-            top = u.topk(k, dim=-1, sorted=False).indices
-            uk = u.gather(1, top)
-            steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-            slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
-            projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
-            selected = projection.gather(1, top) * slope
-            return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
         k = self.s.fc_k
-        Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
+        self.signs(k)  # preserve the removed sign draw
         top = u.topk(k, dim=-1, sorted=False).indices
         uk = u.gather(1, top)
         steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-        columns = out_weight.to(torch.bfloat16).T.contiguous()
-        credit = torch.zeros_like(u)
-        per = max(1, 2 ** 26 // (k * WIDTH))
-        for t0 in range(0, u.shape[0], per):
-            ut, st, tt, gt = uk[t0:t0 + per], steps[t0:t0 + per], top[t0:t0 + per], g[t0:t0 + per]
-            cols = F.embedding(tt, columns)
-            derivative = hidden_scores(ut, st, Hk, cols, gt)
-            credit[t0:t0 + per].scatter_(1, tt, derivative @ Hk / k)
-        return credit
+        slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
+        projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
+        selected = projection.gather(1, top) * slope
+        return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
 
     def internals(self, gradients, targets, b, t):
         """Queries, keys, values, gates and value embeddings, one local step from the targets."""
@@ -706,9 +656,6 @@ def make_optimizer(model, recipe, steps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
-    parser.add_argument('--seed', type=int, default=SEED)
-    parser.add_argument('--fast-keys', action='store_true', help='Factor the same finite coordinate-key probes.')
-    parser.add_argument('--fast-hidden', action='store_true', help='Reassociate finite hidden probes on unchanged support.')
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
@@ -724,7 +671,7 @@ def main():
     torch.set_float32_matmul_precision('high')
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
-    recipe, settings, config = Recipe(), Settings(fast_keys=args.fast_keys, fast_hidden=args.fast_hidden), GPTConfig()
+    recipe, settings, config = Recipe(), Settings(), GPTConfig()
 
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
@@ -735,13 +682,13 @@ def main():
             raise FileExistsError(f'Choose an empty output directory: {args.output}')
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
-            script=__file__, world=world, batch=BATCH, steps=steps, seed=args.seed, target=TARGET,
+            script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED, target=TARGET,
             recipe=asdict(recipe), settings=asdict(settings), torch_version=torch.__version__,
         ), indent=2) + '\n')
 
     def init():
-        model = make_model(device, args.seed, config)
-        return model, make_optimizer(model, recipe, steps), IdentityPath(model, settings, args.seed, rank, world)
+        model = make_model(device, SEED, config)
+        return model, make_optimizer(model, recipe, steps), IdentityPath(model, settings, SEED, rank, world)
 
     def set_rate(optimizer, step):
         left = (steps - step + 1) / steps
