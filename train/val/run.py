@@ -20,6 +20,14 @@ with it the credit, rides on each token's strong activations. Measured this way:
 - one local step from those: writers, the MLP hidden layer, queries (a full cycle per head), keys (single-key
   experiments evaluated in closed form, no interference), values, gates and value embeddings (sampled).
 
+Own queries (on by default). A token's own path through a later attention does not touch any other token: if only
+its own query moves, every other position's output is unchanged. So each move also changes its own token's
+attention output in every block it enters, through its own query against the clean keys and values, and every token
+is still its own experiment. The estimand becomes the attention-cut gradient plus each token's own-query paths. The
+change is formed as a difference throughout (the query's change, its qk-norm's change, then the attention's change as
+p expm1(ds - dlse)), so rounding scales with the change. Only each token's top 64 keys per head by its clean attention
+move their logits; the other logits are held, and their keys' share of the output rescales exactly by exp(-dlse).
+
 The model, init, optimizer (ANVIL II on block matrices, Adam elsewhere), rates and schedule shape are the Noise
 record's. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
 the weights, the optimizer state and the data order.
@@ -81,6 +89,8 @@ class Settings:
     route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 16; HIDDEN: no restriction)
     chain_tokens: int = 256
     cut_exact_keys: bool = True
+    own_query: bool = True      # Cut: a move also reaches its own token's later attentions through its own query
+    query_keys: int = 64        # own_query: keys per token per head whose logits move (0: all keys)
     key_sigma: float = 0.003
     key_chunk: int = 8
 
@@ -243,14 +253,68 @@ def norm_difference(x, delta):
     return delta * inv.unsqueeze(-1) + x.unsqueeze(1) * (inv - inv0).unsqueeze(-1)
 
 
-@torch.compile(dynamic=False)
-def chain_chunk(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
-                target_logit_w, y):
+def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, window):
+    """The change of each token's attention output, through the output projection, when only its own query moves:
+    the token's block input x (m, W) moves by delta (m, P, W); every key and value, its own included, stays clean.
+    keys, values (h, S, d) clean (keys rotated and normed), bfloat16, a window of S positions of the sequence; pos (m,)
+    the tokens' positions in the sequence, rel (m,) the same positions within that window. Returns (m, P, W).
+    Every step forms a difference before any product, so float32 matmul rounding scales with the change, not with
+    the clean values: the query's change from norm_difference, its qk-norm's change likewise, and the attention's
+    change as p_t expm1(ds_t - dlse) with dlse = log1p(sum_t p_t expm1(ds_t))."""
+    m, P, _ = delta.shape
+    heads, S, d = keys.shape
+    c, s_ = cos[pos][:, None, None], sin[pos][:, None, None]
+    rotate = lambda u: torch.cat([u[..., :d // 2] * c + u[..., d // 2:] * s_, u[..., :d // 2] * -s_ + u[..., d // 2:] * c], -1)
+    r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, d))
+    dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, P, heads, d))
+    sq = r0.square().sum(-1, keepdim=True)
+    inv0 = torch.rsqrt(sq / d + EPS)
+    inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / d + EPS)
+    q0, dq = r0 * inv0, dr * inv + r0 * (inv - inv0)
+    lag = rel[:, None] - torch.arange(S, device=rel.device)[None]
+    allowed = ((lag >= 0) & (lag <= window))[:, None, None]
+    scores = torch.einsum('mphd,htd->mpht', q0.to(keys.dtype), keys).float() * d ** -0.5
+    p0 = torch.softmax(scores.masked_fill(~allowed, float('-inf')), -1)
+    ds = torch.einsum('mphd,htd->mpht', dq.to(keys.dtype), keys).float() * d ** -0.5
+    dlse = torch.log1p((p0 * torch.expm1(ds)).sum(-1, keepdim=True))
+    dout = torch.einsum('mpht,htd->mphd', (p0 * torch.expm1(ds - dlse)).to(values.dtype), values).float()
+    return dout.flatten(-2) @ w_proj_t
+
+
+def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos, sin):
+    """query_change along each token's strong keys: only the logits of the token's top keys per head (by its clean
+    attention) move, every other logit is held at its clean value. The held keys then only rescale together by
+    exp(-dlse), so their whole contribution is expm1(-dlse) times their clean share of the output (rest), exactly.
+    top_keys, top_values (m, h, K, d) bfloat16; top_p (m, h, K) their clean probabilities; rest (m, h, d)."""
+    m, P, _ = delta.shape
+    _, heads, K, d = top_keys.shape
+    c, s_ = cos[pos][:, None, None], sin[pos][:, None, None]
+    rotate = lambda u: torch.cat([u[..., :d // 2] * c + u[..., d // 2:] * s_, u[..., :d // 2] * -s_ + u[..., d // 2:] * c], -1)
+    r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, d))
+    dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, P, heads, d))
+    sq = r0.square().sum(-1, keepdim=True)
+    inv0 = torch.rsqrt(sq / d + EPS)
+    inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / d + EPS)
+    dq = dr * inv + r0 * (inv - inv0)
+    ds = torch.einsum('mphd,mhkd->mphk', dq.to(top_keys.dtype), top_keys).float() * d ** -0.5
+    p = top_p.unsqueeze(1)
+    dlse = torch.log1p((p * torch.expm1(ds)).sum(-1, keepdim=True))
+    dout = torch.einsum('mphk,mhkd->mphd', (p * torch.expm1(ds - dlse)).to(top_values.dtype), top_values).float()
+    dout = dout + torch.expm1(-dlse) * rest.unsqueeze(1)
+    return dout.flatten(-2) @ w_proj_t
+
+
+def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
+                target_logit_w, y, own=None):
     """Forward differences of each token's loss along every move of one site, attention held, MLPs restricted to
     each token's top-k units. site: -1 for the raw embedding, else the block whose mid stream moves. move (m, P, W);
     scale (m, P) the step each difference is divided by; e, x0, xL (m, W); mids per block (m, W); idx, hs per block
     (m, k) unit indices and clean pre-activations; w_fc per block (H, W); w_out_t per block (H, W); weight_t (W, V);
-    base (m, V) clean top-stream logits before the norm; target_logit_w (m, W). Returns (m, P)."""
+    base (m, V) clean top-stream logits before the norm; target_logit_w (m, W). own: None (every attention held),
+    or ('window', pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows) with per-block key windows, or
+    ('routed', pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, (cos, sin)) along strong keys, and then
+    every block the move enters also changes its own token's attention through its own query (query_change).
+    Returns (m, P)."""
     L = len(mids)
     if site < 0:
         dx0 = norm(e.unsqueeze(1) + move) - x0.unsqueeze(1)
@@ -260,6 +324,15 @@ def chain_chunk(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc,
     for b in range(first, L):
         if b > first:
             delta = lam_r[b] * delta + (lam_0[b] * dx0 if dx0 is not None else 0)
+        if own is not None and (site < 0 or b > first):  # the move is at the block's input: its own query moves
+            if own[0] == 'routed':  # strong keys only
+                _, pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
+                delta = delta + query_change_routed(inputs[b], delta, pos, w_q[b], top_keys[b], top_values[b],
+                                                    top_p[b], rest[b], w_proj_t[b], cos_sin[0], cos_sin[1])
+            else:
+                _, pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
+                delta = delta + query_change(inputs[b], delta, pos, rels[b], w_q[b], keys[b], values[b], w_proj_t[b],
+                                             cos, sin, windows[b])
         dz = norm_difference(mids[b], delta)
         dh = torch.bmm(dz.to(torch.bfloat16), w_fc[b][idx[b]].transpose(1, 2)).float()
         h = hs[b].unsqueeze(1)
@@ -275,6 +348,11 @@ def chain_chunk(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc,
     clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
         base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
     return (moved - clean) / scale * (y >= 0).unsqueeze(1)
+
+
+chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
+chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)  # its key windows vary in length by chunk
+KEY_BUCKET = 256  # own_query: key windows are cut to multiples of this, to bound the compiled shapes
 
 
 @torch.compile(dynamic=False)
@@ -788,6 +866,11 @@ class Cut(Boost):
         target_w = weight[y.clamp(min=0)]
         n, m, h = e.shape[0], s.chain_tokens, s.scalar_step
         credits = {}
+        own = None
+        if s.own_query:
+            own = self.own_query_inputs(n)
+            if s.query_keys:
+                own = self.strong_keys(own, s.query_keys)
         for site in [-1] + list(range(L)):
             H = self.basis()
             probed = e if site < 0 else mids[site]
@@ -803,9 +886,15 @@ class Cut(Boost):
                     prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
                     move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1), -h * prev, -h * x0[sl].unsqueeze(1)], 1)
                     scale = torch.cat([scale, torch.full_like(scale[:, :2], h), torch.full_like(scale[:, :2], -h)], 1)
-                derivative = chain_chunk(
+                if own is None or own[0] == 'routed':
+                    own_sl = None if own is None else ('routed', own[1][sl], [z[sl] for z in own[2]], own[3]) + tuple(
+                        [z[sl] for z in part] for part in own[4:8]) + own[8:]
+                else:
+                    own_sl = self.own_query_window(own, t0, min(t0 + m, n))
+                derivative = (chain_chunk if own is None or own[0] == 'routed' else chain_chunk_own)(
                     site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
-                    [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl])
+                    [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl],
+                    own_sl)
                 credit[sl] = derivative[:, :WIDTH] @ H / WIDTH
                 if site >= 0:
                     lam += (derivative[:, WIDTH:WIDTH + 2] + derivative[:, WIDTH + 2:]).sum(0) / 2
@@ -813,6 +902,78 @@ class Cut(Boost):
             if site >= 0:
                 credits['lam', site] = lam
         return credits
+
+    def own_query_inputs(self, n):
+        """What query_change needs, from the clean pass of the one sequence on this GPU: positions, each block's
+        input, query weight, clean rotated-normed keys and gated values (h, T, d), and output projection."""
+        d, model = self.capture, self.model
+        if d.batch != 1:
+            raise ValueError('own_query measures one sequence per GPU.')
+        T = d.length
+        heads = model.config.n_head
+        dh = WIDTH // heads
+        cos, sin = model.cos[0, :T, 0].float(), model.sin[0, :T, 0].float()
+        inputs, w_q, keys, values, w_proj_t, windows = [], [], [], [], [], []
+        for i, block in enumerate(model.transformer.h):
+            p = f'transformer.h.{i}.attn.'
+            k = d.outputs[p + 'c_k'].float().view(T, heads, dh)
+            k1, k2 = k[..., :dh // 2], k[..., dh // 2:]
+            c, s_ = cos[:, None], sin[:, None]
+            k = norm(torch.cat([k1 * c + k2 * s_, k1 * -s_ + k2 * c], -1))
+            v = d.outputs[p + 'c_v'].float().view(T, heads, dh)
+            if block.attn.ve_gate is not None:
+                gate = 2 * torch.sigmoid(d.outputs[p + 've_gate'].float().view(T, heads, 1))
+                v = v + gate * d.outputs[f'value_embeds.{i}'].float().view(T, heads, dh)
+            inputs.append(d.blocks[i].float().flatten(0, 1))
+            w_q.append(block.attn.c_q.weight.float())
+            keys.append(k.transpose(0, 1).to(torch.bfloat16).contiguous())
+            values.append(v.transpose(0, 1).to(torch.bfloat16).contiguous())
+            w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
+            windows.append(model.window_sizes[i][0])
+        return (torch.arange(T, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
+
+    @staticmethod
+    def strong_keys(own, k):
+        """own_query's inputs restricted to each token's top k keys per head by its clean attention: their keys,
+        values and clean probabilities, and the rest of the clean output (the held keys' share)."""
+        pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
+        T = len(pos)
+        top_keys, top_values, top_p, rests = [], [], [], []
+        for x, wq, kk, vv, w in zip(inputs, w_q, keys, values, windows):
+            heads, _, d = kk.shape
+            c, s_ = cos[:, None], sin[:, None]
+            r = (norm(x) @ wq.T).view(T, heads, d)
+            q = norm(torch.cat([r[..., :d // 2] * c + r[..., d // 2:] * s_, r[..., :d // 2] * -s_ + r[..., d // 2:] * c], -1))
+            lag = pos[:, None] - pos[None]
+            allowed = (lag >= 0) & (lag <= w)
+            prob = torch.softmax((torch.einsum('thd,hsd->hts', q.to(kk.dtype), kk).float() * d ** -0.5)
+                                 .masked_fill(~allowed, float('-inf')), -1)  # (h, T, T)
+            p, idx = prob.topk(min(k, T), dim=-1)  # (h, T, k)
+            gather = lambda z: z.unsqueeze(1).expand(-1, T, -1, -1).gather(2, idx.unsqueeze(-1).expand(-1, -1, -1, d))
+            ktop, vtop = gather(kk), gather(vv)  # (h, T, k, d)
+            out = torch.einsum('hts,hsd->htd', prob.to(vv.dtype), vv).float()
+            rest = out - torch.einsum('htk,htkd->htd', p, vtop.float())
+            top_keys.append(ktop.transpose(0, 1).contiguous())
+            top_values.append(vtop.transpose(0, 1).contiguous())
+            top_p.append(p.transpose(0, 1).contiguous())
+            rests.append(rest.transpose(0, 1).contiguous())
+        return ('routed', pos, inputs, w_q, top_keys, top_values, top_p, rests, w_proj_t, (cos, sin))
+
+    @staticmethod
+    def own_query_window(own, t0, t1):
+        """own_query's inputs for the tokens t0..t1-1: each block's keys and values cut to the positions those
+        tokens can attend to (back to t0 - window), widened to a multiple of KEY_BUCKET."""
+        pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
+        T = keys[0].shape[1]
+        rels, ks, vs = [], [], []
+        for k, v, w in zip(keys, values, windows):
+            need = t1 - max(0, t0 - w)
+            length = min(T, -(-need // KEY_BUCKET) * KEY_BUCKET)
+            start = max(0, t1 - length)
+            rels.append(pos[t0:t1] - start)
+            ks.append(k[:, start:start + length])
+            vs.append(v[:, start:start + length])
+        return ('window', pos[t0:t1], rels, [z[t0:t1] for z in inputs], w_q, ks, vs, w_proj_t, cos, sin, windows)
 
     @torch.no_grad()
     def estimate(self, x, y):
@@ -1108,6 +1269,10 @@ def main():
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many sequences.')
     parser.add_argument('--boost-probes', type=int, default=0, help='Boost: directions per token per readout '
                         '(0: a full cycle; fewer: the forward-gradient local-loss baseline).')
+    parser.add_argument('--own-query', action=argparse.BooleanOptionalAction, default=True, help='Cut: a move also '
+                        'reaches its own token\'s later attentions through its own query (keys and values held clean).')
+    parser.add_argument('--query-keys', type=int, default=64, help='own_query: keys per token per head whose logits '
+                        'move (0: all keys).')
     parser.add_argument('--chain-tokens', type=int, default=0)
     parser.add_argument('--key-chunk', type=int, default=0)
     parser.add_argument('--steps', type=int, default=0, help='Smoke test: stop after this many updates.')
@@ -1126,7 +1291,8 @@ def main():
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
     settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
-                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact')
+                        cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
+                        own_query=args.own_query, query_keys=args.query_keys)
     if args.boost_probes:
         settings.probes = args.boost_probes
     if args.chain_tokens:
