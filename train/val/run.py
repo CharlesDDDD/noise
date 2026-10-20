@@ -27,10 +27,28 @@ is still its own experiment. The estimand becomes the attention-cut gradient plu
 change is formed as a difference throughout (the query's change, its qk-norm's change, then the attention's change as
 p expm1(ds - dlse)), so rounding scales with the change. Only each token's top 64 keys per head by its clean attention
 move their logits; the other logits are held, and their keys' share of the output rescales exactly by exp(-dlse).
+This entry moves each token's top 256 keys per head (the record before it: 64).
 
-The model, init, optimizer (ANVIL II on block matrices, Adam elsewhere), rates and schedule shape are the Noise
-record's. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
-the weights, the optimizer state and the data order.
+Exact values (on by default, as in the track 2 record). Values and value-embedding gates by single-value experiments
+evaluated in closed form: moving position t's value moves query s's output by A[s, t] times the move, so the value
+credit is sum_s A[s, t] target_s, a linear map of the measured target; a gate's credit then takes its one step through
+the sigmoid (a central difference).
+
+Value path (on by default). Cut's estimand leaves out every path through another token's attention. One of them stays
+inside the no-backprop line: block i's measured mid-stream credit reaches each token's input stream through the
+block's values by linear maps only (W_proj^T, the clean attention A^T, W_v^T), then takes its one nonlinear step back
+through the block's RMS norm (a central forward difference along it). The identity path carries that credit down to
+the earlier blocks' streams, scaled by the residual scalars (linear). Having stepped once, it is used only where no
+further nonlinear step follows: the writers (attn.c_proj, mlp.c_proj) and the values. The MLP hidden layer, queries,
+keys and gates take their step from the measured credit alone.
+
+The model, init and optimizer (ANVIL II on block matrices, Adam elsewhere) are the Noise record's, with ANVIL on its
+fast rail alone, Boost on the first 20% of the epoch, Cut's MLP routes on each token's top quarter of the hidden
+units, the MLP hidden credit on all of each token's units (was its top eighth), the head initialized with std 0.02,
+and the strong backprop baseline's Adam betas (0.5, 0.98) and warmdown (the last 40% of the epoch, down to 15% of each
+rate); rates are 1.13x the record's for ANVIL and 0.7x for Adam. Both phases run at 4 sequences per update, two GPUs
+per sequence, each GPU taking a share of every cycle of moves; the handoff keeps the weights, the optimizer state and
+the data order.
 
     torchrun --standalone --nproc_per_node=8 train/val/run.py                                        # benchmark model
     torchrun --standalone --nproc_per_node=8 train/val/run.py --preset 243m --output logs/bc243m
@@ -63,11 +81,14 @@ torch._dynamo.config.cache_size_limit = 64
 @dataclass
 class Recipe:
     """The record's optimizer settings."""
-    lr: float = 0.003       # Adam; embeddings 300x, mixing scalars 30x
-    betas: tuple = (0.7, 0.95)
-    warmdown: float = 0.3   # final fraction of the epoch with linear lr decay
-    anvil_lr: float = 0.023
+    lr: float = 0.0021      # Adam; embeddings 300x, mixing scalars 30x
+    betas: tuple = (0.5, 0.98)
+    warmdown: float = 0.4   # final fraction of the epoch with linear lr decay
+    final: float = 0.15     # ... down to this fraction of each rate
+    anvil_lr: float = 0.026
     anvil_wd: float = 2.25
+    fast_weight: float = 1.0  # ANVIL's fast rail alone (PR #360's blend: 0.4385)
+    head_std: float = 0.02  # the head's init (the fixed init's 0.001)
 
 
 @dataclass
@@ -76,7 +97,7 @@ class Settings:
     sigma: float = 0.005        # readout probe step, relative to the probed vector's RMS at that token
     probes: int = 0             # directions per token per readout (0: a full cycle, exact; fewer: a forward-gradient
                                 # estimate along that many random orthogonal directions, the local-loss baseline)
-    fc_k: int = 0               # MLP units probed per token (0: HIDDEN / 8)
+    fc_k: int = 0               # MLP units probed per token (main sets HIDDEN: every unit)
     fc_sigma: float = 0.05
     local: dict = field(default_factory=lambda: dict(q=64, k=320, v=512, gate=64))  # attention-internal draws
     nrep: int = 64
@@ -86,13 +107,15 @@ class Settings:
     boost_exact_keys: bool = True
     # Cut
     chain_sigma: float = 0.01
-    route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 16; HIDDEN: no restriction)
+    route_k: int = 0            # MLP units per token per block carrying a move (0: HIDDEN / 4; HIDDEN: no restriction)
     chain_tokens: int = 256
     cut_exact_keys: bool = True
     own_query: bool = True      # Cut: a move also reaches its own token's later attentions through its own query
-    query_keys: int = 64        # own_query: keys per token per head whose logits move (0: all keys)
+    query_keys: int = 256       # own_query: keys per token per head whose logits move (0: all keys)
     key_sigma: float = 0.003
     key_chunk: int = 8
+    exact_values: bool = True   # values and gates by single-value experiments evaluated in closed form
+    value_path: bool = True     # Cut: the measured mid-stream credit also reaches each block's input through its values
 
 
 # ---------------------------------------------------------------------------------------------------------- helpers
@@ -212,6 +235,15 @@ def code_estimate(credited, a):
 
 
 @torch.compile(dynamic=False)
+def hidden_scores(ut, st, Hk, cols, g):
+    moved = st.unsqueeze(-1) * Hk
+    change = F.relu(ut.unsqueeze(1) + moved).square() - F.relu(ut.unsqueeze(1) - moved).square()
+    stream_change = torch.bmm(change.to(torch.bfloat16), cols)
+    scored = torch.bmm(stream_change, g.to(torch.bfloat16).unsqueeze(-1)).squeeze(-1).float()
+    return scored / (2 * st)
+
+
+@torch.compile(dynamic=False)
 def embedding_moves(e, steps, rows, sign, wq, wk, wv, cos, sin):
     n, (b, t, width) = rows.shape[0], e.shape
     hd = 2 * cos.shape[-1]
@@ -242,6 +274,15 @@ def norm_difference(x, delta):
     inv0 = torch.rsqrt(sq / WIDTH + EPS)
     inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / WIDTH + EPS)
     return delta * inv.unsqueeze(-1) + x.unsqueeze(1) * (inv - inv0).unsqueeze(-1)
+
+
+def norm_move(x, v, sigma=0.01):
+    """(norm(x + s v) - norm(x - s v)) / 2s per token, s = sigma * rms(x) / rms(v): the RMS norm's change along v by a
+    central forward difference (its Jacobian is symmetric, so this is the one step back through it)."""
+    s = sigma * (x.square().mean(-1, keepdim=True) / v.square().mean(-1, keepdim=True).clamp_min(1e-30)).sqrt()
+    up = norm_difference(x, (s * v).unsqueeze(1))[:, 0]
+    down = norm_difference(x, (-s * v).unsqueeze(1))[:, 0]
+    return (up - down) / (2 * s)
 
 
 def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, window):
@@ -347,32 +388,21 @@ KEY_BUCKET = 256  # own_query: key windows are cut to multiples of this, to boun
 
 
 @torch.compile(dynamic=False)
-def key_scores(qp, k_raw, steps, cos, sin, A, C, j, qr):
-    """The finite coordinate-key probe, sharing q @ rotated_key across directions."""
+def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
+    """Single-key experiments, each evaluated exactly: the raw key at position t moves by steps_t e_j and nothing
+    else moves, so each query's attention changes in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
+    a' = a exp(dl). Scored against each query's target (C[s, t] = hub_s . (v_t - o_s)): one local step, as the
+    record's coordinate head scores single-logit moves. The processed key's change is formed exactly before the
+    logit product. qp, kp, k_raw (h, T, d); steps (h, T, 1); cos, sin (T, d/2); A, C (h, T, T), A zero outside the
+    window; basis (J, d). Returns (h, T, J)."""
     d = k_raw.shape[-1]
-    half = d // 2
-    x1, x2 = k_raw.chunk(2, -1)
-    r = torch.cat([x1 * cos + x2 * sin, -x1 * sin + x2 * cos], -1)
-    clean = r.square().sum(-1, keepdim=True) + d * EPS
-    jj = j % half
-    rho = (cos.square() + sin.square())[:, jj].T
-    kj = k_raw[:, :, j].transpose(1, 2)
-    st = steps.transpose(1, 2)
-    # Retain the complete finite change in the norm, including the squared step.
-    eta = rho[None] * (2 * st * kj + st.square()) / clean.transpose(1, 2)
-    a0 = torch.rsqrt(clean / d).transpose(1, 2)
-    da = a0 * torch.expm1(-.5 * torch.log1p(eta))
-    a = a0 + da
-    q1 = qp[:, :, jj].transpose(1, 2)
-    q2 = qp[:, :, jj + half].transpose(1, 2)
-    c, s = cos[:, jj].T, sin[:, jj].T
-    sparse = torch.where((j < half)[None, :, None, None],
-        q1[:, :, :, None] * c[None, :, None, :] - q2[:, :, :, None] * s[None, :, None, :],
-        q1[:, :, :, None] * s[None, :, None, :] + q2[:, :, :, None] * c[None, :, None, :])
-    dl = (qr[:, None] * da[:, :, None, :] + st[:, :, None, :] * a[:, :, None, :] * sparse) / (d ** .5)
-    # This is the full finite attention response, not a softmax derivative.
+    moved = k_raw.unsqueeze(1) + steps.unsqueeze(1) * basis[None, :, None, :]
+    x1, x2 = moved[..., :d // 2], moved[..., d // 2:]
+    moved = torch.cat([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], -1)
+    dk = moved * torch.rsqrt(moved.square().mean(-1, keepdim=True) + EPS) - kp.unsqueeze(1)
+    dl = torch.einsum('hsd,hjtd->hjst', qp, dk) / d ** 0.5
     change = A[:, None] * torch.expm1(dl)
-    return ((change / (1 + change) * C[:, None]).sum(2) / st).transpose(1, 2)
+    return (change / (1 + change) * C[:, None]).sum(2).transpose(1, 2) / steps
 
 
 # ---------------------------------------------------------------------------------------------------- the clean pass
@@ -648,6 +678,7 @@ class Boost:
         unit = lambda z: z * torch.rsqrt(z.square().mean(-1, keepdim=True) + EPS)
         pos = torch.arange(t, device=self.device)
         lag = pos[:, None] - pos[None, :]
+        eye = torch.eye(hd, device=self.device)
         lo, hi = self.share(hd)
         errors, self.key_credit = {}, {}
         for i in range(L):
@@ -667,15 +698,35 @@ class Boost:
                 hub = targets[i][r].view(t, h, hd).transpose(0, 1)
                 C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
                 steps = s.key_sigma * k_raw.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-                first, second = k_raw.chunk(2, -1)
-                rotated = torch.cat([first * cos + second * sin, -first * sin + second * cos], -1)
-                qr = qp @ rotated.transpose(-1, -2)
                 for j0 in range(lo, hi, s.key_chunk):
                     j1 = min(j0 + s.key_chunk, hi)
-                    directions = torch.arange(j0, j1, device=self.device)
-                    credit_all[r, :, :, j0:j1] = key_scores(qp, k_raw, steps, cos, sin, A, C, directions, qr)
+                    credit_all[r, :, :, j0:j1] = key_scores(qp, kp, k_raw, steps, cos, sin, A, C, eye[j0:j1])
             self.key_credit[i] = credit_all
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
+        return errors
+
+    def exact_value_errors(self, kind, targets):
+        """Values or value-embedding gates by single-value experiments, evaluated exactly: moving position t's value
+        moves query s's output by A[s, t] times the move, so the credit is sum_s A[s, t] hub_s."""
+        d, model = self.capture, self.model
+        cfg = model.config
+        b, t = d.batch, d.length
+        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
+        errors = {}
+        for i in range(cfg.n_layer):
+            if kind == 'gate' and not has_ve(i, cfg.n_layer):
+                continue
+            A, _ = self.attention_maps(i)
+            hub = targets[i].view(b, t, h, hd).transpose(1, 2).float()
+            credit = (A.float().transpose(-1, -2) @ hub).transpose(1, 2)
+            if kind == 'v':
+                errors[f'transformer.h.{i}.attn.c_v'] = credit.reshape(b, t, h * hd)
+            else:
+                z = d.outputs[f'transformer.h.{i}.attn.ve_gate'].float()
+                ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, hd)
+                step = 0.1
+                slope = (torch.sigmoid(z + step) - torch.sigmoid(z - step)) / step
+                errors[f'transformer.h.{i}.attn.ve_gate'] = slope * (credit * ve).sum(-1)
         return errors
 
     def value_errors(self, kind, draws, targets):
@@ -720,14 +771,21 @@ class Boost:
         """MLP hidden credit, one local step from the measured credit g at the block output: each token's fc_k
         largest units move along a sign-flipped Hadamard cycle, through relu^2 and the output projection."""
         k = self.s.fc_k
-        self.signs(k)  # preserve the removed sign draw
+        Hk = hadamard(k, self.device, torch.float32) * self.signs(k)
         top = u.topk(k, dim=-1, sorted=False).indices
         uk = u.gather(1, top)
         steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-        slope = ((uk + steps).relu().square() - (uk - steps).relu().square()) / (2 * steps)
-        projection = g.to(torch.bfloat16).float() @ out_weight.to(torch.bfloat16).float()
-        selected = projection.gather(1, top) * slope
-        return torch.zeros_like(u).scatter_(1, top, selected) / getattr(self, 'split', 1)
+        columns = out_weight.to(torch.bfloat16).T.contiguous()
+        credit = torch.zeros_like(u)
+        lo, hi = self.share(k)
+        Hs = Hk[lo:hi]
+        per = max(1, 2 ** 26 // (k * WIDTH))
+        for t0 in range(0, u.shape[0], per):
+            ut, st, tt, gt = uk[t0:t0 + per], steps[t0:t0 + per], top[t0:t0 + per], g[t0:t0 + per]
+            cols = F.embedding(tt, columns)
+            derivative = hidden_scores(ut, st, Hs, cols, gt)
+            credit[t0:t0 + per].scatter_(1, tt, derivative @ Hs / k)
+        return credit
 
     def stage_losses(self, i, lam_r, lam_0, x_prev, x0, ve, y):
         model, block = self.model, self.model.transformer.h[i]
@@ -738,7 +796,7 @@ class Boost:
         weight = model.lm_head.weight.float()[:model.config.vocab_size]
         return readout_losses(xmid.float().flatten(0, 1), weight, y.flatten())
 
-    def internals(self, gradients, targets, b, t, exact_keys):
+    def internals(self, gradients, targets, b, t, exact_keys, value_targets=None):
         """Queries, keys, values, gates and value embeddings, one local step from the targets."""
         d, s, L = self.capture, self.s, self.model.config.n_layer
         self.maps = {}
@@ -747,6 +805,10 @@ class Boost:
                 continue
             if kind == 'k' and exact_keys:
                 local = self.exact_key_errors(targets)  # each GPU of a sequence fills its share of directions
+            elif kind in ('v', 'gate') and s.exact_values:
+                local = self.exact_value_errors(kind, value_targets if (kind == 'v' and value_targets) else targets)
+                if self.part:  # every GPU of a sequence forms them in full: kept by its first GPU only
+                    local = {site: torch.zeros_like(error) for site, error in local.items()}
             else:
                 draws = count // self.split
                 local = self.value_errors(kind, draws, targets) if kind in ('v', 'gate') else \
@@ -843,10 +905,11 @@ class Boost:
 # -------------------------------------------------------------------------------------------------------------- Cut
 
 class Cut(Boost):
-    """Phase 2: attention-cut credit measured end to end along each token's strong routes; one sequence per GPU."""
+    """Phase 2: attention-cut credit measured end to end along each token's strong routes; one sequence per group of
+    GPUs (split), each taking a share of every cycle of moves."""
 
-    def __init__(self, model, settings, seed, rank, world):
-        super().__init__(model, settings, seed, rank, world, split=1, group=None)
+    def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        super().__init__(model, settings, seed, rank, world, split=split, group=group)
 
     def chain_credits(self, e, x0, mids, outs, routes, y):
         """Attention-cut credit at the raw embedding ('emb') and every block's mid stream, and each block's
@@ -869,8 +932,10 @@ class Cut(Boost):
             own = self.own_query_inputs(n)
             if s.query_keys:
                 own = self.strong_keys(own, s.query_keys)
+        lo, hi = self.share(WIDTH)  # this GPU's share of each cycle; the scalar moves on the group's first GPU
+        P, scalars_here = hi - lo, self.part == 0
         for site in [-1] + list(range(L)):
-            H = self.basis()
+            H = self.basis()[lo:hi]
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             credit = torch.empty(n, WIDTH, device=self.device)
@@ -878,8 +943,8 @@ class Cut(Boost):
             for t0 in range(0, n, m):
                 sl = slice(t0, t0 + m)
                 move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
-                scale = steps[sl].expand(-1, WIDTH)
-                if site >= 0:  # the block's mixing scalars, central differences (a move along the stream itself
+                scale = steps[sl].expand(-1, P)
+                if site >= 0 and scalars_here:  # the block's mixing scalars, central differences (a move along the stream itself
                     # barely changes the normed stream, so one-sided ones would be dominated by curvature)
                     prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
                     move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1), -h * prev, -h * x0[sl].unsqueeze(1)], 1)
@@ -893,12 +958,12 @@ class Cut(Boost):
                     site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                     [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl],
                     own_sl)
-                credit[sl] = derivative[:, :WIDTH] @ H / WIDTH
-                if site >= 0:
-                    lam += (derivative[:, WIDTH:WIDTH + 2] + derivative[:, WIDTH + 2:]).sum(0) / 2
-            credits['emb' if site < 0 else site] = credit
+                credit[sl] = derivative[:, :P] @ H / WIDTH
+                if site >= 0 and scalars_here:
+                    lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
+            credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
-                credits['lam', site] = lam
+                credits['lam', site] = self.group_sum(lam)
         return credits
 
     def own_query_inputs(self, n):
@@ -929,6 +994,29 @@ class Cut(Boost):
             w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
             windows.append(model.window_sizes[i][0])
         return (torch.arange(T, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
+
+    def value_path_credit(self, chain, b, t):
+        """Extra credit at each block's output: block i's measured mid-stream credit reaches its input stream through
+        its values (every query's target weighted by its clean attention to the token, then W_v^T; all linear) and one
+        step through the RMS norm (a central forward difference); the identity path carries it down, times the
+        residual scalars. Returns {block: (n, W)}."""
+        model, d = self.model, self.capture
+        cfg = model.config
+        L, h = cfg.n_layer, cfg.n_head
+        hd = WIDTH // h
+        lam_r = model.resid_lambdas.float()
+        self.maps = {}  # this step's attention maps (internals() starts afresh too)
+        vp = {}
+        for i in range(1, L):
+            attn = model.transformer.h[i].attn
+            A, _ = self.attention_maps(i)  # (b, h, query, key)
+            hub = (chain[i] @ attn.c_proj.weight.float()).view(b, t, h, hd).transpose(1, 2)
+            ev = (A.float().transpose(-1, -2) @ hub).transpose(1, 2).reshape(b * t, WIDTH)
+            vp[i] = norm_move(d.blocks[i].float().flatten(0, 1), ev @ attn.c_v.weight.float())
+        extra = {L - 1: torch.zeros_like(chain[0])}
+        for j in reversed(range(L - 1)):
+            extra[j] = lam_r[j + 1] * (vp[j + 1] + extra[j + 1])
+        return extra
 
     @staticmethod
     def strong_keys(own, k):
@@ -1005,15 +1093,20 @@ class Cut(Boost):
         chain = self.chain_credits(e, x0, mids, outs, routes, yf)
         self.tick('chain')
         lam_r = model.resid_lambdas.float()
-        targets = {}
+        targets, value_targets = {}, {}
+        extra = self.value_path_credit(chain, b, t) if s.value_path else None
+        self.tick('value_path')
         scalars = torch.zeros(2, L, device=self.device)
         for i in range(L):
             p = f'transformer.h.{i}.'
             block = model.transformer.h[i]
             d_mid = chain[i]
             d_out = lam_r[i + 1] * chain[i + 1] if i < L - 1 else g_top
-            gradients[p + 'attn.c_proj.weight'] = d_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
-            gradients[p + 'mlp.c_proj.weight'] = d_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
+            x_mid, x_out = (d_mid, d_out) if extra is None else (d_mid + extra[i], d_out + extra[i])
+            gradients[p + 'attn.c_proj.weight'] = x_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
+            gradients[p + 'mlp.c_proj.weight'] = x_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
+            if extra is not None:
+                value_targets[i] = (x_mid @ block.attn.c_proj.weight.float()).view(b, t, WIDTH)
             u = d.outputs[p + 'mlp.c_fc'].float().flatten(0, 1)
             hidden = self.hidden_credit(u, d_out, block.mlp.c_proj.weight)
             gradients[p + 'mlp.c_fc.weight'] = hidden.T @ d.inputs[p + 'mlp.c_fc'].flatten(0, 1)
@@ -1022,10 +1115,16 @@ class Cut(Boost):
             scalars[:, i] = chain['lam', i]
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         self.tick('writers_hidden')
-        self.internals(gradients, targets, b, t, s.cut_exact_keys)
+        self.internals(gradients, targets, b, t, s.cut_exact_keys, value_targets or None)
         self.tick('local')
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, WIDTH))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
+        if self.part:  # formed in full by every GPU of the sequence: kept by its first GPU (the internals already
+            # split or zero their own: keys and queries share directions and draws, hidden units share units)
+            for name in list(gradients):
+                if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
+                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
+                    gradients[name] = torch.zeros_like(gradients[name])
         for name, p in model.named_parameters():
             if name not in gradients:
                 gradients[name] = torch.zeros_like(p, dtype=torch.float32)
@@ -1037,8 +1136,8 @@ class DFA(Cut):
     exact output error (the coordinate head's logit credit), e @ B_site, B_site ~ N(0, 1 / V) drawn once from a fixed
     seed. Everything one local step from those credits is Cut's."""
 
-    def __init__(self, model, settings, seed, rank, world):
-        super().__init__(model, settings, seed, rank, world)
+    def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        super().__init__(model, settings, seed, rank, world, split, group)
         V, L = model.config.vocab_size, model.config.n_layer
         g = torch.Generator(self.device).manual_seed(seed + 4242)
         self.feedback = {site: torch.randn(V, WIDTH, device=self.device, generator=g) / V ** 0.5
@@ -1060,7 +1159,7 @@ class DFA(Cut):
 
 # -------------------------------------------------------------------------------------------- model and optimizer
 
-def make_model(device, seed, config):
+def make_model(device, seed, config, head_std=0.001):
     torch.manual_seed(seed)
     with torch.device('meta'):
         model = GPT(config)
@@ -1071,6 +1170,8 @@ def make_model(device, seed, config):
             if 'c_proj' in name and isinstance(module, nn.Linear):
                 scale = 1.5 * math.sqrt(3 / module.weight.shape[1])
                 nn.init.uniform_(module.weight, -scale, scale)
+        if head_std != 0.001:
+            nn.init.normal_(model.lm_head.weight, std=head_std)
     return model.requires_grad_(False)
 
 
@@ -1219,7 +1320,7 @@ def make_optimizer(model, recipe, steps):
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW([{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
                              betas=recipe.betas, eps=1e-8, weight_decay=0.0)
-    return Optimizers(Anvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps), adam)
+    return Optimizers(Anvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps, fast_weight=recipe.fast_weight), adam)
 
 
 @torch.no_grad()
@@ -1255,8 +1356,8 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('logs/val'))
     parser.add_argument('--preset', choices=sorted(PRESETS), default='38m')
     parser.add_argument('--seed', type=int, default=SEED)
-    parser.add_argument('--switch', type=float, default=0.3, help='Fraction of the epoch trained by Boost.')
-    parser.add_argument('--route-k', type=int, default=0, help='Cut: MLP units per token per block (0: hidden/16).')
+    parser.add_argument('--switch', type=float, default=0.2, help='Fraction of the epoch trained by Boost.')
+    parser.add_argument('--route-k', type=int, default=0, help='Cut: MLP units per token per block (0: hidden/4).')
     parser.add_argument('--estimator', choices=('cut', 'dfa'), default='cut', help='Phase 2 (dfa: the direct '
                         'feedback alignment baseline).')
     parser.add_argument('--keys', choices=('exact', 'sampled'), default='exact', help='Cut\'s keys.')
@@ -1269,7 +1370,7 @@ def main():
                         '(0: a full cycle; fewer: the forward-gradient local-loss baseline).')
     parser.add_argument('--own-query', action=argparse.BooleanOptionalAction, default=True, help='Cut: a move also '
                         'reaches its own token\'s later attentions through its own query (keys and values held clean).')
-    parser.add_argument('--query-keys', type=int, default=64, help='own_query: keys per token per head whose logits '
+    parser.add_argument('--query-keys', type=int, default=256, help='own_query: keys per token per head whose logits '
                         'move (0: all keys).')
     parser.add_argument('--chain-tokens', type=int, default=0)
     parser.add_argument('--key-chunk', type=int, default=0)
@@ -1288,7 +1389,7 @@ def main():
     HIDDEN = 4 * WIDTH
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
-    settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
+    settings = Settings(fc_k=HIDDEN, route_k=args.route_k or HIDDEN // 4,
                         cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
                         own_query=args.own_query, query_keys=args.query_keys)
     if args.boost_probes:
@@ -1297,11 +1398,11 @@ def main():
         settings.chain_tokens = args.chain_tokens
     if args.key_chunk:
         settings.key_chunk = args.key_chunk
-    batch1, batch2 = 4, 8
-    if world % batch1 and batch1 % world or batch2 % world:
+    batch1, batch2 = 4, 4
+    if world % batch1 and batch1 % world:
         raise ValueError('Run on 1, 2, 4 or 8 GPUs.')
-    split = world // batch1 if batch1 < world else 1
-    per1, per2 = max(1, batch1 // world), batch2 // world
+    split = world // batch1 if batch1 < world else 1  # Boost and Cut: GPUs per sequence
+    per1, per2 = max(1, batch1 // world), max(1, batch2 // world)
     groups = [None]
     if split > 1:
         groups = [torch.distributed.new_group(list(range(g * split, (g + 1) * split))) for g in range(world // split)]
@@ -1329,20 +1430,21 @@ def main():
         ), indent=2, default=str) + '\n')
 
     def boost_init():
-        model = make_model(device, args.seed, config)
+        model = make_model(device, args.seed, config, recipe.head_std)
         return model, make_optimizer(model, recipe, steps1), Boost(model, settings, args.seed, rank, world, split, group)
 
     # untimed warmup on random tokens (compilation of both phases), then training from a fresh model
-    noise = torch.randint(0, config.vocab_size, (batch2, SEQ), generator=torch.Generator().manual_seed(SEED)).to(device)
+    noise = torch.randint(0, config.vocab_size, (max(batch1, batch2), SEQ),
+                          generator=torch.Generator().manual_seed(SEED)).to(device)
     model, optimizer, estimator = boost_init()
     first = (rank // split) * per1
     estimator.step(noise[first:first + per1, :-1].contiguous(), noise[first:first + per1, 1:].contiguous(), optimizer)
     estimator.close()
-    model = make_model(device, args.seed, config)
+    model = make_model(device, args.seed, config, recipe.head_std)
     optimizer = make_optimizer(model, recipe, steps2)
     Phase2 = DFA if args.estimator == 'dfa' else Cut
-    estimator = Phase2(model, settings, args.seed, rank, world)
-    mine = slice(rank * per2, (rank + 1) * per2)
+    estimator = Phase2(model, settings, args.seed, rank, world, split, group)
+    mine = slice((rank // split) * per2, (rank // split + 1) * per2)
     estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
     estimator.close()
     del model, optimizer, estimator
@@ -1360,7 +1462,7 @@ def main():
         left = (steps - step + 1) / steps
         for g in optimizer.param_groups:
             g.setdefault('initial_lr', g['lr'])
-            g['lr'] = g['initial_lr'] * min(1.0, left / recipe.warmdown)
+            g['lr'] = g['initial_lr'] * (recipe.final + (1 - recipe.final) * min(1.0, left / recipe.warmdown))
 
     def after(phase, step, seqs, loss):
         nonlocal paused, elapsed
@@ -1399,7 +1501,7 @@ def main():
             new_o.state[p] = state
     optimizer.optimizers[0].t = j0
     del old
-    estimator = Phase2(model, settings, args.seed, rank, world)
+    estimator = Phase2(model, settings, args.seed, rank, world, split, group)
     for step in range(j0 + 1, last + 1):
         batch = training[(step - 1) * batch2:step * batch2][mine].to(device)
         set_rate(step, steps2)
