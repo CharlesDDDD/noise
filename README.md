@@ -23,7 +23,11 @@ only run the model forward. The architecture is fixed for now, but we will relax
 ## Rules
 
 - **No backpropagation.** No autograd (reverse or forward mode) and no hand-written backward pass. Learning
-  signal comes from evaluating the model forward. Entries are judged by the spirit of this rule.
+  signal comes from evaluating the model forward: every error signal is measured against a loss by running the
+  model forward, and may then take at most one step through a nonlinear part of the model. Steps through
+  linear maps don't count, and a signal that has taken a step can't take another, so credit can't be chained
+  back through the network block by block. Entries are judged by the spirit of this rule: a method should
+  still apply to networks with non-differentiable parts.
 - **Fixed model.** Final weights must load into [`utils/model.py`](utils/model.py) with a strict state-dict
   match. How training computes the same function, and how it initializes it, is free.
 - **Fixed data.** Train only on `data/train.pt` (4,880 sequences of 2,048 predictions), for at most one
