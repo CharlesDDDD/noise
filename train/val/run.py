@@ -42,10 +42,13 @@ the earlier blocks' streams, scaled by the residual scalars (linear). Having ste
 further nonlinear step follows: the writers (attn.c_proj, mlp.c_proj) and the values. The MLP hidden layer, queries,
 keys and gates take their step from the measured credit alone.
 
-The model, init, optimizer (ANVIL II on block matrices, Adam elsewhere), rates and schedule shape are the Noise
-record's, except ANVIL at 1.6x its rate on its fast rail alone, Boost on the first 20% of the epoch, and Cut's MLP
-routes on each token's top quarter of the hidden units. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
-the weights, the optimizer state and the data order.
+The model, init and optimizer (ANVIL II on block matrices, Adam elsewhere) are the Noise record's, with ANVIL on its
+fast rail alone, Boost on the first 20% of the epoch, Cut's MLP routes on each token's top quarter of the hidden
+units, the MLP hidden credit on all of each token's units (was its top eighth), the head initialized with std 0.02,
+and the strong backprop baseline's Adam betas (0.5, 0.98) and warmdown (the last 40% of the epoch, down to 15% of each
+rate); rates are 1.13x the record's for ANVIL and 0.7x for Adam. Both phases run at 4 sequences per update, two GPUs
+per sequence, each GPU taking a share of every cycle of moves; the handoff keeps the weights, the optimizer state and
+the data order.
 
     torchrun --standalone --nproc_per_node=8 train/val/run.py                                        # benchmark model
     torchrun --standalone --nproc_per_node=8 train/val/run.py --preset 243m --output logs/bc243m
@@ -78,12 +81,14 @@ torch._dynamo.config.cache_size_limit = 64
 @dataclass
 class Recipe:
     """The record's optimizer settings."""
-    lr: float = 0.003       # Adam; embeddings 300x, mixing scalars 30x
-    betas: tuple = (0.7, 0.95)
-    warmdown: float = 0.3   # final fraction of the epoch with linear lr decay
-    anvil_lr: float = 0.037
+    lr: float = 0.0021      # Adam; embeddings 300x, mixing scalars 30x
+    betas: tuple = (0.5, 0.98)
+    warmdown: float = 0.4   # final fraction of the epoch with linear lr decay
+    final: float = 0.15     # ... down to this fraction of each rate
+    anvil_lr: float = 0.026
     anvil_wd: float = 2.25
     fast_weight: float = 1.0  # ANVIL's fast rail alone (PR #360's blend: 0.4385)
+    head_std: float = 0.02  # the head's init (the fixed init's 0.001)
 
 
 @dataclass
@@ -92,7 +97,7 @@ class Settings:
     sigma: float = 0.005        # readout probe step, relative to the probed vector's RMS at that token
     probes: int = 0             # directions per token per readout (0: a full cycle, exact; fewer: a forward-gradient
                                 # estimate along that many random orthogonal directions, the local-loss baseline)
-    fc_k: int = 0               # MLP units probed per token (0: HIDDEN / 8)
+    fc_k: int = 0               # MLP units probed per token (main sets HIDDEN: every unit)
     fc_sigma: float = 0.05
     local: dict = field(default_factory=lambda: dict(q=64, k=320, v=512, gate=64))  # attention-internal draws
     nrep: int = 64
@@ -900,10 +905,11 @@ class Boost:
 # -------------------------------------------------------------------------------------------------------------- Cut
 
 class Cut(Boost):
-    """Phase 2: attention-cut credit measured end to end along each token's strong routes; one sequence per GPU."""
+    """Phase 2: attention-cut credit measured end to end along each token's strong routes; one sequence per group of
+    GPUs (split), each taking a share of every cycle of moves."""
 
-    def __init__(self, model, settings, seed, rank, world):
-        super().__init__(model, settings, seed, rank, world, split=1, group=None)
+    def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        super().__init__(model, settings, seed, rank, world, split=split, group=group)
 
     def chain_credits(self, e, x0, mids, outs, routes, y):
         """Attention-cut credit at the raw embedding ('emb') and every block's mid stream, and each block's
@@ -926,8 +932,10 @@ class Cut(Boost):
             own = self.own_query_inputs(n)
             if s.query_keys:
                 own = self.strong_keys(own, s.query_keys)
+        lo, hi = self.share(WIDTH)  # this GPU's share of each cycle; the scalar moves on the group's first GPU
+        P, scalars_here = hi - lo, self.part == 0
         for site in [-1] + list(range(L)):
-            H = self.basis()
+            H = self.basis()[lo:hi]
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             credit = torch.empty(n, WIDTH, device=self.device)
@@ -935,8 +943,8 @@ class Cut(Boost):
             for t0 in range(0, n, m):
                 sl = slice(t0, t0 + m)
                 move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
-                scale = steps[sl].expand(-1, WIDTH)
-                if site >= 0:  # the block's mixing scalars, central differences (a move along the stream itself
+                scale = steps[sl].expand(-1, P)
+                if site >= 0 and scalars_here:  # the block's mixing scalars, central differences (a move along the stream itself
                     # barely changes the normed stream, so one-sided ones would be dominated by curvature)
                     prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
                     move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1), -h * prev, -h * x0[sl].unsqueeze(1)], 1)
@@ -950,12 +958,12 @@ class Cut(Boost):
                     site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                     [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl],
                     own_sl)
-                credit[sl] = derivative[:, :WIDTH] @ H / WIDTH
-                if site >= 0:
-                    lam += (derivative[:, WIDTH:WIDTH + 2] + derivative[:, WIDTH + 2:]).sum(0) / 2
-            credits['emb' if site < 0 else site] = credit
+                credit[sl] = derivative[:, :P] @ H / WIDTH
+                if site >= 0 and scalars_here:
+                    lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
+            credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
-                credits['lam', site] = lam
+                credits['lam', site] = self.group_sum(lam)
         return credits
 
     def own_query_inputs(self, n):
@@ -1111,6 +1119,12 @@ class Cut(Boost):
         self.tick('local')
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, WIDTH))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
+        if self.part:  # formed in full by every GPU of the sequence: kept by its first GPU (the internals already
+            # split or zero their own: keys and queries share directions and draws, hidden units share units)
+            for name in list(gradients):
+                if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
+                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
+                    gradients[name] = torch.zeros_like(gradients[name])
         for name, p in model.named_parameters():
             if name not in gradients:
                 gradients[name] = torch.zeros_like(p, dtype=torch.float32)
@@ -1122,8 +1136,8 @@ class DFA(Cut):
     exact output error (the coordinate head's logit credit), e @ B_site, B_site ~ N(0, 1 / V) drawn once from a fixed
     seed. Everything one local step from those credits is Cut's."""
 
-    def __init__(self, model, settings, seed, rank, world):
-        super().__init__(model, settings, seed, rank, world)
+    def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        super().__init__(model, settings, seed, rank, world, split, group)
         V, L = model.config.vocab_size, model.config.n_layer
         g = torch.Generator(self.device).manual_seed(seed + 4242)
         self.feedback = {site: torch.randn(V, WIDTH, device=self.device, generator=g) / V ** 0.5
@@ -1145,7 +1159,7 @@ class DFA(Cut):
 
 # -------------------------------------------------------------------------------------------- model and optimizer
 
-def make_model(device, seed, config):
+def make_model(device, seed, config, head_std=0.001):
     torch.manual_seed(seed)
     with torch.device('meta'):
         model = GPT(config)
@@ -1156,6 +1170,8 @@ def make_model(device, seed, config):
             if 'c_proj' in name and isinstance(module, nn.Linear):
                 scale = 1.5 * math.sqrt(3 / module.weight.shape[1])
                 nn.init.uniform_(module.weight, -scale, scale)
+        if head_std != 0.001:
+            nn.init.normal_(model.lm_head.weight, std=head_std)
     return model.requires_grad_(False)
 
 
@@ -1373,7 +1389,7 @@ def main():
     HIDDEN = 4 * WIDTH
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
-    settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 4,
+    settings = Settings(fc_k=HIDDEN, route_k=args.route_k or HIDDEN // 4,
                         cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
                         own_query=args.own_query, query_keys=args.query_keys)
     if args.boost_probes:
@@ -1382,11 +1398,11 @@ def main():
         settings.chain_tokens = args.chain_tokens
     if args.key_chunk:
         settings.key_chunk = args.key_chunk
-    batch1, batch2 = 4, 8
-    if world % batch1 and batch1 % world or batch2 % world:
+    batch1, batch2 = 4, 4
+    if world % batch1 and batch1 % world:
         raise ValueError('Run on 1, 2, 4 or 8 GPUs.')
-    split = world // batch1 if batch1 < world else 1
-    per1, per2 = max(1, batch1 // world), batch2 // world
+    split = world // batch1 if batch1 < world else 1  # Boost and Cut: GPUs per sequence
+    per1, per2 = max(1, batch1 // world), max(1, batch2 // world)
     groups = [None]
     if split > 1:
         groups = [torch.distributed.new_group(list(range(g * split, (g + 1) * split))) for g in range(world // split)]
@@ -1414,20 +1430,21 @@ def main():
         ), indent=2, default=str) + '\n')
 
     def boost_init():
-        model = make_model(device, args.seed, config)
+        model = make_model(device, args.seed, config, recipe.head_std)
         return model, make_optimizer(model, recipe, steps1), Boost(model, settings, args.seed, rank, world, split, group)
 
     # untimed warmup on random tokens (compilation of both phases), then training from a fresh model
-    noise = torch.randint(0, config.vocab_size, (batch2, SEQ), generator=torch.Generator().manual_seed(SEED)).to(device)
+    noise = torch.randint(0, config.vocab_size, (max(batch1, batch2), SEQ),
+                          generator=torch.Generator().manual_seed(SEED)).to(device)
     model, optimizer, estimator = boost_init()
     first = (rank // split) * per1
     estimator.step(noise[first:first + per1, :-1].contiguous(), noise[first:first + per1, 1:].contiguous(), optimizer)
     estimator.close()
-    model = make_model(device, args.seed, config)
+    model = make_model(device, args.seed, config, recipe.head_std)
     optimizer = make_optimizer(model, recipe, steps2)
     Phase2 = DFA if args.estimator == 'dfa' else Cut
-    estimator = Phase2(model, settings, args.seed, rank, world)
-    mine = slice(rank * per2, (rank + 1) * per2)
+    estimator = Phase2(model, settings, args.seed, rank, world, split, group)
+    mine = slice((rank // split) * per2, (rank // split + 1) * per2)
     estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
     estimator.close()
     del model, optimizer, estimator
@@ -1445,7 +1462,7 @@ def main():
         left = (steps - step + 1) / steps
         for g in optimizer.param_groups:
             g.setdefault('initial_lr', g['lr'])
-            g['lr'] = g['initial_lr'] * min(1.0, left / recipe.warmdown)
+            g['lr'] = g['initial_lr'] * (recipe.final + (1 - recipe.final) * min(1.0, left / recipe.warmdown))
 
     def after(phase, step, seqs, loss):
         nonlocal paused, elapsed
@@ -1484,7 +1501,7 @@ def main():
             new_o.state[p] = state
     optimizer.optimizers[0].t = j0
     del old
-    estimator = Phase2(model, settings, args.seed, rank, world)
+    estimator = Phase2(model, settings, args.seed, rank, world, split, group)
     for step in range(j0 + 1, last + 1):
         batch = training[(step - 1) * batch2:step * batch2][mine].to(device)
         set_rate(step, steps2)

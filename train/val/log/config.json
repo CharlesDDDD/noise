@@ -14,26 +14,28 @@
   "seed": 0,
   "switch": 0.2,
   "boost_steps": 244,
-  "cut_steps": 488,
+  "cut_steps": 976,
   "boost_batch": 4,
-  "cut_batch": 8,
+  "cut_batch": 4,
   "train_file": "train.pt",
   "train_rows": 4880,
   "recipe": {
-    "lr": 0.003,
+    "lr": 0.0021,
     "betas": [
-      0.7,
-      0.95
+      0.5,
+      0.98
     ],
-    "warmdown": 0.3,
-    "anvil_lr": 0.037,
+    "warmdown": 0.4,
+    "final": 0.15,
+    "anvil_lr": 0.026,
     "anvil_wd": 2.25,
-    "fast_weight": 1.0
+    "fast_weight": 1.0,
+    "head_std": 0.02
   },
   "settings": {
     "sigma": 0.005,
     "probes": 0,
-    "fc_k": 256,
+    "fc_k": 2048,
     "fc_sigma": 0.05,
     "local": {
       "q": 64,
