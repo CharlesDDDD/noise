@@ -102,6 +102,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 16 | 4.177 | Lower ANVIL rate, earlier skip | 4.4 s | [Script](https://github.com/qlabs-eng/noise/blob/823737bd5cc6be1cc42d6931ba6aa38263d667cb/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 | 17 | 4.182 | Structured start, tail average and late skip at 8 rows per update | 3.6 s | [Script](https://github.com/qlabs-eng/noise/blob/cde84e552507c70b657c080674041b6283f89f3f/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 | 18 | 4.183 | Collectives overlapped with compute, forward compiled as one graph | 3.1 s | [Script](https://github.com/qlabs-eng/noise/blob/4f5c68badf7a399092f17ce528c353ffc6a53f55/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
+| 19 | 4.184 | 400 updates with retuned rates and shorter early rows | 2.7 s | [Script](https://github.com/qlabs-eng/noise/blob/b53e91485211c8ca06f34b032dee1c0752c29442/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 
 ## What backprop gets
 
