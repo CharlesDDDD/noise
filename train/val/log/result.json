@@ -1,7 +1,9 @@
 {
-  "val_loss": 3.7771282651845146,
-  "train_seconds": 1071.18,
-  "boost_steps": 244,
-  "cut_steps": 976,
-  "tokens": 9994240
+  "val_loss": 3.719004546894747,
+  "train_seconds": 25611.03,
+  "steps": 732,
+  "seqs": 4880,
+  "tokens": 9994240,
+  "estimator": "cut",
+  "peak_cuda_gb": 16.421
 }
