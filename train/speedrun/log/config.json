@@ -3,7 +3,7 @@
   "port_of": "#29",
   "world": 8,
   "batch": 8,
-  "steps": 450,
+  "steps": 400,
   "seed": 0,
   "init": "prev8",
   "skip": {
@@ -13,17 +13,17 @@
       4,
       6
     ],
-    "start": 90
+    "start": 80
   },
   "ema": {
     "mode": "fixed",
-    "start": 270,
-    "horizon": 112,
+    "start": 240,
+    "horizon": 100,
     "mix": 0.4
   },
-  "seq_warmup": "1024:360",
-  "cooldown": 180,
-  "lr": 0.003,
+  "seq_warmup": "512:200",
+  "cooldown": 160,
+  "lr": 0.006,
   "betas": [
     0.7,
     0.98
@@ -31,6 +31,6 @@
   "lr_wte": 0.9,
   "lr_value_embeds": 0.9,
   "lr_lambdas": 0.003,
-  "anvil_lr": 0.032,
+  "anvil_lr": 0.024,
   "anvil_wd": 2.25
 }
