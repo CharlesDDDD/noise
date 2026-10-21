@@ -1,8 +1,9 @@
-"""Track 2: #37 in 400 updates. #37 = #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path
-credit with moment kernels and one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average
-and late skip (#34's skip start), in 450 updates (#36), with overlapped collectives and a forward compiled as one graph.
-The shorter run takes three more constants: the head and gates at twice #32's Adam rate, ANVIL II at 0.024, and
-512-token rows for the first half.
+"""Track 2: #38 with a faster update (its estimator, constants and 400 updates). #38 = #37 in 400 updates; #33-#38 are
+@erodola's. #37 = #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path credit with moment
+kernels and one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average and late skip
+(#34's skip start), in 450 updates (#36), with overlapped collectives and a forward compiled as one graph. The shorter
+run takes three more constants: the head and gates at twice #32's Adam rate, ANVIL II at 0.024, and 512-token rows
+for the first half.
 
 The estimator, the optimizers and the work split are #32's, unchanged (below). What this adds, each switchable:
   - The start (`--init prev8`, #12's formula and constants): every head of block 1 starts as a local RoPE head peaking
@@ -31,6 +32,16 @@ The runtime, against #36's (the same arithmetic otherwise, op for op):
   - The forward compiles as one graph: flex attention's log-sum-exp comes through `return_aux=AuxRequest(lse=True)`.
     `return_lse=True` warns, and the warning broke the compiled forward inside its block loop, so the eight blocks
     ran eagerly as many small kernels. Fused, the forward rounds differently (same math).
+
+The runtime, against #38's (`READOUT_FP32 = True`, `GRAD_BF16 = False` restore its precision):
+  - The head-credit kernels: the key kernel takes 32 directions per row (#38: 16), so each attention tile it
+    recomputes serves twice as many directions, and all three pipeline three stages (#38: two). The same sums; the
+    key kernel's run in another order.
+  - The readout cycle's first-order product runs in TF32 (#38: full fp32, #29's HIGHEST).
+  - The weight gradients' products take the forward's bf16 inputs as they are and round the credit side to bf16,
+    accumulating in fp32 (#38: TF32 on fp32 copies); the attention-output targets use the bf16 weights.
+  - The head pack's all-to-all runs under the MLP credits; the scalars' and the embedding's credits run while the
+    head credits come back.
 
 #32's trainer: #13's estimator and work split at 8 rows per update (600 updates, ANVIL II's lr 0.032). One process per
 GPU: each runs the clean pass on its own rows (with fewer rows than GPUs, GPUs share a row and keep their part of it),
@@ -94,6 +105,8 @@ START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head
 EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
 START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: #32's recipe)
 SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
+READOUT_FP32 = False  # #38: the readout cycle's first-order product in full fp32 (#29's HIGHEST), here TF32
+GRAD_BF16 = True  # the weight-gradient products on the forward's bf16 inputs, fp32 out (#38: TF32 on fp32 copies)
 
 
 def has_ve(layer):
@@ -419,7 +432,7 @@ def top_credit(model, x, y):
     c = h @ model.lm_head  # (P, V): row j is direction j's logits
     base = x @ model.lm_head
     fg1, fast, rows, total, steps, inv, inv0, delta, sigma = cycle_weights(x, base, h)
-    torch.backends.cuda.matmul.allow_tf32 = False  # the first-order product in full fp32, as #29's HIGHEST
+    torch.backends.cuda.matmul.allow_tf32 = not READOUT_FP32  # the first-order product
     exact = fg1 @ c.T
     torch.backends.cuda.matmul.allow_tf32 = True
     cb, c2 = c.to(BF16), (c * c).to(BF16)
@@ -455,7 +468,9 @@ def rope32(x, cos, sin):
     return rot * torch.rsqrt(rot.square().mean(-1, keepdim=True) + NORM_EPS)
 
 
-CHUNK, REPEAT = 16, HD // 16  # directions per moment-kernel row; chunks of a head's dims ride in the batch axis
+# directions per moment-kernel row (queries, keys); chunks of a head's dims ride in the batch axis. 32 for the keys
+# shares each attention tile between twice as many directions (on one H100 the key kernel is 23-36% faster)
+CHUNK_Q, CHUNK_K = 16, 32
 PACK = 5 * HD + 2  # q_raw, k_raw, values, attention output, target (bf16), log-sum-exp (fp32 bits)
 
 
@@ -479,12 +494,13 @@ def head_prep(whole, lse, cos, sin, dims):
     q_raw, k_raw, values, out, hub = (whole[..., j * HD:(j + 1) * HD].float() for j in range(5))
     q1, k1 = rope32(q_raw, cos, sin), rope32(k_raw, cos, sin)
     hub_out = (hub * out).sum(-1)
-    batch = lambda x: torch.movedim(x.reshape(*x.shape[:-1], REPEAT, CHUNK), -2, 1).reshape(-1, *x.shape[1:-1], CHUNK)
+    batch = lambda x, c: torch.movedim(x.reshape(*x.shape[:-1], HD // c, c), -2, 1).reshape(-1, *x.shape[1:-1], c)
     coef_q, steps_q = closed_coefficients(q_raw, cos, sin, dims, KEY_SIGMA)
     coef_k, steps_k = closed_coefficients(k_raw, cos, sin, dims, KEY_SIGMA)
-    cq, ck = moment_coefficients(batch(coef_q)).contiguous(), moment_coefficients(batch(coef_k)).contiguous()
-    fk = moment_features(batch(rotated_columns(k1, dims)), HD).contiguous()
-    fq = moment_features(batch(rotated_columns(q1, dims)), HD).contiguous()
+    cq = moment_coefficients(batch(coef_q, CHUNK_Q)).contiguous()
+    ck = moment_coefficients(batch(coef_k, CHUNK_K)).contiguous()
+    fk = moment_features(batch(rotated_columns(k1, dims), CHUNK_Q), HD).contiguous()  # the query kernel's
+    fq = moment_features(batch(rotated_columns(q1, dims), CHUNK_K), HD).contiguous()  # the key kernel's
     q1b, k1b = q1.to(BF16).contiguous(), k1.to(BF16).contiguous()
     return (q1b, k1b, values.to(BF16).contiguous(), hub.to(BF16).contiguous(), lse.contiguous(), hub_out.contiguous(),
             cq, ck, fq, fk, steps_q, steps_k)
@@ -494,26 +510,30 @@ def head_prep(whole, lse, cos, sin, dims):
 def head_finish(qs, ks, vs, steps_q, steps_k):
     """[3, b t, hd]: the head's query, key and value credits by token."""
     b, t = steps_q.shape[:2]
-    unbatch = lambda x: torch.movedim(x.reshape(b, REPEAT, t, CHUNK), 1, 2).reshape(b, t, HD)
-    return torch.stack([unbatch(qs) / steps_q, unbatch(ks) / steps_k, vs]).reshape(3, b * t, HD)
+    unbatch = lambda x, c: torch.movedim(x.reshape(b, HD // c, t, c), 1, 2).reshape(b, t, HD)
+    return torch.stack([unbatch(qs, CHUNK_Q) / steps_q, unbatch(ks, CHUNK_K) / steps_k, vs]).reshape(3, b * t, HD)
 
 
 def head_credits(whole, rope32, win):
     lse_whole = whole[..., 5 * HD:].contiguous().view(F32)[..., 0]  # the lse's fp32 bits back
     q1, k1, values, hub, lse, hub_out, cq, ck, fq, fk, steps_q, steps_k = head_prep(whole, lse_whole, *rope32,
                                                                                     MODEL.dims)
-    qs = moment_query_scores(q1, k1, values, hub, cq, fk, lse, hub_out, win, REPEAT, block_s=64, block_t=32,
-                             num_warps=4, num_stages=2)
-    ks = moment_key_scores(q1, k1, values, hub, ck, fq, lse, hub_out, win, REPEAT, block_t=64, block_s=64,
-                           num_warps=4, num_stages=2)
-    vs = value_credit(q1, k1, hub, lse, win)
+    # tiles from a sweep on one H100 at the run's shapes (three pipeline stages: 8-19% faster than two)
+    qs = moment_query_scores(q1, k1, values, hub, cq, fk, lse, hub_out, win, HD // CHUNK_Q, block_s=64, block_t=32,
+                             num_warps=4, num_stages=3)
+    ks = moment_key_scores(q1, k1, values, hub, ck, fq, lse, hub_out, win, HD // CHUNK_K, block_t=64, block_s=32,
+                           num_warps=4, num_stages=3)
+    vs = value_credit(q1, k1, hub, lse, win, block_t=32, block_s=64, num_stages=3)
     return head_finish(qs, ks, vs, steps_q, steps_k)
 
 
 @torch.compile(dynamic=False)
 def layer_stacks(n1, o, n2, act, u, prev, lo: int, hi: int):
-    """Every block's inputs on this GPU's tokens lo..hi, stacked [L, m, ...] in f32."""
-    st = lambda xs: torch.stack([x.reshape(-1, x.shape[-1])[lo:hi] for x in xs]).float()
+    """Every block's inputs on this GPU's tokens lo..hi, stacked [L, m, ...] (as the forward kept them with
+    GRAD_BF16, else in f32)."""
+    def st(xs):
+        stacked = torch.stack([x.reshape(-1, x.shape[-1])[lo:hi] for x in xs])
+        return stacked if GRAD_BF16 else stacked.float()
     return st(n1), st(o), st(n2), st(act), st(u), st(prev)
 
 
@@ -529,10 +549,12 @@ def block_credits(credit_top, lam_r):
 def hidden_credits(u, cred, w_out_t):
     """Every block's MLP hidden credit: each unit's central difference through relu^2, read through its output row
     (credit @ W_out^T; w_out_t [L, d, 4d] bf16 is W_out^T)."""
+    u = u.float()
     step = FC_SIGMA * torch.clamp(torch.sqrt(u.square().mean(-1, keepdim=True)), min=1e-6)
     relu2 = lambda z: F.relu(z).square()
     slope = (relu2(u + step) - relu2(u - step)) / (2 * step)
-    return slope * torch.bmm(cred.to(BF16), w_out_t).float()
+    hidden = slope * torch.bmm(cred.to(BF16), w_out_t).float()
+    return hidden.to(BF16) if GRAD_BF16 else hidden
 
 
 @torch.compile(dynamic=False)
@@ -543,6 +565,15 @@ def scalar_credits(cred, prevs, lam_r, lam_0):
     scal_0 = (cred * x0[None]).sum((1, 2))
     credit_x0 = (lam_0[:, None, None] * cred).sum(0) + lam_r[0] * cred[0]
     return scal_r, scal_0, credit_x0
+
+
+def weight_grad(a, b, out):
+    """out = a @ b (fp32, batched or not): with GRAD_BF16 on bf16 operands (the forward's side is bf16 already, the
+    credit side is rounded to bf16), fp32 out; else on fp32 operands in TF32, as #38."""
+    if GRAD_BF16:
+        out.copy_((torch.bmm if a.dim() == 3 else torch.mm)(a.to(BF16), b.to(BF16), out_dtype=F32))
+    else:
+        (torch.bmm if a.dim() == 3 else torch.mm)(a.float(), b.float(), out=out)
 
 
 def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
@@ -559,7 +590,7 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
     stream = lambda name: mine(cache[name]).float()
     y, tokens = targets.reshape(-1)[lo:hi], idx.reshape(-1)[lo:hi]
     coords = coordinate_change(cache['lm_head'], y)
-    model.grad['lm_head'].copy_(cache['in.lm_head'].float().T @ coords)
+    weight_grad(cache['in.lm_head'].T, coords, model.grad['lm_head'])
     credit_top = top_credit(model, stream(f'h{L - 1}.stream'), y)
     gsq, gwide = model.grad['square'], model.grad['wide']
     # every block at once: its inputs on this GPU's tokens stacked [L, m, ...] (f32), its output credit
@@ -569,50 +600,57 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
                       lo, hi)
     n1s, os_, n2s, acts, us, prevs = xs
     cred = block_credits(credit_top, model.lam_r)  # [L, m, d]: the top credit down the residual path
-    hidden = hidden_credits(us, cred, model.wide_bf[L:])
-    torch.bmm(cred.transpose(1, 2), acts, out=gwide[L:])  # mlp.c_proj, oriented (out, in)
-    torch.bmm(n2s.transpose(1, 2), hidden, out=gwide[:L])  # mlp.c_fc
-    torch.bmm(os_.transpose(1, 2), cred, out=gsq[3 * L:])  # attn.c_proj
-    targets_o = torch.bmm(cred, model.square[3 * L:].transpose(1, 2)).to(BF16)  # attention-output targets (bf16)
+    if GRAD_BF16:  # the attention-output targets (bf16)
+        targets_o = torch.bmm(cred.to(BF16), model.square_bf[3 * L:].transpose(1, 2))
+    else:
+        targets_o = torch.bmm(cred, model.square[3 * L:].transpose(1, 2)).to(BF16)
     run = [i for i in range(L) if i not in skip]  # the blocks whose attention experiments run (the late skip)
     k = len(run)
-    if k:
+    if k:  # the head pack goes out first, under the MLP credits
         send = pack_heads([mine(cache[f'h{i}.q']) for i in run], [mine(cache[f'h{i}.k']) for i in run],
                           [mine(cache[f'h{i}.values']) for i in run],
                           [mine(cache[f'h{i}.in.attn.c_proj']) for i in run], [targets_o[i] for i in run],
                           [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H)[lo:hi].contiguous().view(BF16)
                            for i in run])  # [b, h, t] -> by token, every row of this GPU's
         got = torch.empty_like(send)
-        dist.all_to_all_single(got, send)  # [source GPU (its tokens), k, m, PACK]: this GPU's head over the batch
+        sent = dist.all_to_all_single(got, send, async_op=True)  # [source GPU (its tokens), k, m, PACK]
+    hidden = hidden_credits(us, cred, model.wide_bf[L:])
+    weight_grad(cred.transpose(1, 2), acts, gwide[L:])  # mlp.c_proj, oriented (out, in)
+    weight_grad(n2s.transpose(1, 2), hidden, gwide[:L])  # mlp.c_fc
+    weight_grad(os_.transpose(1, 2), cred, gsq[3 * L:])  # attn.c_proj
     # the MLP matrices' gradients are complete: reduce them while the head credits run
     works = dict(wide=dist.reduce_scatter_tensor(model.owned['wide'], model.grad['wide'], async_op=True))
-    if not k:
-        by_token = None
-    else:  # one head per GPU
+    if k:  # one head per GPU: this GPU's head over the batch
+        sent.wait()
         whole = got.permute(1, 0, 2, 3).reshape(k, rows_total, t, PACK)
         res = torch.stack([head_credits(whole[j], rope32, window(i)) for j, i in enumerate(run)])  # [k, 3, n, hd]
         back = res.view(k, 3, world, m, HD).permute(2, 0, 1, 3, 4).contiguous()
         got2 = torch.empty_like(back)
-        dist.all_to_all_single(got2, back)  # [source GPU (its head), k, 3, m, hd]
+        returned = dist.all_to_all_single(got2, back, async_op=True)  # [source GPU (its head), k, 3, m, hd]
+    # the scalars' and the embedding's credits need no head credit: they run while the credits come back
+    scal_r, scal_0, credit_x0 = scalar_credits(cred, prevs, model.lam_r, model.lam_0)
+    model.grad['wte'].zero_().index_add_(0, tokens, credit_x0)
+    model.grad['lam_r'].copy_(scal_r)
+    model.grad['lam_0'].copy_(scal_0)
+    by_token = None
+    if k:
+        returned.wait()
         by_token = got2.permute(1, 2, 3, 0, 4).reshape(k, 3, m, D)
     if skip:  # the skipped blocks' queries, keys and values get no credit
         zero, ran = torch.zeros(3, m, D, device=idx.device, dtype=F32), iter(range(k))
         by_token = torch.stack([zero if i in skip else by_token[next(ran)] for i in range(L)])
     for j in range(3):  # queries, keys, values
-        torch.bmm(n1s.transpose(1, 2), by_token[:, j], out=gsq[j * L:(j + 1) * L])
+        weight_grad(n1s.transpose(1, 2), by_token[:, j], gsq[j * L:(j + 1) * L])
     works['square'] = dist.reduce_scatter_tensor(model.owned['square'], model.grad['square'], async_op=True)
     for i in range(L):
         if has_ve(i):
             z, ve = mine(cache[f'h{i}.ve_gate']).float(), mine(cache[f'h{i}.ve']).float().view(-1, H, HD)
             vcredit = by_token[i, 2].view(-1, H, HD)
             slope = (torch.sigmoid(z + GATE_STEP) - torch.sigmoid(z - GATE_STEP)) / GATE_STEP
-            model.grad[f'gate{i}'].copy_(n1s[i, :, :GATE_CHANNELS].T @ (slope * (vcredit * ve).sum(-1)))
+            gate_in = n1s[i, :, :GATE_CHANNELS].float()
+            model.grad[f'gate{i}'].copy_(gate_in.T @ (slope * (vcredit * ve).sum(-1)))
             model.grad[f've{i}'].zero_().index_add_(0, tokens,
                                                     (vcredit * 2 * torch.sigmoid(z)[..., None]).view(-1, D))
-    scal_r, scal_0, credit_x0 = scalar_credits(cred, prevs, model.lam_r, model.lam_0)
-    model.grad['wte'].zero_().index_add_(0, tokens, credit_x0)
-    model.grad['lam_r'].copy_(scal_r)
-    model.grad['lam_0'].copy_(scal_0)
     works['flat'] = dist.all_reduce(model.flat_grad, async_op=True)
     return loss, works, n
 
