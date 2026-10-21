@@ -79,6 +79,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [Script](https://github.com/qlabs-eng/noise/blob/c8834a6ca99173a49b6d4fa557f241f2b1125ab2/train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
 | 10 | 3.896 | Own queries in Cut: each move also reaches its token's later attention through its own query | 10 min | [Script](https://github.com/qlabs-eng/noise/blob/75fbcb5030660f80819e4e6624a8509483294446/train/val/run.py) | [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931) |
 | 11 | 3.777 | Exact values and a value path in Cut; Cut at batch 4, hidden credit on every unit | 18 min | [Script](https://github.com/qlabs-eng/noise/blob/58d2828bf21ee17cb3b48d085d8e1a465a7b3dc3/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
+| 12 | 3.736 | First hop and a live VQ remainder for blocks 0-2's streams, on #23's first version | 12 h 8 min | [Script](https://github.com/hoo0681/noise/blob/3b8844966a6fc4d622299b35db4fdeba00515cf0/train/val/run.py) | [@hoo0681](https://github.com/hoo0681) |
 
 ### Track 2: speedrun to 4.2
 

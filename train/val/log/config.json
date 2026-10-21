@@ -1,5 +1,5 @@
 {
-  "script": "/home/chunyuan/noise/train/val/run.py",
+  "script": "/home/seunghoo/workspace/noise-pr23/train/val/run.py",
   "world": 8,
   "preset": "38m",
   "model": {
@@ -14,28 +14,26 @@
   "seed": 0,
   "switch": 0.2,
   "boost_steps": 244,
-  "cut_steps": 976,
+  "cut_steps": 488,
   "boost_batch": 4,
-  "cut_batch": 4,
+  "cut_batch": 8,
   "train_file": "train.pt",
   "train_rows": 4880,
   "recipe": {
-    "lr": 0.0021,
+    "lr": 0.003,
     "betas": [
-      0.5,
-      0.98
+      0.7,
+      0.95
     ],
-    "warmdown": 0.4,
-    "final": 0.15,
-    "anvil_lr": 0.026,
+    "warmdown": 0.3,
+    "anvil_lr": 0.037,
     "anvil_wd": 2.25,
-    "fast_weight": 1.0,
-    "head_std": 0.02
+    "fast_weight": 1.0
   },
   "settings": {
     "sigma": 0.005,
     "probes": 0,
-    "fc_k": 2048,
+    "fc_k": 256,
     "fc_sigma": 0.05,
     "local": {
       "q": 64,
@@ -57,7 +55,25 @@
     "key_sigma": 0.003,
     "key_chunk": 8,
     "exact_values": true,
-    "value_path": true
+    "value_path": true,
+    "live_scalars": false,
+    "live_scalar_step": 0.01,
+    "hop_receivers": 16,
+    "hop_tokens": 16,
+    "fhvq": true,
+    "vq_codes": 4,
+    "vq_sigma": 0.1,
+    "vq_chunk": 32,
+    "hop_route_k": 128,
+    "hop_query_keys": 64,
+    "oracle_proj": [],
+    "oracle_blocks": [],
+    "oracle_cut": false,
+    "oracle_stream_k": 0,
+    "oracle_first_hop": false,
+    "oracle_mixed": "",
+    "oracle_ranks": 0,
+    "oracle_codes": "pc"
   },
   "polar_margin": 1.1,
   "torch_version": "2.10.0+cu128"
