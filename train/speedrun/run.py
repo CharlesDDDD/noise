@@ -1,6 +1,6 @@
 """Track 2: #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path credit with moment kernels and
 one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average and late skip (#34's skip
-start), in 450 updates.
+start), in 450 updates (#36), with a faster runtime: overlapped collectives and a forward compiled as one graph.
 
 The estimator, the optimizers and the work split are #32's, unchanged (below). What this adds, each switchable:
   - The start (`--init prev8`, #12's formula and constants): every head of block 1 starts as a local RoPE head peaking
@@ -16,7 +16,17 @@ The estimator, the optimizers and the work split are #32's, unchanged (below). W
     own CUDA graph, captured in the warmup.
   - The run length (`--updates`): N = 450 updates instead of 600, the first N batches of #32's data order, with every
     schedule (the row-length switch at 0.8 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length.
-With `--updates 600 --init none --ema none --skip none` the script runs #32's update unchanged.
+With `--updates 600 --init none --ema none --skip none` the script runs #32's update: the same math, but the forward
+is compiled as one graph (#32's runs eagerly, below), so its floating-point rounding differs.
+
+The runtime, against #36's (the same arithmetic otherwise, op for op):
+  - The MLP matrices' gradients are reduce-scattered while the head credits run. The square stack's reduce-scatter,
+    the all-reduce of the other gradients and both ANVIL all-gathers are asynchronous, each under the next step's work
+    (ANVIL steps the MLP stack first, as its gradients arrive first; Adam runs while the matrices gather).
+  - The rotary tables are computed once per row length.
+  - The forward compiles as one graph: flex attention's log-sum-exp comes through `return_aux=AuxRequest(lse=True)`.
+    `return_lse=True` warns, and the warning broke the compiled forward inside its block loop, so the eight blocks
+    ran eagerly as many small kernels. Fused, the forward rounds differently (same math).
 
 #32's trainer: #13's estimator and work split at 8 rows per update (600 updates, ANVIL II's lr 0.032). One process per
 GPU: each runs the clean pass on its own rows (with fewer rows than GPUs, GPUs share a row and keep their part of it),
@@ -45,7 +55,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -173,6 +183,7 @@ class Model:
         mod = lambda w: (lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w))
         self.masks = {(w, t): create_block_mask(mod(w), None, None, t, t, device=device)
                       for w in (SEQ // 2, SEQ) for t in (WARMUP_LEN, SEQ)}
+        self.rope = {t: rotary(t, device) for t in (WARMUP_LEN, SEQ)}  # cos, sin per row length
 
     # views in the JAX trainer's layout
     def w(self, i, kind):
@@ -310,8 +321,9 @@ def forward_impl(model, idx, targets, cos, sin, lo: int, hi: int):
             values = values + (2 * torch.sigmoid(z.float())).unsqueeze(-1).to(BF16) * ve.view(b, t, H, HD)
             cache[f'h{i}.ve_gate'], cache[f'h{i}.ve'] = z, ve
         qp, kp = rope_norm(q.view(b, t, H, HD), cos, sin), rope_norm(k.view(b, t, H, HD), cos, sin)
-        o, lse = flex_attention(qp, kp, values.transpose(1, 2).contiguous(), block_mask=model.masks[(window(i), t)],
-                                return_lse=True)
+        o, aux = flex_attention(qp, kp, values.transpose(1, 2).contiguous(), block_mask=model.masks[(window(i), t)],
+                                return_aux=AuxRequest(lse=True))  # (return_lse's warning breaks the compiled graph)
+        lse = aux.lse
         o = o.transpose(1, 2).reshape(b, t, D)
         cache.update({f'h{i}.in.attn': n1, f'h{i}.q': q, f'h{i}.k': k, f'h{i}.values': values,
                       f'h{i}.lse': lse.float(), f'h{i}.in.attn.c_proj': o})
@@ -532,11 +544,12 @@ def scalar_credits(cred, prevs, lam_r, lam_0):
 def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
     """#29's identity-path estimate: the clean pass on this GPU's rows idx [b, t], the readout cycle and the MLP steps
     on its tokens lo..hi, one head's queries, keys and values over the batch. The ANVIL matrices' gradients stay this
-    GPU's partial sums (reduce-scattered later); the rest are all-reduced here. Returns the clean loss of its tokens."""
+    GPU's partial sums, reduce-scattered; the rest are all-reduced. Returns the clean loss of its tokens, the collectives
+    in flight and the token count."""
     world, rank = model.world, model.rank
     t = idx.shape[1]
     n, m = rows_total * t, hi - lo
-    rope32 = rotary(t, idx.device)
+    rope32 = model.rope[t]
     cache, loss = forward(model, idx, targets, *rope32, lo, hi)
     mine = lambda a: a.reshape(-1, a.shape[-1] if a.dim() < 4 else a.shape[-2] * a.shape[-1])[lo:hi]
     stream = lambda name: mine(cache[name]).float()
@@ -567,6 +580,8 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
                            for i in run])  # [b, h, t] -> by token, every row of this GPU's
         got = torch.empty_like(send)
         dist.all_to_all_single(got, send)  # [source GPU (its tokens), k, m, PACK]: this GPU's head over the batch
+    # the MLP matrices' gradients are complete: reduce them while the head credits run
+    works = dict(wide=dist.reduce_scatter_tensor(model.owned['wide'], model.grad['wide'], async_op=True))
     if not k:
         by_token = None
     else:  # one head per GPU
@@ -581,6 +596,7 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
         by_token = torch.stack([zero if i in skip else by_token[next(ran)] for i in range(L)])
     for j in range(3):  # queries, keys, values
         torch.bmm(n1s.transpose(1, 2), by_token[:, j], out=gsq[j * L:(j + 1) * L])
+    works['square'] = dist.reduce_scatter_tensor(model.owned['square'], model.grad['square'], async_op=True)
     for i in range(L):
         if has_ve(i):
             z, ve = mine(cache[f'h{i}.ve_gate']).float(), mine(cache[f'h{i}.ve']).float().view(-1, H, HD)
@@ -593,14 +609,8 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
     model.grad['wte'].zero_().index_add_(0, tokens, credit_x0)
     model.grad['lam_r'].copy_(scal_r)
     model.grad['lam_0'].copy_(scal_0)
-    dist.all_reduce(model.flat_grad)
-    model.flat_grad.div_(n)
-    for k in ['wte', *[f've{i}' for i in model.ve]]:  # cast to the parameter's dtype, as the JAX trainer does
-        model.grad[k].copy_(model.grad[k].to(BF16).float())
-    for name in ('square', 'wide'):  # the ANVIL matrices: summed gradients of this GPU's share
-        dist.reduce_scatter_tensor(model.owned[name], model.grad[name])
-        model.owned[name].div_(n)
-    return loss
+    works['flat'] = dist.all_reduce(model.flat_grad, async_op=True)
+    return loss, works, n
 
 
 # -------------------------------------------------------------------------------------------------------- optimizers
@@ -633,11 +643,15 @@ def anvil_math(w, g, fast, slow, energy, lr, beta, fast_beta, weight, rates):
     return w - lr * rates[:, None, None] * (update + decay), fast, slow, energy
 
 
-def anvil_update(model):
+def anvil_update(model, works, n):
+    """Steps this GPU's share of each stack once its gradients arrive; returns the all-gathers in flight."""
     beta, fast_beta, weight = anvil_betas(model.step_t)
     lr = model.scale_t * ANVIL_LR
     world, rank = model.world, model.rank
-    for name, w in (('square', model.square), ('wide', model.wide)):
+    gathers = []
+    for name, w in (('wide', model.wide), ('square', model.square)):
+        works[name].wait()
+        model.owned[name].div_(n)
         rates = model.rates[name]
         per = w.shape[0] // world
         sl = slice(rank * per, (rank + 1) * per)
@@ -647,7 +661,9 @@ def anvil_update(model):
         st['fast'][sl].copy_(fast)
         st['slow'][sl].copy_(slow)
         st['energy'][sl].copy_(energy)
-        dist.all_gather_into_tensor(w, new.contiguous())
+        new = new.contiguous()
+        gathers.append((dist.all_gather_into_tensor(w, new, async_op=True), new))
+    return gathers
 
 
 @torch.compile(dynamic=False)
@@ -658,7 +674,11 @@ def adam_math(p, g, m, v, lr, c1, c2):
     return p, m, v
 
 
-def adam_update(model):
+def adam_update(model, works, n):
+    works['flat'].wait()
+    model.flat_grad.div_(n)
+    for k in ['wte', *[f've{i}' for i in model.ve]]:  # cast to the parameter's dtype, as the JAX trainer does
+        model.grad[k].copy_(model.grad[k].to(BF16).float())
     t = model.step_t + 1
     c1, c2 = 1 - BETA1 ** t, 1 - BETA2 ** t
     for (p, g, lr), m, v in zip(model.adam, model.m, model.v):
@@ -691,12 +711,14 @@ def train_step(model, length, skip=()):
         idx, tgt = inputs[rank // share:rank // share + 1], targets[rank // share:rank // share + 1]
         part = length // share
         lo, hi = (rank % share) * part, (rank % share + 1) * part
-    loss = identity_grad(model, idx, tgt, lo, hi, rows_total, skip)
+    loss, works, n = identity_grad(model, idx, tgt, lo, hi, rows_total, skip)
     if skip:  # a skipped block's queries, keys and values get no credit, so no step at all (moves undone below)
         rows_qkv = model.skip_rows[skip]
         frozen = model.square.index_select(0, rows_qkv)
-    anvil_update(model)  # from the weights before this step's Adam (the gradients are this step's)
-    adam_update(model)
+    gathers = anvil_update(model, works, n)  # from the weights before this step's Adam (the gradients are this step's)
+    adam_update(model, works, n)  # while the ANVIL matrices gather
+    for work, _ in gathers:
+        work.wait()
     if skip:
         model.square.index_copy_(0, rows_qkv, frozen)
     model.refresh_bf16()
