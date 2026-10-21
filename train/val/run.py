@@ -43,8 +43,7 @@ further nonlinear step follows: the writers (attn.c_proj, mlp.c_proj) and the va
 keys and gates take their step from the measured credit alone.
 
 First hop and a VQ remainder (on by default). Cut's estimand leaves out every path through another token's keys and
-values; on this model nearly all of the gap to backprop sits in blocks 0-2's streams (their keys tell later tokens
-where to look). Blocks 0-2's mid streams and blocks 1-3's input streams are measured again, against the loss:
+values. Blocks 0-2's mid streams and blocks 1-3's input streams are measured again, against the loss:
 - The first hop. Each source token's experiment along every direction of a full cycle is its own chain (own-query
   routes, attention held) plus, at every later block it enters, the chains of the 16 tokens attending to it most,
   each moved by the change of its attention output when the source's key, value and gate move with the source's own

@@ -56,8 +56,6 @@
     "key_chunk": 8,
     "exact_values": true,
     "value_path": true,
-    "live_scalars": false,
-    "live_scalar_step": 0.01,
     "hop_receivers": 16,
     "hop_tokens": 16,
     "fhvq": true,
@@ -65,15 +63,7 @@
     "vq_sigma": 0.1,
     "vq_chunk": 32,
     "hop_route_k": 128,
-    "hop_query_keys": 64,
-    "oracle_proj": [],
-    "oracle_blocks": [],
-    "oracle_cut": false,
-    "oracle_stream_k": 0,
-    "oracle_first_hop": false,
-    "oracle_mixed": "",
-    "oracle_ranks": 0,
-    "oracle_codes": "pc"
+    "hop_query_keys": 64
   },
   "polar_margin": 1.1,
   "torch_version": "2.10.0+cu128"
