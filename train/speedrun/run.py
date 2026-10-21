@@ -1,13 +1,18 @@
 """Track 2: #29's trainer (@RobertTLange: identity-path credit with moment kernels and one head per GPU, on #25's
-recipe), ported from JAX to PyTorch.
+recipe), ported from JAX to PyTorch, at 8 rows per update.
 
-Same estimator, recipe and work split as #29. One process per GPU: each runs the clean pass on its own rows (two GPUs
-share a 2048-token row and keep half each), the readout cycle (a degree-3 expansion as six matrix products) and the
-MLP steps on its tokens, and one head's queries, keys and values over the batch: their inputs arrive in one
-all-to-all, the exact experiments run as attention-weighted moments on tensor cores (degree 2, kernels.py: Triton
-versions of #29's Pallas kernels), and the credits go back by token in a second all-to-all. The ANVIL matrices'
-gradients are reduce-scattered to the GPU that steps them. Each update is one CUDA graph per row length (collectives
-captured inside) that reads its batch and step index from device memory.
+8 rows per update: with #29's 4 each GPU holds 1,024 tokens, so an update is bound by latency (collectives, kernel
+launches), not compute. Twice the rows cost 1.42x the time per update (9.4 vs 6.6 ms on one node) and need 1.6x fewer
+updates: 600 instead of 975, the schedule's shape kept (1024-token rows until 80%, cooldown the last 40%). ANVIL II's
+lr is 0.8x #29's; at 0.04 some seeds spike.
+
+Same estimator and work split as #29. One process per GPU: each runs the clean pass on its own rows (with fewer rows
+than GPUs, GPUs share a row and keep their part of it), the readout cycle (a degree-3 expansion as six matrix
+products) and the MLP steps on its tokens, and one head's queries, keys and values over the batch: their inputs
+arrive in one all-to-all, the exact experiments run as attention-weighted moments on tensor cores (degree 2,
+kernels.py: Triton versions of #29's Pallas kernels), and the credits go back by token in a second all-to-all. The
+ANVIL matrices' gradients are reduce-scattered to the GPU that steps them. Each update is one CUDA graph per row
+length (collectives captured inside) that reads its batch and step index from device memory.
 
     torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 
@@ -37,15 +42,15 @@ from kernels import (moment_coefficients, moment_features, moment_key_scores, mo
 
 F32, BF16 = torch.float32, torch.bfloat16
 
-# recipe (#25 / #29: 975 updates of 4 rows, cooldown the last 40%, 1024-token rows until 80%)
-BATCH, SEQ, STEPS, SEED = 4, 2048, 975, 0
+# recipe (#25 / #29's shape at 8 rows per update: 600 updates, cooldown the last 40%, 1024-token rows until 80%)
+BATCH, SEQ, STEPS, SEED = 8, 2048, 600, 0
 WARMUP_LEN, WARMUP_UNTIL = 1024, STEPS * 4 // 5
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
 LR, BETA1, BETA2, ADAM_EPS = 0.003, 0.7, 0.98, 1e-8
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.04, 2.25
+ANVIL_LR, ANVIL_WD = 0.032, 2.25  # 0.8x #29's: at 8 rows 0.04 spikes on some seeds
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -468,7 +473,8 @@ def identity_grad(model, idx, targets, lo, hi, rows_total):
     send = pack_heads([mine(cache[f'h{i}.q']) for i in range(L)], [mine(cache[f'h{i}.k']) for i in range(L)],
                       [mine(cache[f'h{i}.values']) for i in range(L)],
                       [mine(cache[f'h{i}.in.attn.c_proj']) for i in range(L)], list(targets_o.unbind(0)),
-                      [cache[f'h{i}.lse'][0].T[lo:hi].contiguous().view(BF16) for i in range(L)])
+                      [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H)[lo:hi].contiguous().view(BF16)
+                       for i in range(L)])  # [b, h, t] -> by token, every row of this GPU's
     got = torch.empty_like(send)
     dist.all_to_all_single(got, send)  # [source GPU (its tokens), L, m, PACK]: this GPU's head over the batch
     whole = got.permute(1, 0, 2, 3).reshape(L, rows_total, t, PACK)
@@ -570,7 +576,7 @@ def train_step(model, length):
     """One update, everything on the device: this step's batch from model.rows, this GPU's rows of it."""
     world, rank = model.world, model.rank
     model.scale_t.copy_(torch.clamp((STEPS - model.step_t) / COOLDOWN, max=1.0))  # warmup-stable-decay
-    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [4, 2049]
+    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [BATCH, 2049]
     inputs, targets = batch[:, :-1].reshape(-1, length), batch[:, 1:].reshape(-1, length)  # rows cut into pieces
     rows_total = inputs.shape[0]
     if rows_total % world == 0:  # whole rows per GPU
