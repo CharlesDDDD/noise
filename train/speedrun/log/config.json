@@ -2,11 +2,11 @@
   "script": "train/speedrun/run.py",
   "port_of": "#29",
   "world": 8,
-  "batch": 4,
-  "steps": 975,
+  "batch": 8,
+  "steps": 600,
   "seed": 0,
-  "seq_warmup": "1024:780",
-  "cooldown": 390,
+  "seq_warmup": "1024:480",
+  "cooldown": 240,
   "lr": 0.003,
   "betas": [
     0.7,
@@ -15,6 +15,6 @@
   "lr_wte": 0.9,
   "lr_value_embeds": 0.9,
   "lr_lambdas": 0.003,
-  "anvil_lr": 0.04,
+  "anvil_lr": 0.032,
   "anvil_wd": 2.25
 }
