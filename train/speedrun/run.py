@@ -1,6 +1,8 @@
-"""Track 2: #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path credit with moment kernels and
-one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average and late skip (#34's skip
-start), in 450 updates (#36), with a faster runtime: overlapped collectives and a forward compiled as one graph.
+"""Track 2: #37 in 400 updates. #37 = #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path
+credit with moment kernels and one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average
+and late skip (#34's skip start), in 450 updates (#36), with overlapped collectives and a forward compiled as one graph.
+The shorter run takes three more constants: the head and gates at twice #32's Adam rate, ANVIL II at 0.024, and
+512-token rows for the first half.
 
 The estimator, the optimizers and the work split are #32's, unchanged (below). What this adds, each switchable:
   - The start (`--init prev8`, #12's formula and constants): every head of block 1 starts as a local RoPE head peaking
@@ -14,10 +16,12 @@ The estimator, the optimizers and the work split are #32's, unchanged (below). W
     (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
     weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
     own CUDA graph, captured in the warmup.
-  - The run length (`--updates`): N = 450 updates instead of 600, the first N batches of #32's data order, with every
-    schedule (the row-length switch at 0.8 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length.
-With `--updates 600 --init none --ema none --skip none` the script runs #32's update: the same math, but the forward
-is compiled as one graph (#32's runs eagerly, below), so its floating-point rounding differs.
+  - The run length (`--updates`): N = 400 updates instead of 600, the first N batches of #32's data order, with every
+    schedule (the row-length switch at 0.5 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length. Three
+    constants go with it: the Adam rate of the LM head and the value-embedding gates 0.006 (#32: 0.003), ANVIL II's
+    rate 0.024 (#32: 0.032), and 512-token rows until 0.5 N, then 2048 (#32: 1024-token rows until 0.8 N).
+With #32's three constants and `--updates 600 --init none --ema none --skip none` the script runs #32's update: the
+same math, but the forward is compiled as one graph (#32's runs eagerly, below), so its floating-point rounding differs.
 
 The runtime, against #36's (the same arithmetic otherwise, op for op):
   - The MLP matrices' gradients are reduce-scattered while the head credits run. The square stack's reduce-scatter,
@@ -65,15 +69,15 @@ from kernels import (moment_coefficients, moment_features, moment_key_scores, mo
 
 F32, BF16 = torch.float32, torch.bfloat16
 
-# recipe (#25 / #29's shape at 8 rows per update (#32): cooldown the last 40%, 1024-token rows until 80%)
-BATCH, SEQ, STEPS, SEED = 8, 2048, 450, 0  # the run length: 450 updates (#32: 600)
-WARMUP_LEN, WARMUP_UNTIL = 1024, STEPS * 4 // 5
+# recipe (#25 / #29's shape at 8 rows per update (#32): cooldown the last 40%; here 512-token rows until 50%)
+BATCH, SEQ, STEPS, SEED = 8, 2048, 400, 0  # the run length: 400 updates (#32: 600)
+WARMUP_LEN, WARMUP_UNTIL = 512, STEPS // 2  # #32: 1024-token rows until 80%
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
-LR, BETA1, BETA2, ADAM_EPS = 0.003, 0.7, 0.98, 1e-8
+LR, BETA1, BETA2, ADAM_EPS = 0.006, 0.7, 0.98, 1e-8  # the head's and gates' rate: 2x #32's for the shorter run
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.032, 2.25  # 0.8x #29's: at 8 rows 0.04 spikes on some seeds
+ANVIL_LR, ANVIL_WD = 0.024, 2.25  # #32: 0.032 (0.8x #29's: at 8 rows 0.04 spikes on some seeds)
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -744,7 +748,7 @@ def main():
     parser.add_argument('--skip', choices=('late', 'none'), default='late',
                         help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
     args = parser.parse_args()
-    STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates * 4 // 5, args.updates * 2 // 5, args.seed
+    STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates // 2, args.updates * 2 // 5, args.seed
     START, EMA, SKIP = args.init == 'prev8', args.ema == 'fixed', args.skip == 'late'
     root = Path(__file__).resolve().parents[2]
     dist.init_process_group('nccl')
