@@ -3,10 +3,26 @@
   "port_of": "#29",
   "world": 8,
   "batch": 4,
-  "steps": 975,
+  "steps": 825,
   "seed": 0,
-  "seq_warmup": "1024:780",
-  "cooldown": 390,
+  "init": "prev8",
+  "skip": {
+    "blocks": [
+      0,
+      2,
+      4,
+      6
+    ],
+    "start": 330
+  },
+  "ema": {
+    "mode": "fixed",
+    "start": 495,
+    "horizon": 206,
+    "mix": 0.4
+  },
+  "seq_warmup": "1024:660",
+  "cooldown": 330,
   "lr": 0.003,
   "betas": [
     0.7,
