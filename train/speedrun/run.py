@@ -1,5 +1,5 @@
 """Track 2: main's trainer (#29's identity-path credit with moment kernels and one head per GPU, @RobertTLange, in
-PyTorch) from a structured start, with a tail average and a late skip, in 825 updates.
+PyTorch) from a structured start, with a tail average and a late skip, in 775 updates.
 
 The estimator, the work split and the runtime are main's, unchanged (below). What this adds, each switchable:
   - The start (`--init prev8`, record #12's): every head of block 1 starts as a local RoPE head peaking at lag 1. Its
@@ -9,13 +9,14 @@ The estimator, the work split and the runtime are main's, unchanged (below). Wha
   - The tail average (`--ema fixed`): an fp32 EMA of every weight from 60% of the run (rate 1 / (0.25 N)), kept inside
     each later update's CUDA graph; after the last update, inside the timer, the weights move 0.4 of the way to it.
     A fixed mix: nothing is measured or selected.
-  - The late skip (`--skip late`): from 40% of the run blocks 0, 2, 4 and 6 run no query / key / value experiments
+  - The late skip (`--skip late`): from 20% of the run blocks 0, 2, 4 and 6 run no query / key / value experiments
     (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
     weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
     own CUDA graph, captured in the warmup.
-  - The run length (`--updates`): N = 825 updates instead of 975, the first N batches of main's data order, with every
+  - The run length (`--updates`): N = 775 updates instead of 975, the first N batches of main's data order, with every
     schedule (the row-length switch at 0.8 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length.
-With `--updates 975 --init none --ema none --skip none` the script runs main's update unchanged.
+  - ANVIL II's peak rate (`ANVIL_LR`, a constant): 0.03 instead of main's 0.04, for the shorter run.
+With `--updates 975 --init none --ema none --skip none` and ANVIL_LR = 0.04 the script runs main's update unchanged.
 
 Main's trainer: same estimator, recipe and work split as #29. One process per GPU: each runs the clean pass on its own
 rows (two GPUs share a 2048-token row and keep half each), the readout cycle (a degree-3 expansion as six matrix
@@ -54,14 +55,14 @@ from kernels import (moment_coefficients, moment_features, moment_key_scores, mo
 F32, BF16 = torch.float32, torch.bfloat16
 
 # recipe (#25 / #29: updates of 4 rows, cooldown the last 40%, 1024-token rows until 80%)
-BATCH, SEQ, STEPS, SEED = 4, 2048, 825, 0  # the run length: 825 updates (main: 975)
+BATCH, SEQ, STEPS, SEED = 4, 2048, 775, 0  # the run length: 775 updates (main: 975)
 WARMUP_LEN, WARMUP_UNTIL = 1024, STEPS * 4 // 5
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
 LR, BETA1, BETA2, ADAM_EPS = 0.003, 0.7, 0.98, 1e-8
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.04, 2.25
+ANVIL_LR, ANVIL_WD = 0.03, 2.25  # main (975 updates): 0.04
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -77,7 +78,7 @@ SQUARE = ('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_proj')
 START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head of block 1 a local RoPE head at lag 1
 EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
 START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: main's recipe)
-SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.4, True  # late skip: no attention experiments in these blocks
+SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
 
 
 def has_ve(layer):
@@ -717,7 +718,7 @@ def main():
     parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: main's init")
     parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
     parser.add_argument('--skip', choices=('late', 'none'), default='late',
-                        help='late: blocks 0, 2, 4, 6 run no attention experiments from 40%% of the run')
+                        help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
     args = parser.parse_args()
     STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates * 4 // 5, args.updates * 2 // 5, args.seed
     START, EMA, SKIP = args.init == 'prev8', args.ema == 'fixed', args.skip == 'late'
