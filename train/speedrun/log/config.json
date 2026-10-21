@@ -2,8 +2,8 @@
   "script": "train/speedrun/run.py",
   "port_of": "#29",
   "world": 8,
-  "batch": 4,
-  "steps": 775,
+  "batch": 8,
+  "steps": 450,
   "seed": 0,
   "init": "prev8",
   "skip": {
@@ -13,16 +13,16 @@
       4,
       6
     ],
-    "start": 155
+    "start": 90
   },
   "ema": {
     "mode": "fixed",
-    "start": 465,
-    "horizon": 194,
+    "start": 270,
+    "horizon": 112,
     "mix": 0.4
   },
-  "seq_warmup": "1024:620",
-  "cooldown": 310,
+  "seq_warmup": "1024:360",
+  "cooldown": 180,
   "lr": 0.003,
   "betas": [
     0.7,
@@ -31,6 +31,6 @@
   "lr_wte": 0.9,
   "lr_value_embeds": 0.9,
   "lr_lambdas": 0.003,
-  "anvil_lr": 0.03,
+  "anvil_lr": 0.032,
   "anvil_wd": 2.25
 }

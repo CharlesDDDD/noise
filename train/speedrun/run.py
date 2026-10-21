@@ -1,29 +1,30 @@
-"""Track 2: main's trainer (#29's identity-path credit with moment kernels and one head per GPU, @RobertTLange, in
-PyTorch) from a structured start, with a tail average and a late skip, in 775 updates.
+"""Track 2: #32's trainer (#13 at 8 rows per update, @Euraba; #13 = #29's identity-path credit with moment kernels and
+one head per GPU, @RobertTLange, in PyTorch) with #33's structured start, tail average and late skip (#34's skip
+start), in 450 updates.
 
-The estimator, the work split and the runtime are main's, unchanged (below). What this adds, each switchable:
-  - The start (`--init prev8`, record #12's): every head of block 1 starts as a local RoPE head peaking at lag 1. Its
-    query and key columns get a rank-one term on the block input's token-shared direction (`shared_means`, in closed
-    form from the initial weights) and keep a quarter of their random map. A fixed formula of the seed and the
-    architecture: no data, statistic or forward pass.
-  - The tail average (`--ema fixed`): an fp32 EMA of every weight from 60% of the run (rate 1 / (0.25 N)), kept inside
-    each later update's CUDA graph; after the last update, inside the timer, the weights move 0.4 of the way to it.
-    A fixed mix: nothing is measured or selected.
+The estimator, the optimizers and the work split are #32's, unchanged (below). What this adds, each switchable:
+  - The start (`--init prev8`, #12's formula and constants): every head of block 1 starts as a local RoPE head peaking
+    at lag 1. Its query and key columns get a rank-one term on the block input's token-shared direction
+    (`shared_means`, in closed form from the initial weights) and keep a quarter of their random map. A fixed formula
+    of the seed and the architecture: no data, statistic or forward pass.
+  - The tail average (`--ema fixed`): an fp32 EMA of every weight from 60% of the run (rate 1 / round(0.25 N)), kept
+    inside each later update's CUDA graph; after the last update, inside the timer, the weights move 0.4 of the way to
+    it. A fixed mix: nothing is measured or selected.
   - The late skip (`--skip late`): from 20% of the run blocks 0, 2, 4 and 6 run no query / key / value experiments
     (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
     weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
     own CUDA graph, captured in the warmup.
-  - The run length (`--updates`): N = 775 updates instead of 975, the first N batches of main's data order, with every
+  - The run length (`--updates`): N = 450 updates instead of 600, the first N batches of #32's data order, with every
     schedule (the row-length switch at 0.8 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length.
-  - ANVIL II's peak rate (`ANVIL_LR`, a constant): 0.03 instead of main's 0.04, for the shorter run.
-With `--updates 975 --init none --ema none --skip none` and ANVIL_LR = 0.04 the script runs main's update unchanged.
+With `--updates 600 --init none --ema none --skip none` the script runs #32's update unchanged.
 
-Main's trainer: same estimator, recipe and work split as #29. One process per GPU: each runs the clean pass on its own
-rows (two GPUs share a 2048-token row and keep half each), the readout cycle (a degree-3 expansion as six matrix
-products) and the MLP steps on its tokens, and one head's queries, keys and values over the batch: their inputs arrive
-in one all-to-all, the exact experiments run as attention-weighted moments on tensor cores (degree 2, kernels.py: Triton
-versions of #29's Pallas kernels), and the credits go back by token in a second all-to-all. The ANVIL matrices'
-gradients are reduce-scattered to the GPU that steps them. Each update is one CUDA graph per row length (collectives
+#32's trainer: #13's estimator and work split at 8 rows per update (600 updates, ANVIL II's lr 0.032). One process per
+GPU: each runs the clean pass on its own rows (with fewer rows than GPUs, GPUs share a row and keep their part of it),
+the readout cycle (a degree-3 expansion as six matrix products) and the MLP steps on its tokens, and one head's
+queries, keys and values over the batch: their inputs arrive in one all-to-all, the exact experiments run as
+attention-weighted moments on tensor cores (degree 2, kernels.py: Triton versions of #29's Pallas kernels), and the
+credits go back by token in a second all-to-all. The ANVIL matrices' gradients are reduce-scattered to the GPU that
+steps them. Each update is one CUDA graph per row length (here also per tail-average and skip phase; collectives
 captured inside) that reads its batch and step index from device memory.
 
     torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
@@ -54,15 +55,15 @@ from kernels import (moment_coefficients, moment_features, moment_key_scores, mo
 
 F32, BF16 = torch.float32, torch.bfloat16
 
-# recipe (#25 / #29: updates of 4 rows, cooldown the last 40%, 1024-token rows until 80%)
-BATCH, SEQ, STEPS, SEED = 4, 2048, 775, 0  # the run length: 775 updates (main: 975)
+# recipe (#25 / #29's shape at 8 rows per update (#32): cooldown the last 40%, 1024-token rows until 80%)
+BATCH, SEQ, STEPS, SEED = 8, 2048, 450, 0  # the run length: 450 updates (#32: 600)
 WARMUP_LEN, WARMUP_UNTIL = 1024, STEPS * 4 // 5
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
 LR, BETA1, BETA2, ADAM_EPS = 0.003, 0.7, 0.98, 1e-8
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.03, 2.25  # main (975 updates): 0.04
+ANVIL_LR, ANVIL_WD = 0.032, 2.25  # 0.8x #29's: at 8 rows 0.04 spikes on some seeds
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -77,7 +78,7 @@ ANVIL_RUN = (1194, 240, 50, 514)
 SQUARE = ('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_proj')
 START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head of block 1 a local RoPE head at lag 1
 EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
-START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: main's recipe)
+START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: #32's recipe)
 SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
 
 
@@ -562,7 +563,8 @@ def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
         send = pack_heads([mine(cache[f'h{i}.q']) for i in run], [mine(cache[f'h{i}.k']) for i in run],
                           [mine(cache[f'h{i}.values']) for i in run],
                           [mine(cache[f'h{i}.in.attn.c_proj']) for i in run], [targets_o[i] for i in run],
-                          [cache[f'h{i}.lse'][0].T[lo:hi].contiguous().view(BF16) for i in run])
+                          [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H)[lo:hi].contiguous().view(BF16)
+                           for i in run])  # [b, h, t] -> by token, every row of this GPU's
         got = torch.empty_like(send)
         dist.all_to_all_single(got, send)  # [source GPU (its tokens), k, m, PACK]: this GPU's head over the batch
     if not k:
@@ -677,7 +679,7 @@ def train_step(model, length, skip=()):
     """One update, everything on the device: this step's batch from model.rows, this GPU's rows of it."""
     world, rank = model.world, model.rank
     model.scale_t.copy_(torch.clamp((STEPS - model.step_t) / COOLDOWN, max=1.0))  # warmup-stable-decay
-    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [4, 2049]
+    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [BATCH, 2049]
     inputs, targets = batch[:, :-1].reshape(-1, length), batch[:, 1:].reshape(-1, length)  # rows cut into pieces
     rows_total = inputs.shape[0]
     if rows_total % world == 0:  # whole rows per GPU
@@ -715,7 +717,7 @@ def main():
     parser.add_argument('--steps', type=int, default=0, help='Stop after this many updates (smoke tests).')
     parser.add_argument('--updates', type=int, default=STEPS, help='the run length N (the schedules scale with it)')
     parser.add_argument('--seed', type=int, default=SEED)
-    parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: main's init")
+    parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: #32's init")
     parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
     parser.add_argument('--skip', choices=('late', 'none'), default='late',
                         help='late: blocks 0, 2, 4, 6 run no attention experiments from 20%% of the run')
