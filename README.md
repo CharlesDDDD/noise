@@ -93,6 +93,10 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [Script](https://github.com/qlabs-eng/noise/blob/2b592c572f2a103a8990a222cb316d9909577704/train/speedrun/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
 | 8 | 4.174 | Factored finite key and hidden probes | 1 min 2 s | [Script](https://github.com/qlabs-eng/noise/blob/90073fae22811409c1496b8b2339d90c5e311652/train/speedrun/run.py) | [@jon123boss](https://github.com/jon123boss) |
 | 9 | 4.177 | Identity-path credit with fused probe kernels, no MLP cycle | 47 s | [Script](https://github.com/qlabs-eng/noise/blob/c2173461b311e350672862d6e52e2d3e0a9bb48f/train/speedrun/run.py) | [@isaac0804](https://github.com/isaac0804) |
+| 10 | 4.180 | Identity-path credit, token-sharded across GPUs | 15.4 s | [Script](https://github.com/RobertTLange/noise/blob/c04f2ae0bac0666fab79e1f9b08343e56aa40f9d/train/speedrun/jax/train.py) | [@RobertTLange](https://github.com/RobertTLange) |
+| 11 | 4.188 | Drift Leap: stop early, then one leap back along the weights' drift | 14.6 s | [Script](https://github.com/areu01or00/noise/blob/bfefa849cfa4095809e079250768e8ea08b1b1ac/train/speedrun/jax/train.py) | [@areu01or00](https://github.com/areu01or00) |
+| 12 | 4.162 | Data-free structured start: block 1's heads as lag-1 RoPE heads | 13.1 s | [Script](https://github.com/erodola/noise/blob/288227ef36b59ccc331e276d1a220f2191c6068a/train/speedrun/jax/train.py) | [@erodola](https://github.com/erodola) |
+| 13 | 4.144 | Moment kernels for the exact experiments, one head per GPU | 6.4 s | [Script](https://github.com/qlabs-eng/noise/blob/89db4bac4f6236295bc6ff7d305c0c12a486421e/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 
 ## What backprop gets
 
