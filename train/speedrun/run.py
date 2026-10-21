@@ -1,18 +1,29 @@
-"""Track 2: #29's trainer (@RobertTLange: identity-path credit with moment kernels and one head per GPU, on #25's
-recipe), ported from JAX to PyTorch, at 8 rows per update.
+"""Track 2: main's trainer (#29's identity-path credit with moment kernels and one head per GPU, @RobertTLange, in
+PyTorch) from a structured start, with a tail average and a late skip, in 825 updates.
 
-8 rows per update: with #29's 4 each GPU holds 1,024 tokens, so an update is bound by latency (collectives, kernel
-launches), not compute. Twice the rows cost 1.42x the time per update (9.4 vs 6.6 ms on one node) and need 1.6x fewer
-updates: 600 instead of 975, the schedule's shape kept (1024-token rows until 80%, cooldown the last 40%). ANVIL II's
-lr is 0.8x #29's; at 0.04 some seeds spike.
+The estimator, the work split and the runtime are main's, unchanged (below). What this adds, each switchable:
+  - The start (`--init prev8`, record #12's): every head of block 1 starts as a local RoPE head peaking at lag 1. Its
+    query and key columns get a rank-one term on the block input's token-shared direction (`shared_means`, in closed
+    form from the initial weights) and keep a quarter of their random map. A fixed formula of the seed and the
+    architecture: no data, statistic or forward pass.
+  - The tail average (`--ema fixed`): an fp32 EMA of every weight from 60% of the run (rate 1 / (0.25 N)), kept inside
+    each later update's CUDA graph; after the last update, inside the timer, the weights move 0.4 of the way to it.
+    A fixed mix: nothing is measured or selected.
+  - The late skip (`--skip late`): from 40% of the run blocks 0, 2, 4 and 6 run no query / key / value experiments
+    (they leave the head pack and both all-to-alls), so their queries, keys and values get no credit and keep their
+    weights (the optimizer's moves on them are undone). Fewer measurements and no new signal. Each skip phase is its
+    own CUDA graph, captured in the warmup.
+  - The run length (`--updates`): N = 825 updates instead of 975, the first N batches of main's data order, with every
+    schedule (the row-length switch at 0.8 N, the cooldown over the last 0.4 N, ANVIL's phases) on that length.
+With `--updates 975 --init none --ema none --skip none` the script runs main's update unchanged.
 
-Same estimator and work split as #29. One process per GPU: each runs the clean pass on its own rows (with fewer rows
-than GPUs, GPUs share a row and keep their part of it), the readout cycle (a degree-3 expansion as six matrix
-products) and the MLP steps on its tokens, and one head's queries, keys and values over the batch: their inputs
-arrive in one all-to-all, the exact experiments run as attention-weighted moments on tensor cores (degree 2,
-kernels.py: Triton versions of #29's Pallas kernels), and the credits go back by token in a second all-to-all. The
-ANVIL matrices' gradients are reduce-scattered to the GPU that steps them. Each update is one CUDA graph per row
-length (collectives captured inside) that reads its batch and step index from device memory.
+Main's trainer: same estimator, recipe and work split as #29. One process per GPU: each runs the clean pass on its own
+rows (two GPUs share a 2048-token row and keep half each), the readout cycle (a degree-3 expansion as six matrix
+products) and the MLP steps on its tokens, and one head's queries, keys and values over the batch: their inputs arrive
+in one all-to-all, the exact experiments run as attention-weighted moments on tensor cores (degree 2, kernels.py: Triton
+versions of #29's Pallas kernels), and the credits go back by token in a second all-to-all. The ANVIL matrices'
+gradients are reduce-scattered to the GPU that steps them. Each update is one CUDA graph per row length (collectives
+captured inside) that reads its batch and step index from device memory.
 
     torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 
@@ -42,15 +53,15 @@ from kernels import (moment_coefficients, moment_features, moment_key_scores, mo
 
 F32, BF16 = torch.float32, torch.bfloat16
 
-# recipe (#25 / #29's shape at 8 rows per update: 600 updates, cooldown the last 40%, 1024-token rows until 80%)
-BATCH, SEQ, STEPS, SEED = 8, 2048, 600, 0
+# recipe (#25 / #29: updates of 4 rows, cooldown the last 40%, 1024-token rows until 80%)
+BATCH, SEQ, STEPS, SEED = 4, 2048, 825, 0  # the run length: 825 updates (main: 975)
 WARMUP_LEN, WARMUP_UNTIL = 1024, STEPS * 4 // 5
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
 LR, BETA1, BETA2, ADAM_EPS = 0.003, 0.7, 0.98, 1e-8
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.032, 2.25  # 0.8x #29's: at 8 rows 0.04 spikes on some seeds
+ANVIL_LR, ANVIL_WD = 0.04, 2.25
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -63,6 +74,10 @@ ANVIL_MAPS = ((3.923798038567, -6.095026865488, 3.905234618423), (3.278126713798
 POLAR_MARGIN = 1.1
 ANVIL_RUN = (1194, 240, 50, 514)
 SQUARE = ('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_proj')
+START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head of block 1 a local RoPE head at lag 1
+EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
+START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: main's recipe)
+SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.4, True  # late skip: no attention experiments in these blocks
 
 
 def has_ve(layer):
@@ -113,6 +128,8 @@ class Model:
         self.ve = {i: uni((VOCAB, D), s).to(device, BF16) for i in range(L) if has_ve(i)}
         self.lam_r = torch.ones(L, device=device)
         self.lam_0 = torch.full((L,), 0.1, device=device)
+        if START:
+            structured_start(self)
         # the ANVIL matrices' gradient stacks (each GPU's partial sums, reduce-scattered to the GPU that steps them),
         # and one flat buffer (one all-reduce) for the rest
         shapes = dict(wte=self.wte.shape, lm_head=self.lm_head.shape,
@@ -148,6 +165,9 @@ class Model:
         self.square_bf, self.wide_bf = self.square.to(BF16), self.wide.to(BF16)  # the forward's bf16 weights
         self.lm_head_bf = self.lm_head.to(BF16)
         self.gates_bf = {i: g.to(BF16) for i, g in self.gates.items()}
+        self.ema = [torch.zeros(w.shape, device=device) for w in self.averaged()] if EMA else None
+        self.skip_rows = {SKIP_BLOCKS: torch.tensor([kind * L + i for kind in range(3) for i in SKIP_BLOCKS],
+                                                    device=device)}  # the square stack's q, k, v rows of the skip
         mod = lambda w: (lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w))
         self.masks = {(w, t): create_block_mask(mod(w), None, None, t, t, device=device)
                       for w in (SEQ // 2, SEQ) for t in (WARMUP_LEN, SEQ)}
@@ -171,6 +191,11 @@ class Model:
         for i, g in self.gates.items():
             self.gates_bf[i].copy_(g)
 
+    def averaged(self):
+        """The weights the tail average follows (every parameter, in a fixed order)."""
+        return [self.square, self.wide, self.wte, self.lm_head, self.lam_r, self.lam_0, *self.gates.values(),
+                *self.ve.values()]
+
     def tensors(self):
         """Every tensor the training state consists of (for snapshots)."""
         out = [self.square, self.wide, self.wte, self.lm_head, self.lam_r, self.lam_0, *self.gates.values(),
@@ -188,6 +213,66 @@ class Model:
                 sd[f'transformer.h.{i}.attn.ve_gate.weight'] = self.gates[i].T
                 sd[f'value_embeds.{i}.weight'] = self.ve[i].float()
         return {k: v.detach().float().contiguous().cpu() for k, v in sd.items()}
+
+
+def rope_pair(lag, rho, generator):
+    """A query and key whose rotary logit is a bump at `lag` whatever the position: energy rho^j on frequency pair j
+    (j = 0 the fastest), random phases, and the key is the query moved `lag` positions ahead. RMS 1 each."""
+    half = HD // 2
+    phase = 2 * math.pi * torch.rand(half, generator=generator)
+    amplitude = rho ** (torch.arange(half, dtype=F32) / 2)
+    q = torch.cat([amplitude * phase.cos(), amplitude * phase.sin()])
+    q = q * math.sqrt(HD) / q.norm()
+    angle = lag / 10000 ** (torch.arange(0, HD, 2, dtype=F32) / HD)
+    q1, q2 = q[:half], q[half:]
+    return q, torch.cat([q1 * angle.cos() + q2 * angle.sin(), q2 * angle.cos() - q1 * angle.sin()])
+
+
+def relu2_moments(mu, sd):
+    """E relu(u)^2 and E relu(u)^4 for u ~ N(mu, sd^2)."""
+    z = mu / sd
+    cdf, pdf = 0.5 * (1 + torch.erf(z / math.sqrt(2))), torch.exp(-z * z / 2) / math.sqrt(2 * math.pi)
+    m2 = (mu ** 2 + sd ** 2) * cdf + mu * sd * pdf
+    m4 = (mu ** 4 + 6 * mu ** 2 * sd ** 2 + 3 * sd ** 4) * cdf + (mu ** 3 + 5 * mu * sd ** 2) * sd * pdf
+    return m2, m4
+
+
+@torch.no_grad()
+def shared_means(model):
+    """Each block's normalized input, averaged over tokens, in closed form from the weights: the part of the stream
+    every token shares, written by the relu^2 means of the MLPs below. Mean field: each stream is a shared mean plus
+    an isotropic token part; near-uniform attention writes c_v c_proj of the mean; each MLP unit's input is Gaussian."""
+    mean, energy, x0, means = torch.zeros(D, device=model.device), float(D), 1.0, []  # E x, E|x|^2, x0's share
+    for i in range(L):
+        r, lam = model.lam_r[i].item(), model.lam_0[i].item()
+        energy = r * r * energy + lam * lam * D + 2 * r * lam * x0 * D
+        mean, x0 = r * mean, r * x0 + lam
+        means.append(mean / math.sqrt(energy / D))
+        attended = (means[-1] @ model.w(i, 'attn.c_v')) @ model.w(i, 'attn.c_proj')
+        energy, mean = energy + (attended @ attended).item() + 2 * (mean @ attended).item(), mean + attended
+        shared = mean / math.sqrt(energy / D)
+        fc, proj = model.w(i, 'mlp.c_fc'), model.w(i, 'mlp.c_proj')
+        spread = fc.norm(dim=0) * max(1 - (shared @ shared).item() / D, 1e-3) ** 0.5
+        m2, m4 = relu2_moments(shared @ fc, spread)
+        written = m2 @ proj
+        energy += (written @ written).item() + (proj.square().sum(1) @ (m4 - m2 * m2)).item()
+        energy, mean = energy + 2 * (mean @ written).item(), mean + written
+    return means
+
+
+@torch.no_grad()
+def structured_start(model):
+    """Every head of block 1 starts as a local RoPE head peaking at lag 1: its query and key columns get a rank-one
+    term on the block input's token-shared direction (shared_means), so the raw query is the same vector for every
+    token, rotated to attend one position back, and keep a quarter of their random map. A fixed formula of the seed
+    and the architecture: no data, statistic or forward pass."""
+    generator = torch.Generator(device='cpu').manual_seed(SEED + 31)
+    mean = shared_means(model)[START_BLOCK]
+    for h in range(H):
+        cols = slice(h * HD, (h + 1) * HD)
+        for kind, v in zip(('attn.c_q', 'attn.c_k'), rope_pair(START_LAG, START_RHO, generator)):
+            w = model.w(START_BLOCK, kind)
+            w[:, cols] = START_CONTENT * w[:, cols] + torch.outer(mean, v.to(mean.device)) / (mean @ mean)
 
 
 def rotary(t, device):
@@ -442,7 +527,7 @@ def scalar_credits(cred, prevs, lam_r, lam_0):
     return scal_r, scal_0, credit_x0
 
 
-def identity_grad(model, idx, targets, lo, hi, rows_total):
+def identity_grad(model, idx, targets, lo, hi, rows_total, skip=()):
     """#29's identity-path estimate: the clean pass on this GPU's rows idx [b, t], the readout cycle and the MLP steps
     on its tokens lo..hi, one head's queries, keys and values over the batch. The ANVIL matrices' gradients stay this
     GPU's partial sums (reduce-scattered later); the rest are all-reduced here. Returns the clean loss of its tokens."""
@@ -470,19 +555,27 @@ def identity_grad(model, idx, targets, lo, hi, rows_total):
     torch.bmm(n2s.transpose(1, 2), hidden, out=gwide[:L])  # mlp.c_fc
     torch.bmm(os_.transpose(1, 2), cred, out=gsq[3 * L:])  # attn.c_proj
     targets_o = torch.bmm(cred, model.square[3 * L:].transpose(1, 2)).to(BF16)  # attention-output targets (bf16)
-    send = pack_heads([mine(cache[f'h{i}.q']) for i in range(L)], [mine(cache[f'h{i}.k']) for i in range(L)],
-                      [mine(cache[f'h{i}.values']) for i in range(L)],
-                      [mine(cache[f'h{i}.in.attn.c_proj']) for i in range(L)], list(targets_o.unbind(0)),
-                      [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H)[lo:hi].contiguous().view(BF16)
-                       for i in range(L)])  # [b, h, t] -> by token, every row of this GPU's
-    got = torch.empty_like(send)
-    dist.all_to_all_single(got, send)  # [source GPU (its tokens), L, m, PACK]: this GPU's head over the batch
-    whole = got.permute(1, 0, 2, 3).reshape(L, rows_total, t, PACK)
-    res = torch.stack([head_credits(whole[i], rope32, window(i)) for i in range(L)])  # [L, 3, n, hd]
-    back = res.view(L, 3, world, m, HD).permute(2, 0, 1, 3, 4).contiguous()
-    got2 = torch.empty_like(back)
-    dist.all_to_all_single(got2, back)  # [source GPU (its head), L, 3, m, hd]
-    by_token = got2.permute(1, 2, 3, 0, 4).reshape(L, 3, m, D)
+    run = [i for i in range(L) if i not in skip]  # the blocks whose attention experiments run (the late skip)
+    k = len(run)
+    if k:
+        send = pack_heads([mine(cache[f'h{i}.q']) for i in run], [mine(cache[f'h{i}.k']) for i in run],
+                          [mine(cache[f'h{i}.values']) for i in run],
+                          [mine(cache[f'h{i}.in.attn.c_proj']) for i in run], [targets_o[i] for i in run],
+                          [cache[f'h{i}.lse'][0].T[lo:hi].contiguous().view(BF16) for i in run])
+        got = torch.empty_like(send)
+        dist.all_to_all_single(got, send)  # [source GPU (its tokens), k, m, PACK]: this GPU's head over the batch
+    if not k:
+        by_token = None
+    else:  # one head per GPU
+        whole = got.permute(1, 0, 2, 3).reshape(k, rows_total, t, PACK)
+        res = torch.stack([head_credits(whole[j], rope32, window(i)) for j, i in enumerate(run)])  # [k, 3, n, hd]
+        back = res.view(k, 3, world, m, HD).permute(2, 0, 1, 3, 4).contiguous()
+        got2 = torch.empty_like(back)
+        dist.all_to_all_single(got2, back)  # [source GPU (its head), k, 3, m, hd]
+        by_token = got2.permute(1, 2, 3, 0, 4).reshape(k, 3, m, D)
+    if skip:  # the skipped blocks' queries, keys and values get no credit
+        zero, ran = torch.zeros(3, m, D, device=idx.device, dtype=F32), iter(range(k))
+        by_token = torch.stack([zero if i in skip else by_token[next(ran)] for i in range(L)])
     for j in range(3):  # queries, keys, values
         torch.bmm(n1s.transpose(1, 2), by_token[:, j], out=gsq[j * L:(j + 1) * L])
     for i in range(L):
@@ -572,11 +665,18 @@ def adam_update(model):
         v.copy_(newv)
 
 
-def train_step(model, length):
+def average_step(model, length, skip=()):
+    """An update, then the tail average follows the new weights."""
+    train_step(model, length, skip)
+    rate = 1 / max(1, round(EMA_HORIZON * STEPS))
+    torch._foreach_lerp_(model.ema, [w.float() for w in model.averaged()], rate)
+
+
+def train_step(model, length, skip=()):
     """One update, everything on the device: this step's batch from model.rows, this GPU's rows of it."""
     world, rank = model.world, model.rank
     model.scale_t.copy_(torch.clamp((STEPS - model.step_t) / COOLDOWN, max=1.0))  # warmup-stable-decay
-    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [BATCH, 2049]
+    batch = model.rows.index_select(0, model.step_t.long().view(1))[0]  # [4, 2049]
     inputs, targets = batch[:, :-1].reshape(-1, length), batch[:, 1:].reshape(-1, length)  # rows cut into pieces
     rows_total = inputs.shape[0]
     if rows_total % world == 0:  # whole rows per GPU
@@ -588,9 +688,14 @@ def train_step(model, length):
         idx, tgt = inputs[rank // share:rank // share + 1], targets[rank // share:rank // share + 1]
         part = length // share
         lo, hi = (rank % share) * part, (rank % share + 1) * part
-    loss = identity_grad(model, idx, tgt, lo, hi, rows_total)
+    loss = identity_grad(model, idx, tgt, lo, hi, rows_total, skip)
+    if skip:  # a skipped block's queries, keys and values get no credit, so no step at all (moves undone below)
+        rows_qkv = model.skip_rows[skip]
+        frozen = model.square.index_select(0, rows_qkv)
     anvil_update(model)  # from the weights before this step's Adam (the gradients are this step's)
     adam_update(model)
+    if skip:
+        model.square.index_copy_(0, rows_qkv, frozen)
     model.refresh_bf16()
     model.losses.index_copy_(0, model.step_t.long().view(1), loss.view(1))
     model.step_t.add_(1)
@@ -602,14 +707,25 @@ MODEL = None
 
 
 def main():
+    global STEPS, WARMUP_UNTIL, COOLDOWN, SEED, START, EMA, SKIP
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/speedrun'))
     parser.add_argument('--steps', type=int, default=0, help='Stop after this many updates (smoke tests).')
+    parser.add_argument('--updates', type=int, default=STEPS, help='the run length N (the schedules scale with it)')
+    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--init', choices=('prev8', 'none'), default='prev8', help="none: main's init")
+    parser.add_argument('--ema', choices=('fixed', 'none'), default='fixed')
+    parser.add_argument('--skip', choices=('late', 'none'), default='late',
+                        help='late: blocks 0, 2, 4, 6 run no attention experiments from 40%% of the run')
     args = parser.parse_args()
+    STEPS, WARMUP_UNTIL, COOLDOWN, SEED = args.updates, args.updates * 4 // 5, args.updates * 2 // 5, args.seed
+    START, EMA, SKIP = args.init == 'prev8', args.ema == 'fixed', args.skip == 'late'
     root = Path(__file__).resolve().parents[2]
     dist.init_process_group('nccl')
     rank, world = dist.get_rank(), dist.get_world_size()
+    if world != H:
+        raise SystemExit(f'one head per GPU: run on {H} GPUs, not {world}')
     device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', rank)))
     torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -622,18 +738,22 @@ def main():
     total = args.steps or STEPS
     snapshot = [x.clone() for x in model.tensors()]
     graphs = {}
+    steps_of = (train_step, average_step) if EMA else (train_step,)  # the tail average's updates: their own graphs
+    skips = ((), SKIP_BLOCKS) if SKIP else ((),)  # and the late skip's
     for length in (WARMUP_LEN, SEQ):  # warmup on random tokens (model.rows is random until training), then capture
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(3):
-                train_step(model, length)
-        torch.cuda.current_stream().wait_stream(side)
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            train_step(model, length)
-        graphs[length] = g
+        for update in steps_of:
+            for skip in skips:
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        update(model, length, skip)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    update(model, length, skip)
+                graphs[length, update is average_step, bool(skip)] = g
     with torch.no_grad():  # training starts from the untouched state, on the real batches
         for x, s in zip(model.tensors(), snapshot):
             x.copy_(s)
@@ -649,13 +769,23 @@ def main():
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
             script='train/speedrun/run.py', port_of='#29', world=world, batch=BATCH, steps=STEPS, seed=SEED,
+            init=args.init, skip=dict(blocks=SKIP_BLOCKS, start=round(SKIP_FROM * STEPS)) if SKIP else None,
+            ema=dict(mode=args.ema, start=round(EMA_FROM * STEPS), horizon=round(EMA_HORIZON * STEPS),
+                     mix=EMA_MIX) if EMA else None,
             seq_warmup=f'{WARMUP_LEN}:{WARMUP_UNTIL}', cooldown=COOLDOWN, lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE,
             lr_value_embeds=LR_VE, lr_lambdas=LR_LAMBDAS, anvil_lr=ANVIL_LR, anvil_wd=ANVIL_WD), indent=2) + '\n')
         log = (args.output / 'metrics.jsonl').open('w')
+    first = round(EMA_FROM * STEPS)  # the update at which the tail average starts
     start = time.perf_counter()
     for step in range(total):
         length = WARMUP_LEN if step < WARMUP_UNTIL else SEQ
-        graphs[length].replay()
+        graphs[length, EMA and step > first, SKIP and step >= round(SKIP_FROM * STEPS)].replay()
+        if EMA and step == first:  # the average starts at the weights after this update
+            torch._foreach_copy_(model.ema, [w.float() for w in model.averaged()])
+    if EMA and total > first:  # the final weights: w + EMA_MIX (EMA - w), inside the timer
+        with torch.no_grad():
+            for w, e in zip(model.averaged(), model.ema):
+                w.copy_(torch.lerp(w.float(), e, EMA_MIX).to(w.dtype))
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     if rank == 0:

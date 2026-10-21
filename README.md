@@ -98,6 +98,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 12 | 4.162 | Data-free structured start: block 1's heads as lag-1 RoPE heads | 13.1 s | [Script](https://github.com/erodola/noise/blob/288227ef36b59ccc331e276d1a220f2191c6068a/train/speedrun/jax/train.py) | [@erodola](https://github.com/erodola) |
 | 13 | 4.144 | Moment kernels for the exact experiments, one head per GPU | 6.4 s | [Script](https://github.com/qlabs-eng/noise/blob/89db4bac4f6236295bc6ff7d305c0c12a486421e/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 | 14 | 4.168 | 8 rows per update | 5.7 s | [Script](https://github.com/qlabs-eng/noise/blob/5e63caa83792f4da3b39222af654b76ab7fbcf13/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
+| 15 | 4.172 | Structured start, tail average and late skip | 4.9 s | [Script](https://github.com/qlabs-eng/noise/blob/0a762caa1d4c8989545f69d1cc73176d5e23439c/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 
 ## What backprop gets
 
