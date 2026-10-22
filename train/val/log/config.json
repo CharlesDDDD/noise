@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/t1prs/base/train/val/run.py",
+  "script": "/home/ubuntu/t1prs/combo/train/val/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -57,7 +57,15 @@
     "future_sigma": 0.01,
     "query_keys": 256,
     "key_sigma": 0.003,
-    "key_chunk": 32
+    "key_chunk": 32,
+    "fhvq": true,
+    "vq_codes": 4,
+    "vq_sigma": 0.1,
+    "vq_chunk": 32,
+    "hop_receivers": 16,
+    "hop_tokens": 16,
+    "hop_route_k": 128,
+    "hop_query_keys": 64
   },
   "steps": 732,
   "epoch_updates": 732,
@@ -67,7 +75,8 @@
     "linear_path_scalars",
     "input_key_probes",
     "input_gate_probes",
-    "independent_future_hidden_query_embedding_probes"
+    "independent_future_hidden_query_embedding_probes",
+    "first_hop_vq_remainder"
   ],
   "resume": null,
   "torch_version": "2.10.0+cu128"

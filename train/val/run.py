@@ -1,13 +1,20 @@
-"""Boost -> Cut with independent input-K/gate and future-token probes.
+"""Boost -> Cut with independent input-K/gate and future-token probes, and PR #35's first hop.
 
 The own-query and value-path measurements of PR #23 remain the starting point.
 Input-K/gate probes supply additional input credit to linear consumers. Separate
 single-source hidden/Q/embedding probes are scored at later, original measured
 attention hubs. Corrected credits never become another probe's scoring target.
 
+PR #35's first hop and live VQ remainder measure blocks 0-2's mid streams and
+blocks 1-3's input streams again, against the loss, through the other tokens'
+keys, values and gates. Their sum replaces those streams' credit for the writers,
+hidden units and attention hubs. Blocks 0-2's input-path credits and future
+hidden/Q probes, already inside it, are dropped; the mixing scalars keep their
+estimate and the embedding keeps its future probes.
+
 This recipe uses 20% Boost (global batch 4), then Cut (global batch 8), consuming
 all 4,880 sequences once. Future probes use 512 central pairs per source token,
-all permitted receivers, and the first four hidden/Q layers plus the embedding.
+all permitted receivers, and block 3's hidden/Q plus the embedding.
 No receiver sampling or active-space direction encoding is used.
 
     uv run torchrun --standalone --nproc_per_node=8 train/val/run.py
@@ -93,6 +100,14 @@ class Settings:
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
+    fhvq: bool = True  # PR #35: blocks 0-2's stream credit by the measured first hop plus a live VQ remainder
+    vq_codes: int = 4  # token codes per site for the VQ remainder
+    vq_sigma: float = 0.1  # VQ move, relative to the stream's RMS (TF32 measurement)
+    vq_chunk: int = 32  # directions per batched rerun
+    hop_receivers: int = 16  # first hop: receivers per source token per later block (by clean attention to it)
+    hop_tokens: int = 16  # first hop: source tokens per batched experiment
+    hop_route_k: int = 128  # first hop: MLP units per receiver per block on the receivers' chains
+    hop_query_keys: int = 64  # first hop: own-query keys per head on the receivers' chains
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
@@ -119,6 +134,8 @@ class Settings:
                 or type(self.future_chunk) is not int or self.future_chunk < 1
                 or not 0 < self.future_sigma < float('inf')):
             raise ValueError('Invalid future source layers, batching limits or finite step')
+        if self.fhvq and (self.estimator != 'cut' or not self.own_query or not self.query_keys):
+            raise ValueError('The first hop requires Cut with own-query strong keys')
         if not isinstance(self.query_keys, int) or self.query_keys < 0:
             raise ValueError('Own-query key count must be a nonnegative integer')
         if type(self.key_path_draws) is not int or not 0 <= self.key_path_draws <= width:
@@ -588,6 +605,72 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
 
 chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
 chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)
+
+
+def own_chain_eager(first, at_input, move, scale, mids, xL, idx, hs, lam_r, w_fc, w_out_t, weight_t, base, target_logit_w,
+                    y, own):
+    """chain_chunk_eager for a stream move at block `first` (at_input: its input stream, so its own query there moves
+    too; else its mid stream), along own-query routes, that also returns the change of the block input stream at
+    every later block it enters ({b: (m, P, W)}), where the token's keys and values would move: the first hops."""
+    L = len(mids)
+    delta, inputs_moved = move, {}
+    _, pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
+    for b in range(first, L):
+        if b > first:
+            delta = lam_r[b] * delta
+        if b > first or at_input:
+            inputs_moved[b] = delta
+            delta = delta + query_change_routed(inputs[b], delta, pos, w_q[b], top_keys[b], top_values[b], top_p[b],
+                                                rest[b], w_proj_t[b], cos_sin[0], cos_sin[1])
+        dz = norm_difference(mids[b], delta)
+        dh = torch.bmm(dz.to(torch.bfloat16), w_fc[b][idx[b]].transpose(1, 2)).float()
+        h = hs[b].unsqueeze(1)
+        up, down = F.relu(h + dh), F.relu(h)
+        delta = delta + torch.bmm(((up - down) * (up + down)).to(torch.bfloat16), w_out_t[b][idx[b]]).float()
+    sq = xL.square().sum(-1, keepdim=True)
+    dots = torch.einsum('md,mpd->mp', xL, delta)
+    inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / xL.shape[-1] + EPS)
+    z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
+    zy = (base.gather(1, y.clamp(min=0).unsqueeze(1)) + (delta * target_logit_w.unsqueeze(1)).sum(-1)) * inv
+    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
+    inv0 = torch.rsqrt(sq / xL.shape[-1] + EPS)
+    clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
+        base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
+    return (moved - clean) / scale * (y >= 0).unsqueeze(1), inputs_moved
+
+
+def hop_change(dxin, xin, q, k_raw, kp, values, ve, z, A_ts, o_t, w_k, w_v, w_g, w_proj_t, cos_s, sin_s):
+    """The first hop, evaluated exactly: source tokens' block-input streams move by dxin (m, P, W); their keys, values
+    and value-embedding gate move with them, and each receiver's attention output changes in one term. Per source
+    (m) and receiver (k): q (m, k, h, d) the receivers' rotated-normed queries; k_raw, kp, values, ve (m, h, d) the
+    sources' raw and rotated-normed keys, gated values and value embeddings (ve None without them); z (m, h) the gate
+    logits; A_ts (m, k, h) the receivers' clean attention to the source; o_t (m, k, h, d) their clean outputs.
+    Returns the receivers' mid-stream moves (m, k, P, W): their output change through c_proj."""
+    m, P, W = dxin.shape
+    heads, d = k_raw.shape[1], k_raw.shape[2]
+    dn = norm_difference(xin, dxin)                                            # (m, P, W)
+    rot = lambda u: torch.cat([u[..., :d // 2] * cos_s + u[..., d // 2:] * sin_s,
+                               u[..., :d // 2] * -sin_s + u[..., d // 2:] * cos_s], -1)
+    r0 = rot(k_raw.unsqueeze(1))                                                # (m, 1, h, d)
+    dr = rot((dn @ w_k.T).view(m, P, heads, d))
+    sq = r0.square().sum(-1, keepdim=True)
+    inv0 = torch.rsqrt(sq / d + EPS)
+    inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / d + EPS)
+    dk = dr * inv + r0 * (inv - inv0)                                           # (m, P, h, d) change of kp
+    dv = (dn @ w_v.T).view(m, P, heads, d)
+    if ve is not None:
+        dz = dn[..., :w_g.shape[1]] @ w_g.T                                     # (m, P, h)
+        dgate = 2 * torch.sigmoid(z.unsqueeze(1) + dz) - 2 * torch.sigmoid(z.unsqueeze(1))
+        dv = dv + dgate.unsqueeze(-1) * ve.unsqueeze(1)
+    dl = torch.einsum('mkhd,mphd->mkph', q, dk) * d ** -0.5                     # (m, k, P, h)
+    a = A_ts.unsqueeze(2)                                                       # (m, k, 1, h)
+    growth = torch.expm1(dl)
+    Z = 1 + a * growth
+    v_s = values.unsqueeze(1).unsqueeze(1)                                      # (m, 1, 1, h, d)
+    # o' = (o - a v_s) / Z + a e^{dl} / Z (v_s + dv) ; written as a difference from o
+    do = ((-a * growth / Z).unsqueeze(-1) * (o_t.unsqueeze(2) - v_s)
+          + (a * (1 + growth) / Z).unsqueeze(-1) * dv.unsqueeze(1))             # (m, k, P, h, d)
+    return do.flatten(-2) @ w_proj_t
 KEY_BUCKET = 256
 
 
@@ -662,6 +745,41 @@ def key_input_prepared_derivatives(x, steps, rows, projected_x, projected_rows, 
 @torch.compile(dynamic=False)
 def decode_key_pairs(scores, steps, rows):
     return decode_local_response(scores.sum(0).T, steps, rows) / len(rows)
+
+
+def attn_output(model, i, h, idx, h_kv=None):
+    """Block i's attention output after c_proj from its normed input h (the VQ remainder's live reruns); keys, values
+    and the gate may read another copy (h_kv)."""
+    attn = model.transformer.h[i].attn
+    B, T, _ = h.shape
+    h_kv = h if h_kv is None else h_kv
+    view = lambda z: z.view(B, T, attn.n_head, attn.head_dim)
+    q, k, v = view(attn.c_q(h)), view(attn.c_k(h_kv)), view(attn.c_v(h_kv))
+    if str(i) in model.value_embeds:
+        ve = view(model.value_embeds[str(i)](idx))
+        v = v + (2 * torch.sigmoid(attn.ve_gate(h_kv[..., :attn.ve_gate_channels]))).unsqueeze(-1) * ve
+    cos, sin = model.cos[:, :T], model.sin[:, :T]
+    q, k = norm(apply_rotary_emb(q, cos, sin)), norm(apply_rotary_emb(k, cos, sin))
+    k, v = k.to(q.dtype), v.to(q.dtype)  # one dtype for the attention under autocast
+    return attn.c_proj(attention(q, k, v, model.window_sizes[i][0]).contiguous().view(B, T, -1))
+
+
+def rest_losses(model, kind, i, stream, x0, idx, y):
+    """Each batch element's summed loss with the network run forward, every attention live, from a stream site:
+    kind 'mid' (block i's mid stream) or 'in' (block i's input stream). stream (P, T, W); x0 (1, T, W)."""
+    P = stream.shape[0]
+    idx = idx.expand(P, -1)
+    x = stream
+    if kind == 'in':
+        x = x + attn_output(model, i, norm(x), idx)
+    x = x + model.transformer.h[i].mlp(norm(x))
+    for b in range(i + 1, model.config.n_layer):
+        x = model.resid_lambdas[b] * x + model.x0_lambdas[b] * x0
+        x = x + attn_output(model, b, norm(x), idx)
+        x = x + model.transformer.h[b].mlp(norm(x))
+    logits = 15 * torch.tanh(model.lm_head(norm(x))[..., :model.config.vocab_size].float() / 15)
+    return F.cross_entropy(logits.flatten(0, 1), y.expand(P, -1).flatten(), ignore_index=-1,
+                           reduction='none').view(P, -1).sum(1).double()
 
 
 class Capture:
@@ -1410,6 +1528,138 @@ class Cut(Boost):
         return ('window', pos[t0:t1], rels, [z[t0:t1] for z in inputs],
                 w_q, ks, vs, w_proj_t, cos, sin, windows)
 
+    def first_hop_credits(self, sites, e, x0, mids, outs, routes, y):
+        """PR #35's measured first-hop credit at stream sites (('mid', i): block i's mid stream; ('in', i): block i's
+        input stream). Each source token's experiment along every direction of a full cycle is its own chain (own-query
+        routes, attention otherwise held) plus, at every later block it enters, the chains of its top receivers there
+        (the tokens attending to it most), each moved by the change of its attention output when the source's key,
+        value and gate move with the source's own stream (hop_change, exact). Every term is a forward difference of a
+        token's loss: the credit is measured against the loss, with no step taken. Returns {site: (n, W)}."""
+        model, s, d = self.model, self.s, self.capture
+        if d.batch != 1:
+            raise ValueError('The first hop measures one sequence per GPU')
+        L, heads = model.config.n_layer, model.config.n_head
+        hd = self.width // heads
+        T = d.length
+        vocab = model.config.vocab_size
+        weight = model.lm_head.weight.float()[:vocab]
+        weight_t = weight.T.to(torch.bfloat16).contiguous()
+        w_fc = [blk.mlp.c_fc.weight.bfloat16() for blk in model.transformer.h]
+        w_out_t = [blk.mlp.c_proj.weight.bfloat16().T.contiguous() for blk in model.transformer.h]
+        lam_r, lam_0 = model.resid_lambdas.float(), model.x0_lambdas.float()
+        xL = outs[-1]
+        base = xL @ weight.T
+        target_w = weight[y.clamp(min=0)]
+        own = self.strong_keys(self.own_query_inputs(0), s.query_keys)
+        cos, sin = model.cos[0, :T, 0].float(), model.sin[0, :T, 0].float()
+        rows = lambda r, o=own: ('routed', o[1][r], [z_[r] for z_ in o[2]], o[3]) + tuple(
+            [z_[r] for z_ in part] for part in o[4:8]) + o[8:]
+        # the receivers' lighter chains: fewer MLP routes (the top of the same sorted routes) and fewer strong keys
+        # (the held keys' share widened to keep the clean output exact)
+        own_r, routes_r = own, routes
+        if s.hop_query_keys and s.hop_query_keys < s.query_keys:
+            K = s.hop_query_keys
+            rest_r = [rest + torch.einsum('thk,thkd->thd', p_[..., K:], v_[..., K:, :].float())
+                      for rest, p_, v_ in zip(own[7], own[6], own[5])]
+            own_r = own[:4] + ([z_[:, :, :K] for z_ in own[4]], [z_[:, :, :K] for z_ in own[5]],
+                               [z_[..., :K] for z_ in own[6]], rest_r) + own[8:]
+        if s.hop_route_k and s.hop_route_k < s.route_k:
+            routes_r = [(q_[0][:, :s.hop_route_k], q_[1][:, :s.hop_route_k]) for q_ in routes]
+        per = lambda r: dict(mids=[z_[r] for z_ in mids], xL=xL[r], idx=[q_[0][r] for q_ in routes],
+                             hs=[q_[1][r] for q_ in routes], base=base[r], target_logit_w=target_w[r], y=y[r])
+        # the later blocks' clean attention pieces
+        blocks = {}
+        first_block = min(i if kind == 'in' else i + 1 for kind, i in sites)
+        for b in range(first_block, L):
+            attn = model.transformer.h[b].attn
+            p = f'transformer.h.{b}.attn.'
+            xin = d.blocks[b].float()[0]
+            k_raw = d.outputs[p + 'c_k'].float().view(T, heads, hd)
+            rot = lambda u: torch.cat([u[..., :hd // 2] * cos[:, None] + u[..., hd // 2:] * sin[:, None],
+                                       u[..., :hd // 2] * -sin[:, None] + u[..., hd // 2:] * cos[:, None]], -1)
+            q = norm(rot(d.outputs[p + 'c_q'].float().view(T, heads, hd)))
+            kp = norm(rot(k_raw))
+            values = d.outputs[p + 'c_v'].float().view(T, heads, hd)
+            ve = z = None
+            if attn.ve_gate is not None:
+                z = d.outputs[p + 've_gate'].float()[0]
+                ve = d.outputs[f'value_embeds.{b}'].float().view(T, heads, hd)
+                values = values + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve
+            A = self.attention_maps(b)[0].float()                                   # (h, query, key)
+            o = torch.einsum('hts,shd->thd', A, values)
+            blocks[b] = dict(xin=xin, q=q, k_raw=k_raw, kp=kp, values=values, ve=ve, z=z, A=A, o=o,
+                             score=A.sum(0), w_k=attn.c_k.weight.float(), w_v=attn.c_v.weight.float(),
+                             w_g=None if attn.ve_gate is None else attn.ve_gate.weight.float(),
+                             w_proj_t=attn.c_proj.weight.float().T.contiguous())
+        k_recv, m = s.hop_receivers, s.hop_tokens
+        credits = {}
+        for kind, i in sites:
+            stream = mids[i] if kind == 'mid' else d.blocks[i].float().flatten(0, 1)
+            H = self.basis()
+            steps = s.chain_sigma * stream.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+            credit = torch.empty(T, self.width, device=self.device)
+            for t0 in range(0, T, m):
+                src = torch.arange(t0, min(t0 + m, T), device=self.device)
+                move = steps[src].unsqueeze(-1) * H.unsqueeze(0)
+                scale = steps[src].expand(-1, self.width)
+                total, moved = own_chain_eager(i, kind == 'in', move, scale, lam_r=lam_r, w_fc=w_fc, w_out_t=w_out_t,
+                                               weight_t=weight_t, own=rows(src), **per(src))
+                for b, dxin in moved.items():
+                    B = blocks[b]
+                    recv = B['score'][:, src].topk(k_recv, dim=0).indices.T              # (m, k) receivers
+                    hops = hop_change(dxin, B['xin'][src], B['q'][recv], B['k_raw'][src], B['kp'][src],
+                                      B['values'][src], None if B['ve'] is None else B['ve'][src],
+                                      None if B['z'] is None else B['z'][src],
+                                      B['A'][:, recv, src[:, None]].permute(1, 2, 0), B['o'][recv],
+                                      B['w_k'], B['w_v'], B['w_g'], B['w_proj_t'], cos[src][:, None, None, :],
+                                      sin[src][:, None, None, :])                       # (m, k, P, W)
+                    flat = recv.flatten()
+                    hop_moves = hops.flatten(0, 1)
+                    derivative = chain_chunk(b, hop_moves, scale.repeat_interleave(k_recv, 0), e[flat], x0[flat],
+                                             [z_[flat] for z_ in mids], xL[flat], [q_[0][flat] for q_ in routes_r],
+                                             [q_[1][flat] for q_ in routes_r], lam_r, lam_0, w_fc, w_out_t, weight_t,
+                                             base[flat], target_w[flat], y[flat], rows(flat, own_r))
+                    total = total + derivative.view(len(src), k_recv, -1).sum(1)
+                credit[src] = total @ H / self.width
+            credits[kind, i] = credit
+        return credits
+
+    def vq_remainder(self, sites, cv, codes, mids, x0):
+        """PR #35's credit at each stream site beyond cv, measured with every attention live and compressed over
+        tokens: for each code B[:, j] and every direction d of a sign-flipped Hadamard cycle, all tokens' streams move
+        by s B[t, j] d (s = vq_sigma times the stream's RMS) and the sequence's summed loss is rerun both ways (float32
+        storage, TF32 products); S_j = sum_d diff_d d / W measures B^T R, and the remainder's projection is
+        r = B (B^T B)^-1 (S - B^T cv). codes {site: (T, C)} pick the token combinations (the constant plus the top
+        principal directions of the later blocks' measured key credit). Returns {site: cv + r}."""
+        model, d, s = self.model, self.capture, self.s
+        idx, y = d.x, d.y
+        W = self.width
+        out = {}
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            for site in sites:
+                kind, i = site
+                stream = (mids[i] if kind == 'mid' else d.blocks[i].float()[0]).unsqueeze(0)
+                U = torch.linalg.svd(codes[site], full_matrices=False)[0][:, :s.vq_codes - 1]
+                B = torch.cat([torch.ones(len(U), 1, device=U.device), U], 1)
+                B = B / B.abs().amax(0, keepdim=True)
+                H = self.basis()
+                step = s.vq_sigma * stream.square().mean().sqrt()
+                S = torch.zeros(B.shape[1], W, device=self.device, dtype=torch.float64)
+                for j in range(B.shape[1]):
+                    for r0 in range(0, W, s.vq_chunk):
+                        dirs = H[r0:r0 + s.vq_chunk]
+                        move = step * B[:, j][None, :, None] * dirs[:, None, :]
+                        with torch.autocast('cuda', enabled=False):
+                            up = rest_losses(model, kind, i, stream + move, x0, idx, y)
+                            down = rest_losses(model, kind, i, stream - move, x0, idx, y)
+                        S[j] += ((up - down) / (2 * step)) @ dirs.double() / W
+                out[site] = cv[site] + B @ torch.linalg.solve(B.T @ B, S.float() - B.T @ cv[site])
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+        return out
+
     def select_mlp_routes(self, layer, mid, hpre, activation):
         """Select the fixed replay units; experiments may override only this ranking."""
         weight = self.model.transformer.h[layer].mlp.c_proj.weight.float()
@@ -1443,19 +1693,40 @@ class Cut(Boost):
         g_top = self.probe(outs[-1], yf)  # the top stream's credit, through the head alone
         chain = self.chain_credits(e, x0, mids, outs, routes, yf)
         lam_r = model.resid_lambdas.float()
+        measured_out = {}
+        if s.fhvq:  # PR #35: blocks 0-2's stream credit, the measured first hop plus the live VQ remainder
+            sites = [('mid', 0), ('mid', 1), ('mid', 2), ('in', 1), ('in', 2), ('in', 3)]
+            first_hop = self.first_hop_credits(sites, e, x0, mids, outs, routes, yf)
+            # the codes: the later blocks' key credit, by the single-key experiments from the measured hub targets
+            keys = self.exact_key_errors({i: (chain[i] @ model.transformer.h[i].attn.c_proj.weight.float())
+                                          .view(b, t, self.width) for i in range(1, L)}, layers=range(1, L))
+            keys = {i: keys[f'transformer.h.{i}.attn.c_k'][0] for i in range(1, L)}
+            codes = {site: torch.cat([keys[j] for j in range(site[1] if site[0] == 'in' else site[1] + 1, L)], 1)
+                     for site in sites}
+            credit = self.vq_remainder(sites, first_hop, codes, mids, x0.view(1, t, self.width))
+            del first_hop, keys, codes
+            for i in range(3):
+                chain[i] = credit['mid', i]
+                measured_out[i] = lam_r[i + 1] * credit['in', i + 1]
         targets = {i: (chain[i] @ block.attn.c_proj.weight.float()).view(b, t, self.width)
                    for i, block in enumerate(model.transformer.h)}
         # Reuse only directly measured hub credit, scoped to this capture.
         # Corrected targets still take a separate A.T @ target in exact_values.
         raw_values = {i: self.value_credit(i, target) for i, target in targets.items()}
         extra, inputs = self.path_credits(chain, targets, raw_values) if s.value_path or s.key_path_draws or s.gate_path else (None, None)
+        path_scalars = self.path_scalar_credit(inputs, extra, x0, outs) if s.path_scalars and extra is not None else None
+        if extra is not None:
+            for i in measured_out:  # the measured credit already holds these blocks' input paths
+                extra[i] = torch.zeros_like(extra[i])
         value_targets = {}
         scalars = torch.zeros(2, L, device=self.device)
         for i in range(L):
             p = f'transformer.h.{i}.'
             block = model.transformer.h[i]
             d_mid = chain[i]
-            if i == L - 1:
+            if i in measured_out:
+                d_out = measured_out[i]
+            elif i == L - 1:
                 d_out = g_top
             else:
                 d_out = lam_r[i + 1] * chain[i + 1]
@@ -1469,8 +1740,8 @@ class Cut(Boost):
             gradients[p + 'mlp.c_fc.weight'] = hidden.T @ d.inputs[p + 'mlp.c_fc'].flatten(0, 1)
             # the internals' local step through the attention module, scored as c_proj sees the mid-stream credit
             scalars[:, i] = chain['lam', i]
-        if s.path_scalars and extra is not None:
-            scalars += self.path_scalar_credit(inputs, extra, x0, outs)
+        if path_scalars is not None:
+            scalars += path_scalars
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         self.internals(gradients, targets, b, t, value_targets or None, self._input_key_errors, raw_values)
         self._input_key_errors = None
@@ -1737,9 +2008,10 @@ def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities
 
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
-                 query_mlp=True, timing=True):
+                 query_mlp=True, timing=True, first_layer=0):
         self.e = estimator
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
+        self.first_layer = first_layer
         self.sigma, self.seed = sigma, seed
         self.query_mlp = query_mlp
         self.timing = timing
@@ -1790,7 +2062,7 @@ class FiniteFuture:
             if family == "wte":
                 yield family, -1, "transformer.wte"
             else:
-                for layer in range(self.source_layers):
+                for layer in range(self.first_layer, self.source_layers):
                     suffix = "mlp.c_fc" if family == "hidden" else "attn.c_q"
                     yield family, layer, f"transformer.h.{layer}.{suffix}"
 
@@ -1903,7 +2175,7 @@ def add_future_gradients(estimator, gradients):
     seed = int(torch.randint(2**31, (), device=e.device, generator=d.generator).item())
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
-                          query_mlp=True, timing=False)
+                          query_mlp=True, timing=False, first_layer=3 if s.fhvq else 0)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
         future.prepare(sequence)
@@ -2269,7 +2541,8 @@ def train_stages(args, settings, device, rank, world):
             epoch_updates=len(schedule), train_rows=len(training),
             upstream='qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259',
             additions=['linear_path_scalars', 'input_key_probes', 'input_gate_probes',
-                       'independent_future_hidden_query_embedding_probes'],
+                       'independent_future_hidden_query_embedding_probes']
+                      + (['first_hop_vq_remainder'] if settings.fhvq else []),
             resume=str(args.resume.resolve()) if args.resume else None, torch_version=torch.__version__,
         ), indent=2)+'\n')
 
@@ -2376,12 +2649,16 @@ def main():
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--stop-after-step', type=int)
     parser.add_argument('--steps', type=int, help='Diagnostic prefix; preserves the full-epoch LR schedule.')
+    parser.add_argument('--fhvq', action=argparse.BooleanOptionalAction, default=True, help='PR #35: blocks 0-2\'s '
+                        'stream credit by the measured first hop plus a live VQ remainder (else #31\'s Cut).')
     # Execution chunks only: the default command reproduces the logged algorithm and budgets.
     parser.add_argument('--chain-tokens', type=int, default=256)
     parser.add_argument('--key-chunk', type=int, default=32)
     parser.add_argument('--key-path-tokens', type=int, default=32)
     parser.add_argument('--future-tokens', type=int, default=64)
     parser.add_argument('--future-chunk', type=int, default=512)
+    parser.add_argument('--hop-tokens', type=int, default=16)
+    parser.add_argument('--vq-chunk', type=int, default=32)
     args = parser.parse_args()
     for key in ('steps', 'stop_after_step'):
         if getattr(args, key) is not None and getattr(args, key) < 1:
@@ -2390,7 +2667,8 @@ def main():
         parser.error('Logging intervals must be nonnegative')
     settings = Settings(chain_tokens=args.chain_tokens, key_chunk=args.key_chunk,
                         key_path_tokens=args.key_path_tokens, future_tokens=args.future_tokens,
-                        future_chunk=args.future_chunk)
+                        future_chunk=args.future_chunk, fhvq=args.fhvq, hop_tokens=args.hop_tokens,
+                        vq_chunk=args.vq_chunk)
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
     device = torch.device('cuda', torch.cuda.current_device())
