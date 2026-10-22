@@ -106,6 +106,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 18 | 4.183 | Collectives overlapped with compute, forward compiled as one graph | 3.1 s | [Script](https://github.com/qlabs-eng/noise/blob/4f5c68badf7a399092f17ce528c353ffc6a53f55/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 | 19 | 4.184 | 400 updates with retuned rates and shorter early rows | 2.7 s | [Script](https://github.com/qlabs-eng/noise/blob/b53e91485211c8ca06f34b032dee1c0752c29442/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
 | 20 | 4.184 | Faster credit kernels, bf16 weight gradients | 2.5 s | [Script](https://github.com/qlabs-eng/noise/blob/4f1c9eea5406559b612c218762d4c24f1ccc8531/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
+| 21 | 4.185 | Credit kernels in fewer launches, compiled glue, overlapped all-to-alls | 1.7 s | [Script](https://github.com/qlabs-eng/noise/blob/f2ef5d57b2c1df045fbc14c0559cc1d32f4dce02/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 
 ## What backprop gets
 
