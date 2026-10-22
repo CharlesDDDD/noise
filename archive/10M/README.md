@@ -1,4 +1,5 @@
 # Noise at 10M tokens (archived)
+![Noise baselines at 10M tokens](val_loss_animation.gif)
 
 Until October 22, 2026, Noise trained on the Dust paper's 10M-token FineWeb training set (`train_10M.pt` of the
 [Dust repo](https://github.com/qlabs-eng/dust): 4,880 sequences of 2,048 predictions), and track 2 was a speedrun to
@@ -8,10 +9,10 @@ records.
 This folder keeps the last record of each track with its log, the EGGROLL baseline, and the data code of that time:
 
 ```bash
-uv run 10m/utils/prepare_data.py --output 10m/data
-uv run torchrun --standalone --nproc_per_node=8 10m/train/val/run.py --data-dir 10m/data         # track 1
-uv run torchrun --standalone --nproc_per_node=8 10m/train/speedrun/run.py --data-dir 10m/data    # track 2
-uv run torchrun --standalone --nproc_per_node=8 10m/train/val/eggroll.py --data-dir 10m/data
+uv run archive/10M/utils/prepare_data.py --output archive/10M/data
+uv run torchrun --standalone --nproc_per_node=8 archive/10M/train/val/run.py --data-dir archive/10M/data         # track 1
+uv run torchrun --standalone --nproc_per_node=8 archive/10M/train/speedrun/run.py --data-dir archive/10M/data    # track 2
+uv run torchrun --standalone --nproc_per_node=8 archive/10M/train/val/eggroll.py --data-dir archive/10M/data
 ```
 
 Every other record's script is linked from its row.

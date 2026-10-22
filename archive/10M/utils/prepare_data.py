@@ -28,7 +28,7 @@ EXPECTED = {
     'train.pt': '36ccb57eba6f5474b18acf99edd4a4793187260f7da7cc7053322cce59154bde',
     'val.pt': '5fdb9242ce8ab83e519ab5dd5cf8d64f4d8a99f6e74c137f4ca0f723da5f7437',
 }
-TOKENIZER = Path(__file__).resolve().parents[2] / 'tokenizer' / 'tokenizer.json'  # the repository's
+TOKENIZER = Path(__file__).resolve().parents[3] / 'tokenizer' / 'tokenizer.json'  # the repository's
 TOKENIZER_SHA256 = 'a15168ae52f4a1b1c80b270a5e18a2ce3e038b5e3772a1ad3982044602da0ae7'
 
 

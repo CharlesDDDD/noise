@@ -14,11 +14,11 @@ for them instead of for backprop gradients.
 The model, the data and the score are fixed: the 37.7M-parameter transformer of Dust, a 30M-token FineWeb
 training set, and the cross-entropy on Dust's validation set. What changes is the learning algorithm, which may
 only run the model forward; track 3 also frees the architecture. Until October 22, 2026, the training set was
-Dust's 10M tokens; those tracks and records are archived in [`10m/`](10m/README.md).
+Dust's 10M tokens; those tracks and records are archived in [`archive/10M/`](archive/10M/README.md).
 
 ## Tracks
 
-The 10M-token tracks are archived in [`10m/`](10m/README.md) and no longer accept submissions.
+The 10M-token tracks are archived in [`archive/10M/`](archive/10M/README.md) and no longer accept submissions.
 
 1. **Validation loss.** The lowest validation loss after one epoch on one 8xH100 node, with no time limit.
 2. **Speedrun.** The shortest training time on one 8xH100 node to reach validation loss **3.5**.
