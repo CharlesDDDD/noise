@@ -105,7 +105,7 @@ The same model, data and epoch trained with backprop, scored the same way (seed 
 | Optimizer | Val loss |
 | - | - |
 | Adam w/ lr cooldown | 3.419 |
-| ANVIL II on the block matrices and Adam elsewhere, 10M record #11's recipe | 3.340 |
+| ANVIL II on the block matrices and Adam elsewhere | 3.340 |
 
 The goal is to beat backprop by a large margin.
 
