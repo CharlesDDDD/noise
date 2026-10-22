@@ -18,6 +18,8 @@ Dust's 10M tokens; those tracks and records are archived in [`10m/`](10m/README.
 
 ## Tracks
 
+The 10M-token tracks are archived in [`10m/`](10m/README.md) and no longer accept submissions.
+
 1. **Validation loss.** The lowest validation loss after one epoch on one 8xH100 node, with no time limit.
 2. **Speedrun.** The shortest training time on one 8xH100 node to reach validation loss **3.5**.
 3. **Open architecture.** Track 1 with the architecture free: the model is
@@ -36,7 +38,7 @@ Dust's 10M tokens; those tracks and records are archived in [`10m/`](10m/README.
   track 3 the model is [`train/arch/model.py`](train/arch/model.py) instead, a copy of `utils/model.py` that
   entries change in place; it must keep the interface `utils/eval.py` uses (`GPT(GPTConfig())`, `init_weights()`
   and the summed loss from `forward`).
-- **Fixed data.** Train only on `data/train.pt` (14,648 sequences of 2,048 predictions), for at most one
+- **Fixed data.** Train only on `data/train.pt` (30M tokens: 14,648 sequences of 2,048 predictions), for at most one
   epoch: each training sequence feeds at most one update. Batch size and order are free.
 - **Score.** [`utils/eval.py`](utils/eval.py) on the final weights (on track 3 with `--model
   train/arch/model.py`): mean next-token cross-entropy over the 1,114,112 predictions of `data/val.pt`. No
@@ -74,27 +76,27 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 
 ## Records
 
-### Track 1: validation loss
+### Track 1: validation loss (30M)
 
 | # | Val loss | Description | Time | Script | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](train/val/dust.py) | - |
-| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/dust.py) | - |
+| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
 
-### Track 2: speedrun to 3.5
-
-| # | Val loss | Description | Time | Script | Contributors |
-| - | - | - | - | - | - |
-| 1 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/speedrun/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
-
-### Track 3: open architecture
-
-Track 3 starts from track 1's records, which use the fixed model.
+### Track 2: speedrun to 3.5 (30M)
 
 | # | Val loss | Description | Time | Script | Contributors |
 | - | - | - | - | - | - |
-| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](train/val/dust.py) | - |
-| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/arch/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+| 1 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/speedrun/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+
+### Track 3: open architecture (30M)
+
+New track where any architecture is allowed!
+
+| # | Val loss | Description | Time | Script | Contributors |
+| - | - | - | - | - | - |
+| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/dust.py) | - |
+| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/arch/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
 
 ## What backprop gets
 
