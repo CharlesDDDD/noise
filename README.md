@@ -81,6 +81,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 11 | 3.777 | Exact values and a value path in Cut; Cut at batch 4, hidden credit on every unit | 18 min | [Script](https://github.com/qlabs-eng/noise/blob/58d2828bf21ee17cb3b48d085d8e1a465a7b3dc3/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
 | 12 | 3.722 | Future-token probes, input-path key and gate credit | 1 h 22 min | [Script](https://github.com/qlabs-eng/noise/blob/441a5b61254132710877f21740373b2629b873ea/train/val/run.py) | [@NotDesigned](https://github.com/NotDesigned) |
 | 13 | 3.707 | First hop and a live VQ remainder for blocks 0-2's streams | 12 h 34 min | [Script](https://github.com/qlabs-eng/noise/blob/9a2ec4c4376c6cbed0054bf87d3031296d40b904/train/val/run.py) | [@hoo0681](https://github.com/hoo0681) |
+| 14 | 3.676 | #12 at batch 4 on two GPUs per sequence, #11's recipe; an end merge of weight averages scored on 32 held-out training sequences | 35 min | [Script](https://github.com/qlabs-eng/noise/blob/4ef285e571ae58de204dc0b343420c77f51634a9/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
 
 ### Track 2: speedrun to 4.2
 
