@@ -11,14 +11,17 @@ weight-space ES, but still trails backprop under Adam. These methods have also h
 research that went into backprop. We made Noise to close the gap: better estimators, and optimizers co-designed
 for them instead of for backprop gradients.
 
-The model, the data and the score are fixed: the 37.7M-parameter transformer of Dust, its 10M-token FineWeb
-training set, and the cross-entropy on its validation set. What changes is the learning algorithm, which may
-only run the model forward. The architecture is fixed for now, but we will relax this constraint later.
+The model, the data and the score are fixed: the 37.7M-parameter transformer of Dust, a 30M-token FineWeb
+training set, and the cross-entropy on Dust's validation set. What changes is the learning algorithm, which may
+only run the model forward; track 3 also frees the architecture. Until October 22, 2026, the training set was
+Dust's 10M tokens; those tracks and records are archived in [`10m/`](10m/README.md).
 
 ## Tracks
 
 1. **Validation loss.** The lowest validation loss after one epoch on one 8xH100 node, with no time limit.
-2. **Speedrun.** The shortest training time on one 8xH100 node to reach validation loss **4.2**.
+2. **Speedrun.** The shortest training time on one 8xH100 node to reach validation loss **3.5**.
+3. **Open architecture.** Track 1 with the architecture free: the model is
+   [`train/arch/model.py`](train/arch/model.py), which entries may change.
 
 ## Rules
 
@@ -28,12 +31,16 @@ only run the model forward. The architecture is fixed for now, but we will relax
   linear maps don't count, and a signal that has taken a step can't take another, so credit can't be chained
   back through the network block by block. Entries are judged by the spirit of this rule: a method should
   still apply to networks with non-differentiable parts.
-- **Fixed model.** Final weights must load into [`utils/model.py`](utils/model.py) with a strict state-dict
-  match. How training computes the same function, and how it initializes it, is free.
-- **Fixed data.** Train only on `data/train.pt` (4,880 sequences of 2,048 predictions), for at most one
+- **Fixed model** (tracks 1 and 2). Final weights must load into [`utils/model.py`](utils/model.py) with a
+  strict state-dict match. How training computes the same function, and how it initializes it, is free. On
+  track 3 the model is [`train/arch/model.py`](train/arch/model.py) instead, a copy of `utils/model.py` that
+  entries change in place; it must keep the interface `utils/eval.py` uses (`GPT(GPTConfig())`, `init_weights()`
+  and the summed loss from `forward`).
+- **Fixed data.** Train only on `data/train.pt` (14,648 sequences of 2,048 predictions), for at most one
   epoch: each training sequence feeds at most one update. Batch size and order are free.
-- **Score.** [`utils/eval.py`](utils/eval.py) on the final weights: mean next-token cross-entropy over the
-  1,114,112 predictions of `data/val.pt`. No checkpoint selection on validation loss.
+- **Score.** [`utils/eval.py`](utils/eval.py) on the final weights (on track 3 with `--model
+  train/arch/model.py`): mean next-token cross-entropy over the 1,114,112 predictions of `data/val.pt`. No
+  checkpoint selection on validation loss.
 - **Timing** (speedrun track; reported on the other). From the start of the first update to the end of the
   last, excluding any validation. An untimed warmup on random tokens may compile kernels, as long as training
   then starts from a fresh state (the baselines rebuild everything from the seed). Runs use seed 0.
@@ -48,15 +55,18 @@ uv run utils/prepare_data.py
 ```
 
 `utils/prepare_data.py` streams FineWeb `sample-10BT`, tokenizes it with the fixed BPE-4096 tokenizer in
-[`tokenizer/`](tokenizer/tokenizer.json), and writes `data/train.pt` and `data/val.pt`, the `train_10M.pt`
-and `val.pt` of the [Dust repo](https://github.com/qlabs-eng/dust). Both are checked against pinned hashes.
+[`tokenizer/`](tokenizer/tokenizer.json), and writes `data/train.pt` and `data/val.pt`. `val.pt` is the
+[Dust repo](https://github.com/qlabs-eng/dust)'s; `train.pt` is Dust's ~20.5M-token training pool followed by the
+documents after its validation and test documents, so its first 4,880 sequences are Dust's `train_10M.pt`. Both
+are checked against pinned hashes.
 
 ## Running the records
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 train/val/run.py         # track 1
 uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py    # track 2
-uv run torchrun --standalone --nproc_per_node=8 train/val/eggroll.py
+uv run torchrun --standalone --nproc_per_node=8 train/arch/run.py        # track 3
+uv run torchrun --standalone --nproc_per_node=8 train/val/dust.py        # Dust w/ Adam
 ```
 
 Each run writes `config.json`, `metrics.jsonl`, `final.pt` and `result.json` (validation loss and training time)
@@ -68,63 +78,40 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 
 | # | Val loss | Description | Time | Script | Contributors |
 | - | - | - | - | - | - |
-| 1 | 5.954 | EGGROLL w/ Adam, 128k antithetic pairs, lr cooldown | 5 h 20 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/val/eggroll.py) | - |
-| 2 | 5.058 | Dust w/ SGD, 16k population | 1 h 19 min | [Script](https://github.com/qlabs-eng/dust/blob/b20f7c03eac630b6441ba6f254128c1761dc45ad/dust.py) | - |
-| 3 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/val/run.py) | - |
-| 4 | 4.088 | Dust w/ ANVIL II on the block matrices and Adam elsewhere| 1 h 47 min | [Script](https://github.com/qlabs-eng/noise/blob/a0c6faab203800fdffd8d21aa9a1076955846c8f/train/val/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
-| 5 | 4.082 | FP32 head in the direct draws reruns | 1 h 49 min | [Script](https://github.com/qlabs-eng/noise/blob/e66fad8c5ededde3efb18782fbdc17df11ed2534/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 6 | 4.035 | Orthogonal draws, coordinate-difference head, live-unit MLP jitter, 2x Adam lr | 1 h 44 min | [Script](https://github.com/qlabs-eng/noise/blob/394a7db72a42fe43e168a2d864343bd55e0fb440/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 7 | 4.008 | Associative credit memory as a prior for the draws | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/cda030253c923eaa55f4645d400cce0a4e8b0025/train/val/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh) |
-| 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [Script](https://github.com/qlabs-eng/noise/blob/e64f3ac70b3c0bb3df3f95e423b1ef5ad208fc4b/train/val/run.py) | [@serdardoesml](https://github.com/serdardoesml) |
-| 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [Script](https://github.com/qlabs-eng/noise/blob/c8834a6ca99173a49b6d4fa557f241f2b1125ab2/train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
-| 10 | 3.896 | Own queries in Cut: each move also reaches its token's later attention through its own query | 10 min | [Script](https://github.com/qlabs-eng/noise/blob/75fbcb5030660f80819e4e6624a8509483294446/train/val/run.py) | [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931) |
-| 11 | 3.777 | Exact values and a value path in Cut; Cut at batch 4, hidden credit on every unit | 18 min | [Script](https://github.com/qlabs-eng/noise/blob/58d2828bf21ee17cb3b48d085d8e1a465a7b3dc3/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
-| 12 | 3.722 | Future-token probes, input-path key and gate credit | 1 h 22 min | [Script](https://github.com/qlabs-eng/noise/blob/441a5b61254132710877f21740373b2629b873ea/train/val/run.py) | [@NotDesigned](https://github.com/NotDesigned) |
-| 13 | 3.707 | First hop and a live VQ remainder for blocks 0-2's streams | 12 h 34 min | [Script](https://github.com/qlabs-eng/noise/blob/9a2ec4c4376c6cbed0054bf87d3031296d40b904/train/val/run.py) | [@hoo0681](https://github.com/hoo0681) |
-| 14 | 3.676 | #12 at batch 4 on two GPUs per sequence, #11's recipe; an end merge of weight averages scored on 32 held-out training sequences | 35 min | [Script](https://github.com/qlabs-eng/noise/blob/4ef285e571ae58de204dc0b343420c77f51634a9/train/val/run.py) | [@CharlesDDDD](https://github.com/CharlesDDDD) |
+| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](train/val/dust.py) | - |
+| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/val/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
 
-### Track 2: speedrun to 4.2
+### Track 2: speedrun to 3.5
 
 | # | Val loss | Description | Time | Script | Contributors |
 | - | - | - | - | - | - |
-| 1 | 4.167 | Dust w/ Adam, 24k population, lr cooldown | 1 h 46 min | [Script](https://github.com/qlabs-eng/noise/blob/00ca1d26ab9484fbb7d4dfcf0b05dc9b7669d521/train/speedrun/run.py) | - |
-| 2 | 4.180 | Track 1 record at 5k population | 22 min | [Script](https://github.com/qlabs-eng/noise/blob/254d02e021e5438e7909e21e8c6e85c71f0be7b0/train/speedrun/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@Lazarus-931](https://github.com/Lazarus-931), [@serdardoesml](https://github.com/serdardoesml) |
-| 3 | 4.184 | Compile the probe construction | 21 min | [Script](https://github.com/qlabs-eng/noise/blob/3ab01f01b79dfc509985c17723a4683de42afa16/train/speedrun/run.py) | [@pculaf](https://github.com/pculaf) |
-| 4 | 4.123 | Boost: stagewise forward-only training with exact readout credit | 5 min | [Script](https://github.com/qlabs-eng/noise/blob/7749eb125f40f634472fb59bb88022e4d8da429d/train/speedrun/run.py) | [@spicylemonade](https://github.com/spicylemonade) |
-| 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [Script](https://github.com/qlabs-eng/noise/blob/cb06760d590b2112de2e876875c9e545f8c9dd10/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
-| 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [Script](https://github.com/qlabs-eng/noise/blob/300034eebc22d88b277e155e75e71bfe5fda68cf/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
-| 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [Script](https://github.com/qlabs-eng/noise/blob/2b592c572f2a103a8990a222cb316d9909577704/train/speedrun/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
-| 8 | 4.174 | Factored finite key and hidden probes | 1 min 2 s | [Script](https://github.com/qlabs-eng/noise/blob/90073fae22811409c1496b8b2339d90c5e311652/train/speedrun/run.py) | [@jon123boss](https://github.com/jon123boss) |
-| 9 | 4.177 | Identity-path credit with fused probe kernels, no MLP cycle | 47 s | [Script](https://github.com/qlabs-eng/noise/blob/c2173461b311e350672862d6e52e2d3e0a9bb48f/train/speedrun/run.py) | [@isaac0804](https://github.com/isaac0804) |
-| 10 | 4.180 | Identity-path credit, token-sharded across GPUs | 15.4 s | [Script](https://github.com/RobertTLange/noise/blob/c04f2ae0bac0666fab79e1f9b08343e56aa40f9d/train/speedrun/jax/train.py) | [@RobertTLange](https://github.com/RobertTLange) |
-| 11 | 4.188 | Drift Leap: stop early, then one leap back along the weights' drift | 14.6 s | [Script](https://github.com/areu01or00/noise/blob/bfefa849cfa4095809e079250768e8ea08b1b1ac/train/speedrun/jax/train.py) | [@areu01or00](https://github.com/areu01or00) |
-| 12 | 4.162 | Data-free structured start: block 1's heads as lag-1 RoPE heads | 13.1 s | [Script](https://github.com/erodola/noise/blob/288227ef36b59ccc331e276d1a220f2191c6068a/train/speedrun/jax/train.py) | [@erodola](https://github.com/erodola) |
-| 13 | 4.144 | Moment kernels for the exact experiments, one head per GPU | 6.4 s | [Script](https://github.com/qlabs-eng/noise/blob/89db4bac4f6236295bc6ff7d305c0c12a486421e/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
-| 14 | 4.168 | 8 rows per update | 5.7 s | [Script](https://github.com/qlabs-eng/noise/blob/5e63caa83792f4da3b39222af654b76ab7fbcf13/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
-| 15 | 4.172 | Structured start, tail average and late skip | 4.9 s | [Script](https://github.com/qlabs-eng/noise/blob/0a762caa1d4c8989545f69d1cc73176d5e23439c/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
-| 16 | 4.177 | Lower ANVIL rate, earlier skip | 4.4 s | [Script](https://github.com/qlabs-eng/noise/blob/823737bd5cc6be1cc42d6931ba6aa38263d667cb/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
-| 17 | 4.182 | Structured start, tail average and late skip at 8 rows per update | 3.6 s | [Script](https://github.com/qlabs-eng/noise/blob/cde84e552507c70b657c080674041b6283f89f3f/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
-| 18 | 4.183 | Collectives overlapped with compute, forward compiled as one graph | 3.1 s | [Script](https://github.com/qlabs-eng/noise/blob/4f5c68badf7a399092f17ce528c353ffc6a53f55/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
-| 19 | 4.184 | 400 updates with retuned rates and shorter early rows | 2.7 s | [Script](https://github.com/qlabs-eng/noise/blob/b53e91485211c8ca06f34b032dee1c0752c29442/train/speedrun/run.py) | [@erodola](https://github.com/erodola) |
-| 20 | 4.184 | Faster credit kernels, bf16 weight gradients | 2.5 s | [Script](https://github.com/qlabs-eng/noise/blob/4f1c9eea5406559b612c218762d4c24f1ccc8531/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
-| 21 | 4.185 | Credit kernels in fewer launches, compiled glue, overlapped all-to-alls | 1.7 s | [Script](https://github.com/qlabs-eng/noise/blob/f2ef5d57b2c1df045fbc14c0559cc1d32f4dce02/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
-| 22 | 4.186 | 16 rows per update in 250 updates, skip from the first update | 1.6 s | [Script](https://github.com/qlabs-eng/noise/blob/40fbdd0befc80210117cf61e82468269f6eac5df/train/speedrun/run.py) | [@areu01or00](https://github.com/areu01or00) |
+| 1 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/speedrun/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+
+### Track 3: open architecture
+
+Track 3 starts from track 1's records, which use the fixed model.
+
+| # | Val loss | Description | Time | Script | Contributors |
+| - | - | - | - | - | - |
+| 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](train/val/dust.py) | - |
+| 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](train/arch/run.py) | [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
 
 ## What backprop gets
 
-The same model, data and epoch trained with backprop, scored the same way:
+The same model, data and epoch trained with backprop, scored the same way (seed 0, a few learning rates each):
 
 | Optimizer | Val loss |
 | - | - |
-| SGD | 5.007 |
-| Adam w/ lr cooldown | 3.769 |
+| Adam w/ lr cooldown | 3.419 |
+| ANVIL II on the block matrices and Adam elsewhere, 10M record #11's recipe | 3.340 |
 
 The goal is to beat backprop by a large margin.
 
 ## Submitting
 
-Open a PR that changes its track's training script in place, [`train/val/run.py`](train/val/run.py) or
-[`train/speedrun/run.py`](train/speedrun/run.py), with the run's log (`config.json`, `metrics.jsonl` and `result.json` from `logs/`) in the `log/` folder next to it. A record must beat the current one
+Open a PR that changes its track's training script in place, [`train/val/run.py`](train/val/run.py),
+[`train/speedrun/run.py`](train/speedrun/run.py) or [`train/arch/run.py`](train/arch/run.py) (with
+[`train/arch/model.py`](train/arch/model.py) on track 3), with the run's log (`config.json`, `metrics.jsonl` and `result.json` from `logs/`) in the `log/` folder next to it. A record must beat the current one
 in its track under the rules above; the training script is the record.
 
 ## Citation

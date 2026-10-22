@@ -21,7 +21,7 @@ This record adds to #31 (nothing here changes what is measured or how):
     loss. About 5,000 forward passes on 32 sequences (~1 min), inside the timed region.
 
 This recipe uses 20% Boost (global batch 4), then Cut (global batch 4), consuming
-4,848 sequences once (the other 32 score the end merge). Future probes use all
+every training sequence but the last 32 once (those score the end merge). Future probes use all
 permitted receivers and the first four hidden/Q layers plus the embedding.
 No receiver sampling or active-space direction encoding is used.
 

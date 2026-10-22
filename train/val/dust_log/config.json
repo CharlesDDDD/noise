@@ -1,0 +1,60 @@
+{
+  "script": "/home/ubuntu/scale/src/train/val/dust_scale.py",
+  "world": 8,
+  "batch": 8,
+  "steps": 1831,
+  "seed": 0,
+  "train_file": "train_100M.pt",
+  "train_rows": 14648,
+  "recipe": {
+    "writers": [
+      384,
+      384,
+      384,
+      384,
+      384,
+      384,
+      384,
+      384
+    ],
+    "hidden": [
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768
+    ],
+    "hubs": [
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768,
+      768
+    ],
+    "embedding": 3072,
+    "head": 73728,
+    "local": {
+      "q": 576,
+      "v": 576,
+      "gate": 192,
+      "k": 2496,
+      "ve": 6912
+    },
+    "nrep": 16,
+    "lr": 0.0015,
+    "betas": [
+      0.7,
+      0.95
+    ],
+    "warmdown": 0.3,
+    "gamma": 0.98,
+    "first_gamma": 0.3
+  },
+  "torch_version": "2.10.0+cu128"
+}

@@ -1,0 +1,7 @@
+{
+  "val_loss": 4.18590973405277,
+  "train_seconds": 1.58,
+  "steps": 250,
+  "tokens": 8192000,
+  "reached_target": true
+}

@@ -1,5 +1,5 @@
 {
-  "script": "/home/chunyuan/noise_pr_wt/train/val/run.py",
+  "script": "/home/ubuntu/t1prs/pr40/train/val/run_scale.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -61,9 +61,9 @@
     "key_sigma": 0.003,
     "key_chunk": 32
   },
-  "steps": 1212,
-  "epoch_updates": 1212,
-  "train_rows": 4848,
+  "steps": 3654,
+  "epoch_updates": 3654,
+  "train_rows": 14616,
   "upstream": "qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259",
   "additions": [
     "linear_path_scalars",
