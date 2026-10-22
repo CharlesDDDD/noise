@@ -1,4 +1,10 @@
-"""Track 2: #39 with a faster update (#38's estimator, constants and 400 updates). #38 = #37 in 400 updates with the
+"""Track 2: #41 at 16 rows per update in 250 updates, with the skip from the first update and both rates 1.4x. Only
+module constants change (BATCH 8 -> 16, STEPS 400 -> 250, SKIP_FROM 0.2 -> 0, LR 0.006 -> 0.0084, ANVIL_LR 0.024 ->
+0.0336); the estimator, the update and the kernels are #41's. Twice the rows make each update ~1.5x dearer (6.3 ms vs
+4.15) but the run needs 250 updates instead of 400; skipping blocks 0, 2, 4 and 6's attention experiments from the
+start saves ~0.3 ms per update. #41's description follows.
+
+Track 2: #39 with a faster update (#38's estimator, constants and 400 updates). #38 = #37 in 400 updates with the
 head and gates at twice #32's Adam rate, ANVIL II at 0.024 and 512-token rows for the first half; #33-#38 are
 @erodola's. The update was developed from #37 alongside #38 / #39 and replaces #39's: like #39 it runs the readout
 cycle's first-order product in TF32, the weight-gradient products on bf16 operands, the hidden credits and the
@@ -94,14 +100,14 @@ from kernels import moment_key_scores, moment_query_scores  # noqa: E402
 F32, BF16 = torch.float32, torch.bfloat16
 
 # recipe (#25 / #29's shape at 8 rows per update (#32): cooldown the last 40%; here 512-token rows until 50%)
-BATCH, SEQ, STEPS, SEED = 8, 2048, 400, 0  # the run length: 400 updates (#38; #37: 450, #32: 600)
+BATCH, SEQ, STEPS, SEED = 16, 2048, 250, 0  # 16 rows x 250 updates (#41: 8 x 400; #37: 450, #32: 600)
 WARMUP_LEN, WARMUP_UNTIL = 512, STEPS // 2  # #32: 1024-token rows until 80%
 COOLDOWN = STEPS * 2 // 5
 VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
-LR, BETA1, BETA2, ADAM_EPS = 0.006, 0.7, 0.98, 1e-8  # the head's and gates' rate: 2x #32's for the shorter run
+LR, BETA1, BETA2, ADAM_EPS = 0.0084, 0.7, 0.98, 1e-8  # the head's and gates' rate: 1.4x #38's at 16 rows
 LR_WTE, LR_VE, LR_LAMBDAS = 0.9, 0.9, 0.003
-ANVIL_LR, ANVIL_WD = 0.024, 2.25  # #32: 0.032 (0.8x #29's: at 8 rows 0.04 spikes on some seeds)
+ANVIL_LR, ANVIL_WD = 0.0336, 2.25  # 1.4x #38's 0.024 at 16 rows (#32: 0.032)
 
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
@@ -117,7 +123,7 @@ SQUARE = ('attn.c_q', 'attn.c_k', 'attn.c_v', 'attn.c_proj')
 START_BLOCK, START_LAG, START_RHO, START_CONTENT = 1, 1, 0.8, 0.25  # every head of block 1 a local RoPE head at lag 1
 EMA_FROM, EMA_HORIZON, EMA_MIX = 0.6, 0.25, 0.4  # tail average from 60% of the run over a quarter of it; final mix
 START, EMA = True, True  # the structured start and the tail average (--init none / --ema none: #32's recipe)
-SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.2, True  # late skip: no attention experiments in these blocks
+SKIP_BLOCKS, SKIP_FROM, SKIP = (0, 2, 4, 6), 0.0, True  # skip from the first update (#34-#41: from 20%)
 
 
 def has_ve(layer):
