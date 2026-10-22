@@ -1,5 +1,5 @@
 # Noise: Speedrun for pretraining without backpropagation
-![Noise baselines](val_loss_animation.gif)
+![Noise baselines](val_loss_animation_30m.gif)
 
 Noise is a pretraining speedrun for learning algorithms that never run a backward pass. We think replacing
 backprop with a much better credit assignment algorithm is inevitable. Deep learning's architectures,
