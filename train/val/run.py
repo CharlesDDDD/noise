@@ -1,13 +1,28 @@
-"""Boost -> Cut with independent input-K/gate and future-token probes.
+"""Boost -> Cut with independent input-K/gate and future-token probes (#31), trained at batch 4 on two GPUs per
+sequence with the backprop baseline's recipe, and merged at the end along its own trajectory.
 
 The own-query and value-path measurements of PR #23 remain the starting point.
 Input-K/gate probes supply additional input credit to linear consumers. Separate
 single-source hidden/Q/embedding probes are scored at later, original measured
 attention hubs. Corrected credits never become another probe's scoring target.
 
-This recipe uses 20% Boost (global batch 4), then Cut (global batch 8), consuming
-all 4,880 sequences once. Future probes use 512 central pairs per source token,
-all permitted receivers, and the first four hidden/Q layers plus the embedding.
+This record adds to #31 (nothing here changes what is measured or how):
+  - Record #11's recipe: Cut at batch 4, each sequence split over two GPUs (each takes half of every cycle of moves
+    and draws; the pair adds its parts, equal to one GPU), 0.7x rates, Adam betas (0.5, 0.98), a warmdown over the
+    last 40% that ends at 30% of each rate (the end merge anneals the rest), and the LM head initialized at std 0.02.
+  - Future probes: 128 central pairs per source token (#31: 512), in larger token chunks.
+  - An end merge along the trajectory. The last 32 training sequences feed no update: they only score the merge. From
+    60% of the epoch, every 5 updates, nine exponential means of the weights are kept (weight 0.5 ... 0.01 on the
+    newest). After the last update, for each part (each block matrix, each table, the scalars) a candidate moves the
+    final weights toward one mean, in full inside the part's 64 top input-covariance directions (for a table, the rows
+    of the 512 most frequent tokens; both from forward passes on the held-out rows) and a fraction 0, 1/2 or 1 outside,
+    times 0.75, 1 or 1.25: 81 candidates and no move. The best single candidate for every part comes first, then two
+    coordinate sweeps over the parts (the second over each part's best 8) keep any change that lowers the held-out
+    loss. About 5,000 forward passes on 32 sequences (~1 min), inside the timed region.
+
+This recipe uses 20% Boost (global batch 4), then Cut (global batch 4), consuming
+4,848 sequences once (the other 32 score the end merge). Future probes use all
+permitted receivers and the first four hidden/Q layers plus the embedding.
 No receiver sampling or active-space direction encoding is used.
 
     uv run torchrun --standalone --nproc_per_node=8 train/val/run.py
@@ -55,12 +70,14 @@ class Settings:
     mlp_output_credit: str = field(default='next_mid', init=False)
     switch: float = 0.2
     boost_batch: int = 4
-    cut_batch: int = 8
+    cut_batch: int = 4
     projection_std: float = 1.5
-    lr: float = 0.003
-    betas: tuple = (0.7, 0.95)
-    warmdown: float = 0.3
-    anvil_lr: float = 0.037
+    lr: float = 0.0021
+    betas: tuple = (0.5, 0.98)
+    warmdown: float = 0.4
+    final: float = 0.3  # the warmdown ends at this fraction of each rate; the end merge anneals the rest
+    head_std: float = 0.02  # the LM head's init std (the fixed init's 0.001)
+    anvil_lr: float = 0.026
     anvil_wd: float = 2.25
     fast_weight: float = 1.0  # ANVIL fast rail
     polar_margin: float = 1.1
@@ -75,19 +92,19 @@ class Settings:
     chunk: int = 2 ** 27
     chain_sigma: float = 0.01
     route_k: int = 512
-    chain_tokens: int = 256
+    chain_tokens: int = 512
     chain_precision: str = 'bf16'
     own_query: bool = True  # PR #19's measured own-query paths in later attention blocks
     value_path: bool = True  # PR #23: one RMSNorm step, then only linear writers/V/VE
     path_scalars: bool = True  # also contract input-path credit into the linear mixing coefficients
     key_path_draws: int = 512  # independent input-K central pairs per token
     key_path_sigma: float = 0.01  # relative input RMS step
-    key_path_tokens: int = 32  # source-token chunk; every allowed query contributes
+    key_path_tokens: int = 64  # source-token chunk; every allowed query contributes
     gate_path: bool = True  # independent full-cycle input probes through the VE gate
     gate_path_sigma: float = 0.01  # relative input RMS step
-    future_draws: int = 512  # independent hidden/Q/WTE probes scored at every later raw hub
+    future_draws: int = 128  # independent hidden/Q/WTE probes scored at every later raw hub
     future_layers: int = 4  # first blocks whose hidden and Q outputs receive this correction
-    future_tokens: int = 64
+    future_tokens: int = 128
     future_chunk: int = 512
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
     query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
@@ -1123,8 +1140,9 @@ class Boost:
 class Cut(Boost):
     """Own-query forward loss probes, optionally augmented by PR #23's value path."""
 
-    def __init__(self, model, settings, seed, rank, world):
-        super().__init__(model, settings, seed, rank, world, split=1, group=None)
+    def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        # split > 1: the GPUs of a sequence each take a share of every cycle of moves and draws
+        super().__init__(model, settings, seed, rank, world, split=split, group=group)
 
     def value_path_credit(self, chain, *, return_inputs=False, raw_values=None):
         """Independent measured mid credits -> V -> one RMSNorm step -> residual identities.
@@ -1162,6 +1180,9 @@ class Cut(Boost):
             indices = torch.randperm(self.width, device=self.device, generator=generator)[:s.key_path_draws]
             signs = torch.randint(0, 2, (self.width,), device=self.device, generator=generator)*2-1
             rows = frame[indices] * signs
+            total_rows = len(rows)
+            r0, r1 = self.share(total_rows)  # this GPU's share of the draws
+            rows = rows[r0:r1]
             estimate = torch.zeros(d.batch, d.length, self.width, device=self.device)
             raw_credit = torch.empty_like(estimate)
             w_key = self.model.transformer.h[i].attn.c_k.weight.float()
@@ -1188,7 +1209,7 @@ class Cut(Boost):
                                                    projected_rows, raw[:, sl], cos[sl], sin[sl])
                         scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
                                                     t0, qs.start, self.model.window_sizes[i][0])
-                        estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows)
+                        estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
                         continue
                     derivatives = torch.empty(len(xin[sl]), len(rows), device=self.device)
                     for j0 in range(0, len(rows), s.key_chunk):
@@ -1197,8 +1218,8 @@ class Cut(Boost):
                             xin[sl], steps[sl], rows[js], projected_x[sl], projected_rows[js],
                             raw[:, sl], cos[sl], sin[sl],
                             qp[:, qs], A[:, qs, sl], C[:, qs, sl])
-                    estimate[r, sl] = derivatives @ rows / len(rows)
-            credits[i] = estimate.flatten(0, 1)
+                    estimate[r, sl] = derivatives @ rows / total_rows
+            credits[i] = self.group_sum(estimate.flatten(0, 1))
             raw_errors[f'transformer.h.{i}.attn.c_k'] = raw_credit
         self._input_key_errors = raw_errors
         return credits
@@ -1282,8 +1303,10 @@ class Cut(Boost):
         # Draw bases in the original site order. Replay one sequence at a time
         # so routed K/V storage does not grow with the per-GPU batch size.
         probes = []
+        lo, hi = self.share(self.width)  # this GPU's share of each cycle; the scalar moves on the first GPU
+        P, scalars_here = hi - lo, self.part == 0
         for site in range(-1, L):
-            H = self.basis()
+            H = self.basis()[lo:hi]
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             credit = torch.empty(n, self.width, device=self.device)
@@ -1315,8 +1338,8 @@ class Cut(Boost):
                 selected_out = [w[r[0][sl]] for w, r in zip(w_out_t, routes)]
                 for site, H, steps, credit, lam in probes:
                     move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
-                    scale = steps[sl].expand(-1, self.width)
-                    if site >= 0:  # symmetric probes of both linear mixing scalars
+                    scale = steps[sl].expand(-1, P)
+                    if site >= 0 and scalars_here:  # symmetric probes of both linear mixing scalars
                         prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
                         move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1),
                                           -h * prev, -h * x0[sl].unsqueeze(1)], 1)
@@ -1326,19 +1349,18 @@ class Cut(Boost):
                         site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                         [r[1][sl] for r in routes], lam_r, lam_0, selected_fc, selected_out, weight_t,
                         base[sl], target_w[sl], y[sl], own_sl, packed=True)
-                    credit[sl] = derivative[:, :self.width] @ H / self.width
-                    if site >= 0:
-                        lam += (derivative[:, self.width:self.width + 2]
-                                + derivative[:, self.width + 2:]).sum(0) / 2
+                    credit[sl] = derivative[:, :P] @ H / self.width
+                    if site >= 0 and scalars_here:
+                        lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
                 del selected_fc, selected_out
             # Drop views as well as the owning cache before constructing the
             # next sequence's routed keys and values.
             del own_sl, own
         credits = {}
         for site, _, _, credit, lam in probes:
-            credits['emb' if site < 0 else site] = credit
+            credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
-                credits['lam', site] = lam
+                credits['lam', site] = self.group_sum(lam)
         return credits
 
     def own_query_inputs(self, sequence=0):
@@ -1479,6 +1501,12 @@ class Cut(Boost):
         for name, p in model.named_parameters():
             if name not in gradients:
                 gradients[name] = torch.zeros_like(p, dtype=torch.float32)
+        if self.part:  # split: formed in full by every GPU of the sequence, kept by its first GPU (the
+            # internals split or average their own: keys share dims, queries share draws, hidden units share units)
+            for name in list(gradients):
+                if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
+                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
+                    gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:
             # Use this capture's original measured hub targets, never corrected
             # targets. Only the source parameter gradients receive the addition.
@@ -1840,6 +1868,15 @@ class FiniteFuture:
             raise ValueError("Probe budgets must be positive")
         # Preserve every requested prefix when the execution tile is larger.
         chunk = gcd(self.chunk, *budgets)
+        split, part = getattr(e, 'split', 1), getattr(e, 'part', 0)
+        if split > 1:  # each GPU of the sequence takes a share of the draws, decoded at the full budget
+            if len(budgets) != 1 or budgets[0] % split:
+                raise ValueError('Split future probes need one budget divisible by the GPUs of a sequence')
+            share = budgets[0] // split
+            chunk = gcd(self.chunk, share)
+            span = range(part * share, (part + 1) * share, chunk)
+        else:
+            span = range(0, max(budgets), chunk)
         result = {p: {} for p in budgets}
         timings = {}
         lam, lam0 = model.resid_lambdas.float(), model.x0_lambdas.float()
@@ -1874,12 +1911,15 @@ class FiniteFuture:
                 sl = slice(t0, min(t0+self.tokens, t))
                 trial = self.experiment(family, layer, raw, sl, receivers, t0)
                 accumulator = torch.zeros_like(raw[sl])
-                for p0 in range(0, max(budgets), chunk):
+                for p0 in span:
                     p1 = p0+chunk
                     index = (offsets[sl, None]+permutation[None, p0:p1]) % width
                     rows = frame[index]*signs[sl, None]
                     accumulator += trial(rows, steps[sl])
-                    if p1 in credits:
+                    if split > 1:
+                        if p1 == (part + 1) * share:
+                            credits[budgets[0]][sl] = accumulator/budgets[0]
+                    elif p1 in credits:
                         credits[p1][sl] = accumulator/p1
             for p in budgets:
                 result[p][name] = credits[p][None]
@@ -1900,7 +1940,8 @@ def add_future_gradients(estimator, gradients):
     """
     e, s, d = estimator, estimator.s, estimator.capture
     e.maps.clear()
-    seed = int(torch.randint(2**31, (), device=e.device, generator=d.generator).item())
+    seed = int(torch.randint(2**31, (), device=e.device,
+                             generator=d.shared_generator if e.split > 1 else d.generator).item())
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
                           query_mlp=True, timing=False)
@@ -2123,7 +2164,7 @@ class Optimizers:
             torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
-def make_model(device, seed, config, projection_std):
+def make_model(device, seed, config, projection_std, head_std=0.001):
     torch.manual_seed(seed)
     with torch.device('meta'):
         model = GPT(config)
@@ -2135,6 +2176,8 @@ def make_model(device, seed, config, projection_std):
             if 'c_proj' in name and isinstance(module, nn.Linear):
                 scale = projection_std * math.sqrt(3 / module.weight.shape[1])
                 nn.init.uniform_(module.weight, -scale, scale)
+        if head_std != 0.001:
+            nn.init.normal_(model.lm_head.weight, std=head_std)
     return model.requires_grad_(False)
 
 
@@ -2156,12 +2199,12 @@ def make_optimizer(model, recipe, steps):
     return Optimizers(anvil, adam)
 
 
-def set_rate(optimizer, step, steps, warmdown):
-    """Set the original val linear warmdown rate, with one-based training steps."""
+def set_rate(optimizer, step, steps, warmdown, final=0.0):
+    """Set the original val linear warmdown rate, with one-based training steps (down to `final` of the rate)."""
     left = (steps - step + 1) / steps
     for group in optimizer.param_groups:
         group.setdefault('initial_lr', group['lr'])
-        group['lr'] = group['initial_lr'] * min(1.0, left / warmdown if warmdown else 1.0)
+        group['lr'] = group['initial_lr'] * (final + (1 - final) * min(1.0, left / warmdown if warmdown else 1.0))
 
 
 # ------------------------------------------------------------------------------------------------------- training
@@ -2246,12 +2289,166 @@ def handoff_optimizer(old, new, phase_step):
     new.optimizers[0].t = phase_step - 1
 
 
+def holdout_loss(model, rows, rank, world):
+    """Mean next-token loss over the held-out training sequences, split across ranks."""
+    device = next(model.parameters()).device
+    total = torch.zeros(2, dtype=torch.float64, device=device)
+    with torch.no_grad():
+        for batch in rows[rank::world].split(8):
+            batch = batch.to(device)
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+            total[0] += loss.double()
+            total[1] += batch[:, 1:].numel()
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(total)
+    return (total[0] / total[1]).item()
+
+
+def merge_part(name):
+    if name.startswith('transformer.h.') and 've_gate' not in name:
+        return '.'.join(name.split('.')[2:5])  # one matrix of block i (attn.c_q, ..., mlp.c_proj)
+    return 've_gates' if 've_gate' in name else name
+
+
+HOLDOUT = 32  # training sequences that feed no update and score the end merge
+MERGE_FROM, MERGE_EVERY = 0.6, 5  # the exponential means follow the weights from 60% of the epoch, every 5 updates
+MERGE_DECAYS = (0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01)  # weight of the newest weights in each mean
+MERGE_RHOS = (0.0, 0.5, 1.0)  # how far a candidate moves outside the high-curvature subspace
+MERGE_K, MERGE_TOKENS = 64, 512  # input-covariance directions per linear layer; frequent-token rows per table
+
+
+@torch.no_grad()
+def curvature_bases(model, rows, rank, world, k=MERGE_K):
+    """Per linear layer, the top-k eigenvectors of its input covariance E[x x^T], and the token order of
+    `rows` by frequency (for the embedding tables), from forward passes of the current weights on `rows` (the
+    held-out training sequences; no gradient). Computed on rank 0 and broadcast, so every rank merges identically."""
+    device = next(model.parameters()).device
+    layers = [(name + '.weight', mod) for name, mod in model.named_modules()
+              if isinstance(mod, nn.Linear) and 've_gate' not in name]
+    bases = {key: torch.zeros(mod.weight.shape[1], k, device=device) for key, mod in layers}
+    order = torch.zeros(model.config.vocab_size, dtype=torch.long, device=device)
+    if rank == 0:
+        acc, hooks = {}, []
+        for key, mod in layers:
+            def hook(module, inputs, output, key=key):
+                x = inputs[0].reshape(-1, inputs[0].shape[-1]).float()
+                acc[key] = acc.get(key, 0) + (x.T @ x).double()
+            hooks.append(mod.register_forward_hook(hook))
+        counts = torch.zeros(model.config.vocab_size, dtype=torch.float64, device=device)
+        for batch in rows.split(4):
+            batch = batch.to(device)
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+            counts += torch.bincount(batch[:, :-1].reshape(-1).long(), minlength=len(counts)).double()
+        for h in hooks:
+            h.remove()
+        for key, _ in layers:
+            bases[key] = torch.linalg.eigh(acc[key])[1].flip(1)[:, :k].float().contiguous()
+        order = torch.argsort(counts, descending=True)
+    if world > 1:
+        for key, _ in layers:
+            torch.distributed.broadcast(bases[key], 0)
+        torch.distributed.broadcast(order, 0)
+    return bases, order
+
+
+def subspace_move(name, move, bases, order):
+    """The part of a weight move inside its high-curvature subspace: the top input-covariance directions of a
+    linear layer, the rows of the most frequent tokens of an embedding table; other tensors whole."""
+    if name in bases:
+        return (move @ bases[name]) @ bases[name].T
+    if name == 'transformer.wte.weight' or name.startswith('value_embeds.'):
+        mask = torch.zeros(move.shape[0], 1, device=move.device, dtype=move.dtype)
+        mask[order[:MERGE_TOKENS]] = 1
+        return move * mask
+    return move
+
+
+MERGE_COEFS = (0.75, 1.0, 1.25)  # multiples of each move in the joint search
+
+
+@torch.no_grad()
+def joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain, load,
+                sweeps=2, shortlist=8):
+    """The joint search over keys (rho, j, c) = final + c * move(rho, j) per part (None = the final weights):
+    the best single key for every part, then coordinate sweeps (all keys per part, then each part's best `shortlist`)."""
+    parts = sorted({merge_part(n) for n, _ in named})
+    keys = [None] + [(rho, j, c) for rho, j in candidates for c in MERGE_COEFS]
+    cache = {}
+
+    def value(i, key):
+        if key is None:
+            return final[i]
+        if (i, key[0], key[1]) not in cache:
+            cache[i, key[0], key[1]] = move(i, key[0], key[1])
+        return final[i] + key[2] * cache[i, key[0], key[1]]
+
+    def state(choice):
+        return [value(i, choice[merge_part(n)]) for i, (n, _) in enumerate(named)]
+    best_key, best = None, plain
+    for key in keys[1:]:
+        load([value(i, key) for i in range(len(params))])
+        loss = holdout_loss(model, rows, rank, world)
+        if loss < best:
+            best_key, best = key, loss
+    choice = {p: best_key for p in parts}
+    ranked = {}
+    for sweep in range(sweeps):
+        for p in parts:
+            tried = []
+            for key in (keys if sweep == 0 else ranked[p]):
+                if key == choice[p]:
+                    tried.append((best, key))
+                    continue
+                trial = dict(choice)
+                trial[p] = key
+                load(state(trial))
+                loss = holdout_loss(model, rows, rank, world)
+                tried.append((loss, key))
+                if loss < best:
+                    best, choice = loss, trial
+            if sweep == 0:
+                ranked[p] = [k for _, k in sorted(tried, key=lambda x: x[0])[:shortlist]]
+    load(state(choice))
+    return dict(holdout_plain=plain, holdout_merged=best,
+                merge_choices={p: (None if k is None else [k[0], MERGE_DECAYS[k[1]], k[2]]) for p, k in choice.items()})
+
+
+@torch.no_grad()
+def end_merge(model, means, rows, rank, world):
+    """The end merge (module docstring): per part, candidates final + c * (inside + rho * (full - inside)), full = an
+    exponential mean minus the final weights and inside its part in the high-curvature subspace (curvature_bases on the
+    held-out rows), chosen on the held-out loss by joint_parts. Every rank takes the same decisions (the losses are
+    all-reduced)."""
+    named = list(model.named_parameters())
+    params = [q for _, q in named]
+    final = [q.detach().float().clone() for q in params]
+    bases, order = curvature_bases(model, rows, rank, world)
+    candidates = [(rho, j) for rho in MERGE_RHOS for j in range(len(means))]
+
+    def move(i, rho, j):
+        full = means[j][i] - final[i]
+        if rho == 1.0:
+            return full
+        inside = subspace_move(named[i][0], full, bases, order)
+        return inside + rho * (full - inside)
+
+    def load(ws):
+        for q, w in zip(params, ws):
+            q.copy_(w.to(q.dtype))
+    plain = holdout_loss(model, rows, rank, world)
+    return joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain, load)
+
+
 def train_stages(args, settings, device, rank, world):
     """Boost -> own-query Cut; each row is consumed exactly once, including across resume."""
     if world not in (1, 2, 4, 8):
         raise ValueError('Stage training supports 1, 2, 4 or 8 GPUs')
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
+    holdout_rows, training = training[-HOLDOUT:], training[:-HOLDOUT]  # these feed no update, only the end merge
+    means = None  # the exponential means of the end merge, one per MERGE_DECAYS entry
     schedule = stage_schedule(len(training), settings)
     steps = min(args.steps or len(schedule), len(schedule))
     stop = min(steps, args.stop_after_step or steps)
@@ -2259,6 +2456,11 @@ def train_stages(args, settings, device, rank, world):
     groups = ([torch.distributed.new_group(list(range(i, i+split))) for i in range(0, world, split)]
               if split > 1 else [None])
     group = groups[rank // split] if split > 1 else None
+    cut_split = max(1, world // settings.cut_batch)  # GPUs per sequence in Cut
+    cut_groups = groups if cut_split == split else (
+        [torch.distributed.new_group(list(range(i, i+cut_split))) for i in range(0, world, cut_split)]
+        if cut_split > 1 else [None])
+    cut_group = cut_groups[rank // cut_split] if cut_split > 1 else None
     recipe_state = asdict(settings)
     if rank == 0:
         if args.output.exists() and any(args.output.iterdir()):
@@ -2269,18 +2471,20 @@ def train_stages(args, settings, device, rank, world):
             epoch_updates=len(schedule), train_rows=len(training),
             upstream='qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259',
             additions=['linear_path_scalars', 'input_key_probes', 'input_gate_probes',
-                       'independent_future_hidden_query_embedding_probes'],
+                       'independent_future_hidden_query_embedding_probes', 'cut_batch4_split2', 'recipe_11',
+                       'end_merge'],
             resume=str(args.resume.resolve()) if args.resume else None, torch_version=torch.__version__,
         ), indent=2)+'\n')
 
     def estimator_for(model, phase):
         if phase == 'boost':
             return Boost(model, settings, SEED, rank, world, split, group)
-        return Cut(model, settings, SEED, rank, world)
+        return Cut(model, settings, SEED, rank, world, cut_split, cut_group)
 
     def rank_slice(batch, phase):
-        per = len(batch) // (world // split if phase == 'boost' else world)
-        first = (rank // split if phase == 'boost' else rank) * per
+        group_size = split if phase == 'boost' else cut_split
+        per = len(batch) // (world // group_size)
+        first = (rank // group_size) * per
         return batch[first:first+per].to(device)
 
     # Compile every active phase on random tokens; recreate all model/optimizer/RNG state afterward.
@@ -2289,7 +2493,7 @@ def train_stages(args, settings, device, rank, world):
                           (max(settings.boost_batch, settings.cut_batch), settings.model.sequence_len+1),
                           generator=torch.Generator().manual_seed(SEED))
     for phase, horizon in phases.items():
-        model = make_model(device, SEED, settings.model, settings.projection_std)
+        model = make_model(device, SEED, settings.model, settings.projection_std, settings.head_std)
         optimizer, estimator = make_optimizer(model, settings, horizon), estimator_for(model, phase)
         size = settings.boost_batch if phase == 'boost' else settings.cut_batch
         batch = rank_slice(noise[:size], phase)
@@ -2311,7 +2515,7 @@ def train_stages(args, settings, device, rank, world):
             raise ValueError('Resume data position or phase schedule differs')
         phase = saved_phase
         del checkpoint
-    model = make_model(device, SEED, settings.model, settings.projection_std)
+    model = make_model(device, SEED, settings.model, settings.projection_std, settings.head_std)
     optimizer, estimator = make_optimizer(model, settings, phases[phase]), estimator_for(model, phase)
     if args.resume:
         completed, previous_seconds = restore_training_state(args.resume, model, optimizer, estimator, recipe=recipe_state)
@@ -2328,7 +2532,7 @@ def train_stages(args, settings, device, rank, world):
                 handoff_optimizer(optimizer, next_optimizer, phase_step)
                 optimizer, estimator, phase = next_optimizer, estimator_for(model, current), current
             batch = rank_slice(training[begin:end], phase)
-            set_rate(optimizer, phase_step, horizon, settings.warmdown)
+            set_rate(optimizer, phase_step, horizon, settings.warmdown, settings.final)
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
             torch.cuda.synchronize()
             elapsed = previous_seconds + time.perf_counter()-start-paused
@@ -2342,6 +2546,14 @@ def train_stages(args, settings, device, rank, world):
             if rank == 0:
                 print(json.dumps(record), flush=True)
                 log.write(json.dumps(record)+'\n'); log.flush()
+            if (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
+                with torch.no_grad():  # a resumed run restarts the means at its resumed weights
+                    if means is None:
+                        means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
+                    else:
+                        for a, mean in zip(MERGE_DECAYS, means):
+                            for m, q in zip(mean, model.parameters()):
+                                m.lerp_(q.detach().float(), a)
             if (args.checkpoint_every and (step % args.checkpoint_every == 0 or step == stop)) or step == stop < steps:
                 pause = time.perf_counter()
                 save_training_state(args.output/'checkpoint.pt', model, optimizer, estimator, step=step,
@@ -2353,10 +2565,24 @@ def train_stages(args, settings, device, rank, world):
                 (args.output/'segment.json').write_text(json.dumps(dict(step=stop, total_steps=steps, seqs=end,
                     train_seconds=elapsed, checkpoint=str((args.output/'checkpoint.pt').resolve())), indent=2)+'\n')
             return
+        extra = {}
+        if means:  # the end merge, timed with the training (the plain weights' validation is not)
+            plain = {name: value.detach().cpu() for name, value in model.state_dict().items()}
+            pause = time.perf_counter()
+            extra['val_loss_plain'] = evaluate(plain, args.data_dir)
+            paused += time.perf_counter()-pause
+            merge_start = time.perf_counter()
+            extra.update(end_merge(model, means, holdout_rows, rank, world))
+            torch.cuda.synchronize()
+            extra['merge_seconds'] = round(time.perf_counter()-merge_start, 2)
+            elapsed = previous_seconds + time.perf_counter()-start-paused
+            if rank == 0:
+                torch.save(plain, args.output/'final_plain.pt')
+            means = None
         state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
         result = dict(val_loss=evaluate(state, args.data_dir), train_seconds=round(elapsed, 2), steps=stop,
                       seqs=end, tokens=end*settings.model.sequence_len, estimator=settings.estimator,
-                      peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3))
+                      peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3), **extra)
         if rank == 0:
             torch.save(state, args.output/'final.pt')
             (args.output/'result.json').write_text(json.dumps(result, indent=2)+'\n')
@@ -2377,10 +2603,10 @@ def main():
     parser.add_argument('--stop-after-step', type=int)
     parser.add_argument('--steps', type=int, help='Diagnostic prefix; preserves the full-epoch LR schedule.')
     # Execution chunks only: the default command reproduces the logged algorithm and budgets.
-    parser.add_argument('--chain-tokens', type=int, default=256)
+    parser.add_argument('--chain-tokens', type=int, default=512)
     parser.add_argument('--key-chunk', type=int, default=32)
-    parser.add_argument('--key-path-tokens', type=int, default=32)
-    parser.add_argument('--future-tokens', type=int, default=64)
+    parser.add_argument('--key-path-tokens', type=int, default=64)
+    parser.add_argument('--future-tokens', type=int, default=128)
     parser.add_argument('--future-chunk', type=int, default=512)
     args = parser.parse_args()
     for key in ('steps', 'stop_after_step'):
