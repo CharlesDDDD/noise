@@ -88,6 +88,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | # | Val loss | Description | Time | Script | Contributors |
 | - | - | - | - | - | - |
 | 1 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/speedrun/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+| 2 | 3.499 | The identity path first, then Cut-lite at 8 rows per update with faster chain reruns | 8 min 20 s | [Script](https://github.com/qlabs-eng/noise/blob/4586b02e7f77927683c1f5d28a981b3a0342b9ea/train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 
 ### Track 3: open architecture (30M)
 

@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/t1prs/pr40/train/val/run_scale.py",
+  "script": "train/speedrun/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -15,9 +15,9 @@
     "estimator": "cut",
     "boost_hub": "projected",
     "mlp_output_credit": "next_mid",
-    "switch": 0.2,
+    "switch": 0.0,
     "boost_batch": 4,
-    "cut_batch": 4,
+    "cut_batch": 8,
     "projection_std": 1.5,
     "lr": 0.0021,
     "betas": [
@@ -41,29 +41,41 @@
     "scalar_step": 0.01,
     "chunk": 134217728,
     "chain_sigma": 0.01,
-    "route_k": 512,
-    "chain_tokens": 512,
+    "route_k": 192,
+    "chain_tokens": 1024,
     "chain_precision": "bf16",
     "own_query": true,
     "value_path": true,
     "path_scalars": true,
-    "key_path_draws": 512,
+    "key_path_draws": 0,
     "key_path_sigma": 0.01,
     "key_path_tokens": 64,
     "gate_path": true,
     "gate_path_sigma": 0.01,
-    "future_draws": 128,
+    "future_draws": 0,
     "future_layers": 4,
     "future_tokens": 128,
     "future_chunk": 512,
     "future_sigma": 0.01,
-    "query_keys": 256,
+    "query_keys": 32,
     "key_sigma": 0.003,
-    "key_chunk": 32
+    "key_chunk": 32,
+    "merge_keys": 8,
+    "merge_graph": true,
+    "chain_fast": true,
+    "chain_act": "bf16",
+    "fused_query": true,
+    "fold_norm": true,
+    "fused_moves": true,
+    "head_moments": true,
+    "moment_kernel": true,
+    "emb_credit": "mid0",
+    "emb_scale": 750.0,
+    "lambda_scale": 15.0
   },
-  "steps": 3654,
-  "epoch_updates": 3654,
-  "train_rows": 14616,
+  "steps": 1163,
+  "epoch_updates": 1163,
+  "train_rows": 9304,
   "upstream": "qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259",
   "additions": [
     "linear_path_scalars",
@@ -75,5 +87,37 @@
     "end_merge"
   ],
   "resume": null,
-  "torch_version": "2.10.0+cu128"
+  "torch_version": "2.10.0+cu128",
+  "identity": {
+    "updates": 1831,
+    "batch": 8,
+    "seed": 0,
+    "init": "prev8",
+    "skip": {
+      "blocks": [
+        0,
+        2,
+        4,
+        6
+      ],
+      "start": 366
+    },
+    "ema": {
+      "start": 1099,
+      "horizon": 458,
+      "mix": 0.4
+    },
+    "seq_warmup": "1024:1464",
+    "cooldown": 732,
+    "lr": 0.006,
+    "betas": [
+      0.7,
+      0.98
+    ],
+    "lr_wte": 1.8,
+    "lr_value_embeds": 1.8,
+    "lr_lambdas": 0.006,
+    "anvil_lr": 0.032,
+    "anvil_wd": 2.25
+  }
 }
