@@ -99,6 +99,7 @@ New track where any architecture is allowed!
 | - | - | - | - | - | - |
 | 1 | 3.767 | Dust w/ Adam, 24k population, lr cooldown | 5 h 17 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/val/dust.py) | - |
 | 2 | 3.409 | 10M record #14: Boost → Cut with own queries, exact values, future-token probes and an end merge | 1 h 43 min | [Script](https://github.com/qlabs-eng/noise/blob/b6405a155a38371f994a8f3915ea5d8a87235315/train/arch/run.py) | [@JaydenTeoh](https://github.com/JaydenTeoh), [@spicylemonade](https://github.com/spicylemonade), [@hoo0681](https://github.com/hoo0681), [@Lazarus-931](https://github.com/Lazarus-931), [@CharlesDDDD](https://github.com/CharlesDDDD), [@NotDesigned](https://github.com/NotDesigned) |
+| 3 | 3.378 | A quarter-turn previous-token tap in the embedding; exact future-token probes | 3 h 50 min | [Script](https://github.com/qlabs-eng/noise/blob/d45f830431ed9bebca3f36a464184ec8a3016513/train/arch/run.py) | [@dylantirandaz](https://github.com/dylantirandaz) |
 
 ## What backprop gets
 
