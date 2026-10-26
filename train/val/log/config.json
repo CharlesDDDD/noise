@@ -1,5 +1,5 @@
 {
-  "script": "/home/ubuntu/t1prs/pr40/train/val/run_scale.py",
+  "script": "/home/chunyuan/noise30_pr/train/val/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -15,7 +15,7 @@
     "estimator": "cut",
     "boost_hub": "projected",
     "mlp_output_credit": "next_mid",
-    "switch": 0.2,
+    "switch": 0.0668,
     "boost_batch": 4,
     "cut_batch": 4,
     "projection_std": 1.5,
@@ -28,14 +28,13 @@
     "final": 0.3,
     "head_std": 0.02,
     "anvil_lr": 0.026,
-    "anvil_wd": 2.25,
+    "anvil_wd": 0.75,
     "fast_weight": 1.0,
     "polar_margin": 1.1,
     "sigma": 0.005,
     "fc_sigma": 0.05,
     "query_draws": 64,
     "query_sigma": 0.1,
-    "query_central": false,
     "nrep": 64,
     "emb_chunk": 16,
     "scalar_step": 0.01,
@@ -43,36 +42,62 @@
     "chain_sigma": 0.01,
     "route_k": 512,
     "chain_tokens": 512,
-    "chain_precision": "bf16",
-    "own_query": true,
-    "value_path": true,
-    "path_scalars": true,
     "key_path_draws": 512,
     "key_path_sigma": 0.01,
-    "key_path_tokens": 64,
-    "gate_path": true,
     "gate_path_sigma": 0.01,
-    "future_draws": 128,
-    "future_layers": 4,
-    "future_tokens": 128,
-    "future_chunk": 512,
-    "future_sigma": 0.01,
     "query_keys": 256,
     "key_sigma": 0.003,
-    "key_chunk": 32
+    "readout_q_keys": 16,
+    "readout_q_full": [
+      0
+    ],
+    "readout_fc_cycle": [
+      512,
+      128,
+      128,
+      128
+    ],
+    "readout_hi_fc_cycle": [
+      512,
+      128,
+      128
+    ],
+    "readout_sigma": 0.01,
+    "readout_k_blocks": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "readout_k_receivers": 8,
+    "readout_k_cap": 1.5,
+    "readout_hi_blocks": [
+      4,
+      5,
+      6
+    ],
+    "readout_in_roots": [
+      5,
+      7
+    ],
+    "readout_chunk": 512
   },
   "steps": 3654,
   "epoch_updates": 3654,
   "train_rows": 14616,
-  "upstream": "qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259",
+  "upstream": "qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e",
   "additions": [
     "linear_path_scalars",
     "input_key_probes",
     "input_gate_probes",
-    "independent_future_hidden_query_embedding_probes",
     "cut_batch4_split2",
     "recipe_11",
-    "end_merge"
+    "end_merge",
+    "true_path_readout",
+    "self_edged_chain",
+    "q_fc_source_experiments",
+    "k_gate_receiver_experiments",
+    "input_roots"
   ],
   "resume": null,
   "torch_version": "2.10.0+cu128"
