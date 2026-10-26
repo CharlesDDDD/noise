@@ -1,34 +1,29 @@
-"""Boost -> Cut with independent input-K/gate and future-token probes (#31), trained at batch 4 on two GPUs per
-sequence with the backprop baseline's recipe, and merged at the end along its own trajectory.
+"""Track 3 (open architecture): Cut-lite over the whole epoch on a 12 x 1024 transformer whose value embeddings
+read hashed bigram, trigram and skip-bigram tables, then the end merge.
 
-The own-query and value-path measurements of PR #23 remain the starting point.
-Input-K/gate probes supply additional input credit to linear consumers. Separate
-single-source hidden/Q/embedding probes are scored at later, original measured
-attention hubs. Corrected credits never become another probe's scoring target.
+The model is model.py's GPTConfig() (what utils/eval.py builds): 12 blocks at width 1024 (16 heads of 64), a value
+embedding on every block, and three hashed n-gram tables of 2^20 rows x 128, indexed by (previous token, token),
+(the two previous tokens, token) and (the token two back, token), summed and projected into every block's value
+embedding by its own 128 -> 1024 matrix (613.9M parameters, the tables 402.7M).
 
-This record adds to #31 (nothing here changes what is measured or how):
-  - Record #11's recipe: Cut at batch 4, each sequence split over two GPUs (each takes half of every cycle of moves
-    and draws; the pair adds its parts, equal to one GPU), 0.7x rates, Adam betas (0.5, 0.98), a warmdown over the
-    last 40% that ends at 30% of each rate (the end merge anneals the rest), and the LM head initialized at std 0.02.
-  - Future probes: 128 central pairs per source token (#31: 512), in larger token chunks.
-  - An end merge along the trajectory. The last 32 training sequences feed no update: they only score the merge. From
-    60% of the epoch, every 5 updates, nine exponential means of the weights are kept (weight 0.5 ... 0.01 on the
-    newest). After the last update, for each part (each block matrix, each table, the scalars) a candidate moves the
-    final weights toward one mean, in full inside the part's 64 top input-covariance directions (for a table, the rows
-    of the 512 most frequent tokens; both from forward passes on the held-out rows) and a fraction 0, 1/2 or 1 outside,
-    times 0.75, 1 or 1.25: 81 candidates and no move. The best single candidate for every part comes first, then two
-    coordinate sweeps over the parts (the second over each part's best 8) keep any change that lowers the held-out
-    loss. About 5,000 forward passes on 32 sequences (~1 min), inside the timed region.
+Training (every signal measured forward against the loss, at most one step through a nonlinear part):
+  - Cut over every update (no Boost phase), 8 rows per update, one sequence per GPU: chain credits along full
+    Hadamard cycles of each block's mid stream, rerun to the loss through the later blocks (own-query keys, exact
+    values, each token's 192 strongest MLP units), the head's coordinate differences, and the input-key probes along
+    a full 1,024-direction cycle. No future-token probes.
+  - The value embeddings, the n-gram projections and the table rows are credited exactly from each block's measured
+    value error (they enter the values linearly).
+  - ANVIL II on the block matrices, Adam elsewhere (x750 on the embedding and n-gram tables, x15 on the residual
+    scalars), a warmdown over the last 60% of the updates.
+  - The end merge along the trajectory, scored on the last 64 training sequences (which feed no update).
+  - The chain reruns use the track-2 record's exact speedups (bf16 moves, readout moments, fused query, norm fold).
 
-This recipe uses 20% Boost (global batch 4), then Cut (global batch 4), consuming
-every training sequence but the last 32 once (those score the end merge). Future probes use all
-permitted receivers and the first four hidden/Q layers plus the embedding.
-No receiver sampling or active-space direction encoding is used.
+Every switch is a Settings field (or a flag below) with the record's value as its default.
 
     uv run torchrun --standalone --nproc_per_node=8 train/arch/run.py
 """
 import argparse
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from functools import cache, partial
 from math import gcd
 import json
@@ -37,7 +32,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import torch
@@ -47,7 +42,7 @@ from torch.nn import functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Track 3: the model is this folder's model.py, which entries may change; utils/eval.py scores it with --model.
 MODEL_FILE = Path(__file__).resolve().with_name('model.py')
-from model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask
+from model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask  # noqa: E402
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
 
@@ -58,7 +53,7 @@ torch._dynamo.config.cache_size_limit = 64
 
 
 def model_config():
-    """Track 3: this folder's model.py defaults, which utils/eval.py also builds."""
+    """The architecture is model.py's: GPTConfig()'s defaults, as utils/eval.py builds it."""
     return GPTConfig()
 
 
@@ -69,13 +64,13 @@ class Settings:
     estimator: str = 'cut'
     boost_hub: str = field(default='projected', init=False)  # persisted algorithm version, not an ablation flag
     mlp_output_credit: str = field(default='next_mid', init=False)
-    switch: float = 0.2
+    switch: float = 0.0
     boost_batch: int = 4
-    cut_batch: int = 4
+    cut_batch: int = 8
     projection_std: float = 1.5
     lr: float = 0.0021
     betas: tuple = (0.5, 0.98)
-    warmdown: float = 0.4
+    warmdown: float = 0.6
     final: float = 0.3  # the warmdown ends at this fraction of each rate; the end merge anneals the rest
     head_std: float = 0.02  # the LM head's init std (the fixed init's 0.001)
     anvil_lr: float = 0.026
@@ -92,39 +87,49 @@ class Settings:
     scalar_step: float = 0.01
     chunk: int = 2 ** 27
     chain_sigma: float = 0.01
-    route_k: int = 512
+    route_k: int = 192
     chain_tokens: int = 512
     chain_precision: str = 'bf16'
     own_query: bool = True  # PR #19's measured own-query paths in later attention blocks
     value_path: bool = True  # PR #23: one RMSNorm step, then only linear writers/V/VE
     path_scalars: bool = True  # also contract input-path credit into the linear mixing coefficients
-    key_path_draws: int = 512  # independent input-K central pairs per token
+    key_path_draws: int = 1024  # independent input-K central pairs per token
     key_path_sigma: float = 0.01  # relative input RMS step
-    key_path_tokens: int = 256  # source-token chunk; every allowed query contributes
+    key_path_tokens: int = 64  # source-token chunk; every allowed query contributes
     gate_path: bool = True  # independent full-cycle input probes through the VE gate
     gate_path_sigma: float = 0.01  # relative input RMS step
-    future_draws: int = 128  # independent hidden/Q/WTE probes scored at every later raw hub
+    future_draws: int = 0  # independent hidden/Q/WTE probes scored at every later raw hub
     future_layers: int = 4  # first blocks whose hidden and Q outputs receive this correction
-    future_tokens: int = 512
+    future_tokens: int = 128
     future_chunk: int = 512
     future_sigma: float = 0.01  # source-relative RMS; Q includes its own complete MLP response
-    future_moments: bool = True  # score future probes with degree-2 moments over the receiving queries
-    future_routed: bool = True  # future Q moves through the chain's routed keys (query_keys), not every key
-    future_stacked: bool = True  # score every receiver of a source chunk at once (with future_moments)
-    future_fused: bool = True  # the stacked receivers' K/V changes and moment forms in one kernel (cuda)
-    query_keys: int = 256   # moving key logits per head; 0 reruns all allowed logits
+    query_keys: int = 32  # moving key logits per head; 0 reruns all allowed logits
     key_sigma: float = 0.003
     key_chunk: int = 32
-    key_moments: bool = True  # score input-K probes with degree-2 moments over the receiving queries
-    key_fused: bool = True  # form the input-K changes and their moment scores in one kernel (with key_moments)
-    raw_key_moments: bool = True  # Cut's raw-K single-coordinate experiments scored by the same moments too
-    own_query_precision: str = 'bf16'  # the chain's own-query move products (the record: 'fp32', TF32 products)
-    future_precision: str = 'bf16'  # the future probes' move products (the record: 'fp32', TF32 products)
-    moment_precision: str = 'bf16'  # the quadratic moments' products ('fp32': TF32 products)
-    ngram_lr_scale: float = 300  # the n-gram tables' Adam rate, in units of lr (the token embedding's is 300)
+    merge_keys: int = 8  # end merge: keys per part in the first sweep (0 = all 82)
+    fused_query: bool = True  # chain reruns: rotate + renormalize the moved queries in one Triton pass (bf16 moves)
+    fold_norm: bool = True  # chain reruns: the norm's change folded into the next projection (d's, rescaled, + clean)
+    fused_moves: bool = True  # chain reruns: each root's moves built inside the compiled chunk (no fp32 copies)
+    moment_kernel: bool = True  # head_moments: each token's W^T diag(c) W in one Triton GEMM (no scaled copies)
+    merge_graph: bool = True  # end merge: the held-out forward compiled and CUDA-graphed (warmed up before the timer)
+    head_moments: bool = True  # chain reruns: the readout's partition-function change from per-token moments
+    chain_act: str = 'bf16'  # 'bf16': the chain reruns' moved-stream changes stored in bf16, the query projection too
+    emb_scale: float = 750.0  # Adam rate multiplier of the embedding tables
+    lambda_scale: float = 15.0  # Adam rate multiplier of the residual scalars
+    ngram_scale: float = 0.0  # Adam rate multiplier of the n-gram tables (0: emb_scale)
+    ngram_proj_scale: float = 1.0  # Adam rate multiplier of the n-gram projections
+    emb_credit: str = 'mid0'  # 'mid0': the embedding's credit from block 0's measured one (no embedding chain root)
+    chain_fast: bool = True  # routed own-query responses with one exponential per logit, their projection in bf16
+    future_precision: str = 'tf32x3'  # the future scores' dot products ('tf32': one MMA, ~8e-4 relative)
 
     def __post_init__(self):
         width, hidden = self.model.n_embd, 4 * self.model.n_embd
+        if self.chain_act not in ('fp32', 'bf16'):
+            raise ValueError('Unknown chain activation dtype')
+        if self.emb_credit not in ('chain', 'mid0'):
+            raise ValueError('Unknown embedding credit')
+        if self.future_precision not in ('tf32x3', 'tf32'):
+            raise ValueError('Unknown future score precision')
         if self.estimator not in ('boost', 'cut') or not 0 <= self.switch <= 1:
             raise ValueError('Invalid stage estimator or Boost fraction')
         if not 0 <= self.fast_weight <= 1:
@@ -215,8 +220,8 @@ def attention_state(qraw, kraw, values, cos, sin, nhead, window):
     pos = torch.arange(qraw.shape[1], device=qraw.device)
     lag = pos[:, None] - pos[None, :]
     allowed = (lag >= 0) & (lag <= window)
-    a = ((q @ k.transpose(-1, -2)) * q.shape[-1] ** -.5).masked_fill(
-        ~allowed, -torch.inf).softmax(-1)
+    logits = (q @ k.transpose(-1, -2)) * q.shape[-1] ** -.5
+    a = logits.masked_fill(~allowed, -torch.inf).softmax(-1)
     return q, k, a, a @ values
 
 
@@ -288,8 +293,8 @@ def query_probe_attention(moved, keys, values, window, count, batch):
     if not moved.is_cuda or batch == 1:
         repeat = lambda z: z.unsqueeze(0).expand(count, -1, -1, -1, -1).reshape(count*batch, length, heads, width)
         return attention(moved, repeat(keys), repeat(values), window).view(count, batch, length, heads, width)
-    out = flex(moved, keys.transpose(1, 2), values.transpose(1, 2),
-               block_mask=window_mask(window, length, moved.device), enable_gqa=True)
+    mask = window_mask(window, length, moved.device)
+    out = flex(moved, keys.transpose(1, 2), values.transpose(1, 2), block_mask=mask, enable_gqa=True)
     return out.view(batch, heads, count, length, width).permute(2, 0, 3, 1, 4)
 
 @torch.compile(dynamic=False)
@@ -377,13 +382,30 @@ def stage_readout(x0, out, mix, wproj, weight, y):
     xmid = mix * x0 + F.linear(out.reshape(x0.shape).float(), wproj)
     return readout_losses(xmid.reshape(-1, xmid.shape[-1]), weight, y)
 
+def norm_inverses(x, delta):
+    """1 / rms(x) (m, 1) and 1 / rms(x + delta) (m, P), exactly: x (m, W) clean, delta (m, P, W) moves."""
+    sq = x.square().sum(-1, keepdim=True)
+    if delta.dtype == x.dtype:
+        dots = torch.einsum('md,mpd->mp', x, delta)
+    else:  # bf16 moves (chain_act): a fused product-sum instead of a mixed-dtype product
+        dots = (x.unsqueeze(1) * delta.float()).sum(-1)
+    inv0 = torch.rsqrt(sq / x.shape[-1] + EPS)
+    return inv0, torch.rsqrt((sq + 2 * dots + delta.float().square().sum(-1)) / x.shape[-1] + EPS)
+
+
 def norm_difference(x, delta):
     """norm(x + delta) - norm(x), exactly: x (m, W) clean, delta (m, P, W) moves."""
-    sq = x.square().sum(-1, keepdim=True)
-    dots = (x.unsqueeze(1) * delta).sum(-1)  # a fused reduction, not a batched GEMV
-    inv0 = torch.rsqrt(sq / x.shape[-1] + EPS)
-    inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / x.shape[-1] + EPS)
+    inv0, inv = norm_inverses(x, delta)
     return delta * inv.unsqueeze(-1) + x.unsqueeze(1) * (inv - inv0).unsqueeze(-1)
+
+
+def folded_projection(x, delta, w, clean):
+    """(norm(x + delta) - norm(x)) @ w.T without forming the difference (fold_norm): the norm has no weight, so it is
+    inv delta @ w.T + (inv / inv0 - 1) clean, with clean = norm(x) @ w.T (m, O). delta's projection in w's dtype,
+    batched per token when w is (m, O, W). Returns (m, P, O) fp32."""
+    inv0, inv = norm_inverses(x, delta)
+    moved = torch.bmm(delta.to(w.dtype), w.transpose(1, 2)) if w.dim() == 3 else delta.to(w.dtype) @ w.T
+    return inv.unsqueeze(-1) * moved.float() + (inv / inv0 - 1).unsqueeze(-1) * clean.unsqueeze(1)
 
 
 @torch.compile(dynamic=False)
@@ -429,24 +451,20 @@ def query_change(x, delta, pos, rel, w_q, keys, values, w_proj_t, cos, sin, wind
     rotate = lambda u: torch.cat([u[..., :width // 2] * c + u[..., width // 2:] * s,
                                   u[..., :width // 2] * -s + u[..., width // 2:] * c], -1)
     r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, width))
-    dr = rotate(move_product(norm_difference(x, delta), w_q.T).view(m, probes, heads, width))
+    dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, probes, heads, width))
     sq = r0.square().sum(-1, keepdim=True)
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
     q0, dq = r0 * inv0, dr * inv + r0 * (inv - inv0)
     lag = rel[:, None] - torch.arange(length, device=rel.device)[None]
-    allowed = ((lag >= 0) & (lag <= window))[:, None, None]
+    allowed = (lag >= 0) & (lag <= window)
+    allowed = allowed[:, None, None]
     scores = torch.einsum('mphd,htd->mpht', q0.to(keys.dtype), keys).float() * width ** -0.5
     p0 = torch.softmax(scores.masked_fill(~allowed, float('-inf')), -1)
     ds = torch.einsum('mphd,htd->mpht', dq.to(keys.dtype), keys).float() * width ** -0.5
     dlse = torch.log1p((p0 * torch.expm1(ds)).sum(-1, keepdim=True))
     dout = torch.einsum('mpht,htd->mphd', (p0 * torch.expm1(ds - dlse)).to(values.dtype), values).float()
-    return move_product(dout.flatten(-2), w_proj_t)
-
-
-def move_product(move, weight):
-    """A replayed move times a clean weight, in MOVE_DTYPE with an fp32 result."""
-    return (move.to(MOVE_DTYPE) @ weight.to(MOVE_DTYPE)).float()
+    return dout.flatten(-2) @ w_proj_t
 
 
 @cache
@@ -457,57 +475,32 @@ def finite_attention_kernels():
     from triton.language.extra.cuda import libdevice
 
     @triton.jit
-    def expm1(x, FAST: tl.constexpr):
-        if FAST:  # exp(x) - 1 loses relative accuracy near 0: a cubic there (|error| < 1e-9 for |x| < 1/64)
-            return tl.where(tl.abs(x) < 0.015625, x * (1 + x * (0.5 + x * (1 / 6))), tl.exp(x) - 1)
-        return libdevice.expm1(x)
-
-    @triton.jit
-    def log1p(x, FAST: tl.constexpr):
-        if FAST:
-            return tl.where(tl.abs(x) < 0.015625, x * (1 - x * (0.5 - x * (1 / 3))), tl.log(1 + x))
-        return libdevice.log1p(x)
-
-    @triton.jit
-    def routed_block(Q, Out, k, v, p, rest, token, head, p0, Probes: tl.constexpr, Heads: tl.constexpr,
-                     D: tl.constexpr, BP: tl.constexpr, FAST: tl.constexpr):
-        features = tl.arange(0, D)
-        probes = p0 + tl.arange(0, BP)
-        q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                    probes[:, None] < Probes, 0)
-        # Match both BF16 matmul output roundings of the original implementation.
-        ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
-        grown = expm1(ds, FAST)
-        dlse = log1p(tl.sum(p[None, :] * grown, 1), FAST)
-        shrink = expm1(-dlse, FAST)[:, None]
-        # expm1(ds - dlse) = grown + shrink (1 + grown): one exponential per logit, no cancellation
-        weights = (p[None, :] * (grown + shrink * (1 + grown))).to(v.dtype)
-        moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
-        moved += shrink * rest[None, :]
-        tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
-                 moved, probes[:, None] < Probes)
-
-    @triton.jit
     def routed(Q, K, V, P, Rest, Out,
                Probes: tl.constexpr, Heads: tl.constexpr, Keys: tl.constexpr, D: tl.constexpr,
-               BP: tl.constexpr, BK: tl.constexpr, LOOP: tl.constexpr, FAST: tl.constexpr):
-        # LOOP: one program per (token, head) loops over its probe blocks; else one per (probe block, token, head)
-        if LOOP:
-            pid = tl.program_id(0)
-        else:
-            pid = tl.program_id(1)
-        token, head = pid // Heads, pid % Heads
+               BP: tl.constexpr, BK: tl.constexpr, ONE_EXP: tl.constexpr):
+        token, head = tl.program_id(1) // Heads, tl.program_id(1) % Heads
+        probes = tl.program_id(0) * BP + tl.arange(0, BP)
         keys, features = tl.arange(0, BK), tl.arange(0, D)
+        q = tl.load(Q + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                    probes[:, None] < Probes, 0)
         offsets = ((token * Heads + head) * Keys + keys[:, None]) * D + features[None, :]
         k = tl.load(K + offsets, keys[:, None] < Keys, 0)
         v = tl.load(V + offsets, keys[:, None] < Keys, 0)
         p = tl.load(P + (token * Heads + head) * Keys + keys, keys < Keys, 0)
-        rest = tl.load(Rest + (token * Heads + head) * D + features)
-        if LOOP:
-            for p0 in range(0, Probes, BP):
-                routed_block(Q, Out, k, v, p, rest, token, head, p0, Probes, Heads, D, BP, FAST)
+        # Match both BF16 matmul output roundings of the original implementation.
+        ds = tl.dot(q, tl.trans(k)).to(q.dtype).to(tl.float32) * (D ** -.5)
+        if ONE_EXP:  # one exponential per logit: expm1(ds - dlse) = exp(ds) exp(-dlse) - 1
+            grown = tl.exp(ds)
+            dlse = libdevice.log1p(tl.sum(p[None, :] * (grown - 1), 1))
+            weights = (p[None, :] * (grown * tl.exp(-dlse)[:, None] - 1)).to(v.dtype)
         else:
-            routed_block(Q, Out, k, v, p, rest, token, head, tl.program_id(0) * BP, Probes, Heads, D, BP, FAST)
+            dlse = libdevice.log1p(tl.sum(p[None, :] * libdevice.expm1(ds), 1))
+            weights = (p[None, :] * libdevice.expm1(ds - dlse[:, None])).to(v.dtype)
+        moved = tl.dot(weights, v).to(v.dtype).to(tl.float32)
+        rest = tl.load(Rest + (token * Heads + head) * D + features)
+        moved += libdevice.expm1(-dlse)[:, None] * rest[None, :]
+        tl.store(Out + ((token * Probes + probes[:, None]) * Heads + head) * D + features[None, :],
+                 moved.to(Out.dtype.element_ty), probes[:, None] < Probes)
 
     @triton.jit
     def key_response(Q, DK, A, C, Out,
@@ -516,52 +509,54 @@ def finite_attention_kernels():
                      AH: tl.constexpr, AT: tl.constexpr, AM: tl.constexpr,
                      CH: tl.constexpr, CT: tl.constexpr, CM: tl.constexpr,
                      SourceStart, QueryStart, Window: tl.constexpr,
-                     BC: tl.constexpr, BQ: tl.constexpr):
-        head = tl.program_id(1)
-        col = tl.program_id(0) * BC + tl.arange(0, BC)
-        source = col % M
+                     BP: tl.constexpr, BM: tl.constexpr, BQ: tl.constexpr):
+        # One program: one head, BP probes x BM sources; the attention and contrast tiles are loaded once per
+        # query tile and broadcast over the probes (as in the future scores).
+        head = tl.program_id(2)
+        probe = tl.program_id(1) * BP + tl.arange(0, BP)
+        source = tl.program_id(0) * BM + tl.arange(0, BM)
+        col = (probe[:, None] * M + source[None, :]).reshape(BP * BM)
+        live = ((probe[:, None] < P) & (source[None, :] < M)).reshape(BP * BM)
         features = tl.arange(0, D)
-        changed = tl.load(DK + (head * P * M + col[None, :]) * D + features[:, None],
-                          col[None, :] < P * M, 0)
-        first = tl.maximum(0, SourceStart + tl.min(source, 0) - QueryStart)
-        last = tl.minimum(T, SourceStart + tl.max(source, 0) + Window + 1 - QueryStart)
-        first = first // BQ * BQ
-        result = tl.full((BC,), 0, tl.float32)
+        changed = tl.load(DK + (head * P * M + col[None, :]) * D + features[:, None], live[None, :], 0)
+        s0 = tl.program_id(0) * BM
+        first = tl.maximum(0, SourceStart + s0 - QueryStart) // BQ * BQ
+        last = tl.minimum(T, SourceStart + s0 + BM + Window - QueryStart)
+        result = tl.full((BP * BM,), 0, tl.float32)
         for start in range(first, last, BQ):
             query = start + tl.arange(0, BQ)
             q = tl.load(Q + head * QH + query[:, None] * QT + features[None, :] * QD,
                         query[:, None] < T, 0)
             delta = tl.dot(q, changed, input_precision='tf32x3') * (D ** -.5)
-            valid = (query[:, None] < T) & (col[None, :] < P * M)
-            a = tl.load(A + head * AH + query[:, None] * AT + source[None, :] * AM, valid, 0)
-            c = tl.load(C + head * CH + query[:, None] * CT + source[None, :] * CM, valid, 0)
+            keep = (query[:, None] < T) & (source[None, :] < M)
+            a = tl.load(A + head * AH + query[:, None] * AT + source[None, :] * AM, keep, 0)
+            c = tl.load(C + head * CH + query[:, None] * CT + source[None, :] * CM, keep, 0)
+            a = tl.broadcast_to(a[:, None, :], (BQ, BP, BM)).reshape(BQ, BP * BM)
+            c = tl.broadcast_to(c[:, None, :], (BQ, BP, BM)).reshape(BQ, BP * BM)
             change = a * libdevice.expm1(delta)
             result += tl.sum(change / (1 + change) * c, 0)
-        tl.store(Out + head * P * M + col, result, col < P * M)
+        tl.store(Out + head * P * M + col, result, live)
 
     return routed, key_response
 
 
-ROUTED = (False, True, 4)  # routed kernel: probe loop per program, fast expm1/log1p, warps (bench.py's choice)
-
-
 @torch.library.custom_op('noise_record::routed_response', mutates_args=())
 def routed_response(dq: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
-                    probabilities: torch.Tensor, rest: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+                    probabilities: torch.Tensor, rest: torch.Tensor) -> torch.Tensor:
     import triton
     m, probes, heads, width = dq.shape
     count = keys.shape[2]
-    out = torch.empty((m, probes, heads, width), device=dq.device, dtype=dtype)  # stored rounded to dtype
-    loop, fast, warps = ROUTED
-    finite_attention_kernels()[0][(m * heads,) if loop else (triton.cdiv(probes, 32), m * heads)](
+    out = torch.empty((m, probes, heads, width), device=dq.device,
+                      dtype=torch.bfloat16 if OWN_PROJECTION_BF16 else torch.float32)  # bf16: what the projection reads
+    finite_attention_kernels()[0][(triton.cdiv(probes, 32), m * heads)](
         dq.contiguous(), keys.contiguous(), values.contiguous(), probabilities.contiguous(), rest.contiguous(),
-        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), loop, fast, num_warps=warps)
+        out, probes, heads, count, width, 32, max(16, triton.next_power_of_2(count)), ROUTED_ONE_EXP, num_warps=4)
     return out
 
 
 @routed_response.register_fake
-def _(dq, keys, values, probabilities, rest, dtype):
-    return torch.empty(dq.shape, device=dq.device, dtype=dtype)
+def _(dq, keys, values, probabilities, rest):
+    return torch.empty(dq.shape, device=dq.device, dtype=torch.bfloat16 if OWN_PROJECTION_BF16 else torch.float32)
 
 
 @torch.library.custom_op('noise_record::key_response', mutates_args=())
@@ -570,16 +565,77 @@ def fused_key_response(q: torch.Tensor, dk: torch.Tensor, A: torch.Tensor, C: to
     import triton
     heads, probes, sources, width = dk.shape
     out = torch.empty((heads, probes, sources), device=q.device, dtype=torch.float32)
-    finite_attention_kernels()[1][(triton.cdiv(probes * sources, 64), heads)](
+    finite_attention_kernels()[1][(triton.cdiv(sources, SCORE_SOURCES), triton.cdiv(probes, SCORE_PROBES), heads)](
         q, dk.contiguous(), A, C, out, heads, q.shape[1], sources, probes, width,
         *q.stride(), *A.stride(), *C.stride(), source_start, query_start, window,
-        64, 64, num_warps=4, enable_fp_fusion=False)
+        SCORE_PROBES, SCORE_SOURCES, SCORE_QUERIES, num_warps=4, num_stages=2, enable_fp_fusion=False)
     return out
 
 
 @fused_key_response.register_fake
 def _(q, dk, A, C, source_start, query_start, window):
     return torch.empty(dk.shape[:3], device=q.device, dtype=torch.float32)
+
+
+@cache
+def moved_query_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(Raw, R0, Cos, Sin, Inv, Shift, Out, P: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+               BP: tl.constexpr, EPS_: tl.constexpr, FOLDED: tl.constexpr):
+        # One program: BP moves of one (token, head). Rotate each moved query projection, renormalize it against the
+        # clean rotated query r0 (the query-norm change, exactly) and store the change in bf16, in one pass. FOLDED:
+        # Raw is the bare moves' projection; the input norm's change is inv * Raw + shift * (clean query).
+        token, head = tl.program_id(1) // H, tl.program_id(1) % H
+        rows = tl.program_id(0) * BP + tl.arange(0, BP)
+        half = tl.arange(0, D // 2)
+        c = tl.load(Cos + token * (D // 2) + half)
+        s = tl.load(Sin + token * (D // 2) + half)
+        r0a = tl.load(R0 + (token * H + head) * D + half)
+        r0b = tl.load(R0 + (token * H + head) * D + D // 2 + half)
+        base = ((token * P + rows[:, None]) * H + head) * D
+        keep = rows[:, None] < P
+        a = tl.load(Raw + base + half[None, :], keep, 0).to(tl.float32)
+        b = tl.load(Raw + base + D // 2 + half[None, :], keep, 0).to(tl.float32)
+        ra = a * c[None, :] + b * s[None, :]
+        rb = -a * s[None, :] + b * c[None, :]
+        if FOLDED:
+            g = tl.load(Inv + token * P + rows, rows < P, 0)[:, None]
+            h = tl.load(Shift + token * P + rows, rows < P, 0)[:, None]
+            ra, rb = ra * g + h * r0a[None, :], rb * g + h * r0b[None, :]
+        sq = tl.sum(r0a * r0a, 0) + tl.sum(r0b * r0b, 0)
+        dots = tl.sum(ra * r0a[None, :], 1) + tl.sum(rb * r0b[None, :], 1)
+        moved = tl.sum(ra * ra, 1) + tl.sum(rb * rb, 1)
+        inv0 = tl.math.rsqrt(sq / D + EPS_)
+        inv = tl.math.rsqrt((sq + 2 * dots + moved) / D + EPS_)
+        shift = (inv - inv0)[:, None]
+        tl.store(Out + base + half[None, :], (ra * inv[:, None] + r0a[None, :] * shift).to(tl.bfloat16), keep)
+        tl.store(Out + base + D // 2 + half[None, :], (rb * inv[:, None] + r0b[None, :] * shift).to(tl.bfloat16), keep)
+    return kernel
+
+
+@torch.library.custom_op("noise_record::moved_query_bf16", mutates_args=())
+def moved_query_bf16(raw: torch.Tensor, r0: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                     inv: Optional[torch.Tensor] = None, shift: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """dq for routed_response from the moved query projections raw (m, P, H, D) and the clean rotated query r0
+    (m, H, D): rotate, renormalize against r0, bf16 (fused_query). With inv and shift (m, P) (fold_norm), raw is the
+    bare moves' projection and the moved projection is inv * raw + shift * (r0 before the rotation)."""
+    import triton
+    m, probes, heads, width = raw.shape
+    out = torch.empty(raw.shape, device=raw.device, dtype=torch.bfloat16)
+    folded = inv is not None
+    moved_query_kernel()[(triton.cdiv(probes, 16), m * heads)](
+        raw.contiguous(), r0.float().contiguous(), cos.float().contiguous(), sin.float().contiguous(),
+        inv.float().contiguous() if folded else raw, shift.float().contiguous() if folded else raw, out,
+        probes, heads, width, 16, EPS, folded, num_warps=4)
+    return out
+
+
+@moved_query_bf16.register_fake
+def _(raw, r0, cos, sin, inv=None, shift=None):
+    return torch.empty(raw.shape, device=raw.device, dtype=torch.bfloat16)
 
 
 def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos, sin):
@@ -589,32 +645,128 @@ def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w
     c, s = cos[pos][:, None, None], sin[pos][:, None, None]
     rotate = lambda u: torch.cat([u[..., :width // 2] * c + u[..., width // 2:] * s,
                                   u[..., :width // 2] * -s + u[..., width // 2:] * c], -1)
-    r0 = rotate((norm(x) @ w_q.T).view(m, 1, heads, width))
-    dr = rotate(move_product(norm_difference(x, delta), w_q.T).view(m, probes, heads, width))
+    q0 = norm(x) @ w_q.T
+    r0 = rotate(q0.view(m, 1, heads, width))
+    if (FUSED_QUERY and CHAIN_ACT_BF16 and delta.dtype == torch.bfloat16 and delta.is_cuda
+            and top_keys.dtype == torch.bfloat16 and width in (32, 64) and top_keys.shape[2] <= 256):
+        if FOLD_NORM:  # the bare moves' projection; the kernel rescales it and adds the clean query's share
+            inv0, inv = norm_inverses(x, delta)
+            raw = (delta.to(torch.bfloat16) @ w_q.T.to(torch.bfloat16)).view(m, probes, heads, width)
+            dq = moved_query_bf16(raw, r0[:, 0], cos[pos], sin[pos], inv, inv / inv0 - 1)
+        else:
+            moved = norm_difference(x, delta).to(torch.bfloat16)
+            raw = (moved @ w_q.T.to(torch.bfloat16)).view(m, probes, heads, width)
+            dq = moved_query_bf16(raw, r0[:, 0], cos[pos], sin[pos])
+        dout = routed_response(dq, top_keys, top_values, top_p, rest)
+        if OWN_PROJECTION_BF16:
+            return (dout.flatten(-2) @ w_proj_t.to(torch.bfloat16)).float()
+        return dout.flatten(-2) @ w_proj_t
+    if FOLD_NORM:
+        dr = rotate(folded_projection(x, delta, w_q.to(torch.bfloat16) if CHAIN_ACT_BF16 else w_q, q0)
+                    .view(m, probes, heads, width))
+    elif CHAIN_ACT_BF16:  # the moved query's input projection on bf16 operands
+        moved = norm_difference(x, delta).to(torch.bfloat16)
+        dr = rotate((moved @ w_q.T.to(torch.bfloat16)).float()
+                    .view(m, probes, heads, width))
+    else:
+        dr = rotate((norm_difference(x, delta) @ w_q.T).view(m, probes, heads, width))
     sq = r0.square().sum(-1, keepdim=True)
     inv0 = torch.rsqrt(sq / width + EPS)
     inv = torch.rsqrt((sq + 2 * (r0 * dr).sum(-1, keepdim=True) + dr.square().sum(-1, keepdim=True)) / width + EPS)
     dq = dr * inv + r0 * (inv - inv0)
-    change = routed_output_change(dq, top_keys, top_values, top_p, rest, MOVE_DTYPE)
-    return move_product(change.flatten(-2), w_proj_t)
-
-
-def routed_output_change(dq, top_keys, top_values, top_p, rest, dtype=torch.float32):
-    """The attention output's finite change [m, P, H, D] when the processed query moves by dq [m, P, H, D] and
-    only its selected key logits move; the held remainder rescales exactly. Returned in dtype, the precision of
-    the product the caller takes next."""
-    width = dq.shape[-1]
     if dq.is_cuda and top_keys.dtype == torch.bfloat16 and width in (32, 64) and top_keys.shape[2] <= 256:
-        return routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest, dtype)
+        dout = routed_response(dq.to(top_keys.dtype), top_keys, top_values, top_p, rest)
+        if OWN_PROJECTION_BF16:  # the held attention output's change through c_proj on bf16 operands
+            return (dout.flatten(-2) @ w_proj_t.to(torch.bfloat16)).float()  # dout is already bf16
+        return dout.flatten(-2) @ w_proj_t
     ds = torch.einsum('mphd,mhkd->mphk', dq.to(top_keys.dtype), top_keys).float() * width ** -0.5
     p = top_p.unsqueeze(1)
     dlse = torch.log1p((p * torch.expm1(ds)).sum(-1, keepdim=True))
     dout = torch.einsum('mphk,mhkd->mphd', (p * torch.expm1(ds - dlse)).to(top_values.dtype), top_values).float()
-    return (dout + torch.expm1(-dlse) * rest.unsqueeze(1)).to(dtype)
+    dout = dout + torch.expm1(-dlse) * rest.unsqueeze(1)
+    return dout.flatten(-2) @ w_proj_t
+
+
+@torch.compile(dynamic=False)
+def norm_input_credit(x, g, sigma, H):
+    """Each token's credit at an RMSNorm's input, from the credit g at its output: central differences of
+    g . norm(x +- s h) along every row h of a full Hadamard cycle (s = sigma * rms(x)), decoded. One finite step through
+    the norm; closed form, since g . norm(x + d) only needs x . h, g . h, g . x and |x|^2."""
+    width = x.shape[-1]
+    sq = x.square().sum(-1, keepdim=True)
+    step = sigma * (sq / width).sqrt().clamp(min=1e-6)
+    xh, gh, gx = x @ H.T, g @ H.T, (g * x).sum(-1, keepdim=True)
+    inv = torch.rsqrt(sq / width + EPS)
+    inv_up = torch.rsqrt((sq + 2 * step * xh + step.square() * width) / width + EPS)
+    inv_down = torch.rsqrt((sq - 2 * step * xh + step.square() * width) / width + EPS)
+    up = step * gh * inv_up + gx * (inv_up - inv)
+    down = -step * gh * inv_down + gx * (inv_down - inv)
+    return ((up - down) / (2 * step)) @ H / width
+
+
+@torch.no_grad()
+@cache
+def moment_matrix_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(W, C, Out, V, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        # One program: a (BM, BN) tile of token t's W^T diag(c_t) W, the scaling applied to W's tiles as they load.
+        rm = tl.program_id(0) * BM + tl.arange(0, BM)
+        rn = tl.program_id(1) * BN + tl.arange(0, BN)
+        t = tl.program_id(2)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, V, BK):
+            k = k0 + tl.arange(0, BK)
+            c = tl.load(C + t * V + k).to(tl.float32)
+            a = (tl.load(W + k[:, None] * D + rm[None, :]).to(tl.float32) * c[:, None]).to(tl.bfloat16)
+            b = tl.load(W + k[:, None] * D + rn[None, :])
+            acc += tl.dot(tl.trans(a), b)
+        tl.store(Out + t * D * D + rm[:, None] * D + rn[None, :], acc.to(tl.bfloat16))
+    return kernel
+
+
+def moment_matrices(w16, c16):
+    """W^T diag(c_t) W per token in bf16 (moment_kernel): w16 (V, D), c16 (T, V), both bf16. The same products as
+    scaling W^T by c_t in bf16 and multiplying, without storing the scaled (T, D, V) copies."""
+    vocab, width = w16.shape
+    assert vocab % 64 == 0 and width % 128 == 0
+    out = torch.empty(len(c16), width, width, device=w16.device, dtype=torch.bfloat16)
+    moment_matrix_kernel()[(width // 128, width // 128, len(c16))](
+        w16.contiguous(), c16.contiguous(), out, vocab, width, 128, 128, 64, num_warps=8, num_stages=3)
+    return out
+
+
+MOMENT_KERNEL = False  # set from Settings.moment_kernel
+
+
+def head_moments(xL, base, weight, block=64):
+    """Per-token moments of the softcapped readout for head_moments: with z0 = base * inv0, f = 15 tanh(z / 15) and
+    p = softmax(f(z0)), the change of log sum exp f(z0 + dz) for dz = a * base + inv * (W delta) is, to second order,
+    lin + a^2 B2 + 2 a inv nu.delta + inv^2 delta^T M delta - lin^2 / 2 with lin = a B1 + inv mu1.delta. Returns
+    (B1, B2, mu1, nu, M), M in bf16 (tokens, width, width)."""
+    width = xL.shape[-1]
+    inv0 = torch.rsqrt(xL.square().sum(-1, keepdim=True) / width + EPS)
+    t = torch.tanh(base * inv0 / 15)
+    f, f1 = 15 * t, 1 - t.square()
+    f2 = -(2 / 15) * t * f1
+    prob = torch.softmax(f, -1)
+    c1, c2 = prob * f1, prob * (f2 + f1.square()) / 2
+    b1, b2 = (c1 * base).sum(-1), (c2 * base.square()).sum(-1)
+    mu1, nu = c1 @ weight, (c2 * base) @ weight
+    w16 = weight.to(torch.bfloat16)
+    if MOMENT_KERNEL and xL.is_cuda:
+        return b1, b2, mu1, nu, moment_matrices(w16, c2.to(torch.bfloat16))
+    second = torch.empty(len(xL), width, width, device=xL.device, dtype=torch.bfloat16)
+    for t0 in range(0, len(xL), block):
+        c = c2[t0:t0 + block].to(torch.bfloat16)
+        second[t0:t0 + block] = torch.matmul(w16.T.unsqueeze(0) * c.unsqueeze(1), w16)
+    return b1, b2, mu1, nu, second
 
 
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
-                      target_logit_w, y, own=None, from_output=False, packed=False):
+                      target_logit_w, y, own=None, from_output=False, packed=False, moments=None):
     """Forward differences of each token's loss along every move of one site, K/V held, MLPs restricted to
     each token's top-k units. site: -1 for the raw embedding, else the block whose mid stream moves. move (m, P, W);
     scale (m, P) the step each difference is divided by; e, x0, xL (m, W); mids per block (m, W); idx, hs per block
@@ -623,8 +775,15 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     own optionally supplies PR #19's own-query responses in every entered attention.
     from_output starts at the block's MLP output instead: skip its MLP, then enter
     the next block through BOTH its residual scaling and its own-query response.
+    move may be (steps (m, 1), rows (P0, W), extra (m, P - P0, W) or None) (fused_moves): the moves steps * rows, then
+    extra, formed here so the compiled graph never stores them in fp32.
     Returns (m, P)."""
     L = len(mids)
+    if isinstance(move, tuple):
+        steps, rows, extra = move
+        move = steps.unsqueeze(-1) * rows.unsqueeze(0)
+        if extra is not None:
+            move = torch.cat([move, extra], 1)
     if site < 0:
         dx0 = norm(e.unsqueeze(1) + move) - x0.unsqueeze(1)
         delta, first = (lam_r[0] + lam_0[0]) * dx0, 0
@@ -638,24 +797,43 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
                 _, pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
                 delta = delta + query_change_routed(inputs[b], delta, pos, w_q[b], top_keys[b], top_values[b],
                                                     top_p[b], rest[b], w_proj_t[b], cos_sin[0], cos_sin[1])
+                if CHAIN_ACT_BF16:
+                    delta = delta.to(torch.bfloat16)
             else:
                 _, pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
                 delta = delta + query_change(inputs[b], delta, pos, rels[b], w_q[b], keys[b], values[b],
                                              w_proj_t[b], cos, sin, windows[b])
-        dz = norm_difference(mids[b], delta)
         fc = w_fc[b] if packed else w_fc[b][idx[b]]
         wo = w_out_t[b] if packed else w_out_t[b][idx[b]]
-        dh = torch.bmm(dz.to(fc.dtype), fc.transpose(1, 2)).float()
+        if FOLD_NORM:  # hs are the clean pre-activations norm(mid) @ fc.T of the selected units
+            dh = folded_projection(mids[b], delta, fc, hs[b])
+        else:
+            dz = norm_difference(mids[b], delta)
+            dh = torch.bmm(dz.to(fc.dtype), fc.transpose(1, 2)).float()
         h = hs[b].unsqueeze(1)
         up, down = F.relu(h + dh), F.relu(h)
-        delta = delta + torch.bmm(((up - down) * (up + down)).to(wo.dtype), wo).float()
+        change = (up - down) * (up + down)
+        delta = delta + torch.bmm(change.to(wo.dtype), wo).float()
+        if CHAIN_ACT_BF16:  # the moved stream's change stored in bf16 between blocks (the head reads it in bf16)
+            delta = delta.to(torch.bfloat16)
     sq = xL.square().sum(-1, keepdim=True)
-    dots = (xL.unsqueeze(1) * delta).sum(-1)  # a fused reduction, not a batched GEMV
-    inv = torch.rsqrt((sq + 2 * dots + delta.square().sum(-1)) / xL.shape[-1] + EPS)
-    z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
+    dots = (delta.float() * xL.unsqueeze(1)).sum(-1) if CHAIN_ACT_BF16 else torch.einsum('md,mpd->mp', xL, delta)
+    inv = torch.rsqrt((sq + 2 * dots + delta.float().square().sum(-1)) / xL.shape[-1] + EPS)
     zy = (base.gather(1, y.clamp(min=0).unsqueeze(1)) + (delta * target_logit_w.unsqueeze(1)).sum(-1)) * inv
-    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
     inv0 = torch.rsqrt(sq / xL.shape[-1] + EPS)
+    if moments is not None:  # the partition function's change to second order in the logit change (head_moments)
+        b1, b2, mu1, nu, second = moments
+        a = inv - inv0
+        d = delta.float()
+        lin = a * b1.unsqueeze(1) + inv * (d * mu1.unsqueeze(1)).sum(-1)
+        quad = (torch.bmm(delta.to(torch.bfloat16), second).float() * d).sum(-1)
+        change = (lin + a.square() * b2.unsqueeze(1) + 2 * a * inv * (d * nu.unsqueeze(1)).sum(-1)
+                  + inv.square() * quad - 0.5 * lin.square())
+        target0 = base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0
+        moved_minus_clean = change - (15 * torch.tanh(zy / 15) - 15 * torch.tanh(target0 / 15))
+        return moved_minus_clean / scale * (y >= 0).unsqueeze(1)
+    z = (base.unsqueeze(1) + (delta.to(torch.bfloat16) @ weight_t).float()) * inv.unsqueeze(-1)
+    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh(zy / 15)
     clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
         base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
     return (moved - clean) / scale * (y >= 0).unsqueeze(1)
@@ -664,20 +842,13 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
 chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
 chain_chunk_own = torch.compile(chain_chunk_eager, dynamic=True)
 KEY_BUCKET = 256
-MOVE_DTYPE = torch.bfloat16  # the own-query move products of the chain replay (Settings.own_query_precision)
-FUTURE_DTYPE = torch.bfloat16  # the future probes' move products (Settings.future_precision)
-MOMENT_DTYPE = torch.bfloat16  # the products forming the quadratic moments (Settings.moment_precision)
-
-
-def moment_product(weights, outer):
-    """weights [H, T(query), T(source)] transposed times outer [H, T(query), F], in MOMENT_DTYPE with an fp32
-    result: the quadratic moments' sums over each source's receiving queries."""
-    return torch.bmm(weights.transpose(1, 2).to(MOMENT_DTYPE), outer.to(MOMENT_DTYPE)).float()
-
-
-def future_linear(move, weight):
-    """F.linear of a future probe's move in FUTURE_DTYPE, with an fp32 result."""
-    return F.linear(move.to(FUTURE_DTYPE), weight.to(FUTURE_DTYPE)).float()
+ASYNC_STEPS = False  # --async-steps: no host synchronization inside an update
+ASYNC_LOG = 50
+ROUTED_ONE_EXP = False  # both set from Settings.chain_fast when a Cut estimator is built
+OWN_PROJECTION_BF16 = False
+CHAIN_ACT_BF16 = False  # set from Settings.chain_act
+FUSED_QUERY = False  # set from Settings.fused_query
+FOLD_NORM = False  # set from Settings.fold_norm
 
 
 @torch.compile(dynamic=False)
@@ -746,24 +917,6 @@ def key_input_prepared_derivatives(x, steps, rows, projected_x, projected_rows, 
     change = A[:, None] * torch.expm1(dl)
     scores = (change / (1 + change) * C[:, None]).sum((0, 2)).T
     return (scores[:, :probes] - scores[:, probes:]) / (2 * steps)
-
-
-def key_moments(qp, A, C):
-    """Degree-2 moments over each source token's queries for keys alone (future_moments with no value change; A
-    holds the queries that see each source, the source's own query included): key_moment_scores is the key
-    kernel's change / (1 + change) * c to third order in the logit change."""
-    dh = qp.shape[-1]
-    ac = A*C
-    mk = torch.einsum('hst,hsd->htd', ac, qp)*dh**-.5
-    qq = (qp[..., :, None]*qp[..., None, :]).flatten(-2)
-    mkk = moment_product(ac*(.5-A), qq).view(*mk.shape, dh)/dh
-    return mk, mkk
-
-
-@torch.compile(dynamic=False)
-def key_moment_scores(dk, mk, mkk):
-    """Summed key scores [H, P, M] of key changes dk [H, P, M, D] from the moments of their tokens M."""
-    return (torch.einsum('hpmd,hmde->hpme', dk, mkk)*dk+dk*mk[:, None]).sum(-1)
 
 
 @torch.compile(dynamic=False)
@@ -835,10 +988,10 @@ class Capture:
         finally:
             self.capturing = False
         with torch.autocast(self.device.type, dtype=self.dtype, enabled=self.device.type == 'cuda'):
-            # Track 3: the embedding is wte + n-grams, recomputed as the forward did; every embedding probe
-            # moves that sum
-            self.outputs['transformer.wte'] = self.model.embed(x)
             self.x0 = norm(self.outputs['transformer.wte'])
+        if self.model.config.ngram_rows:  # the value embedding every rerun reads: the table's row plus the n-gram's
+            for i in self.model.value_embeds:
+                self.outputs[f'value_embeds.{i}'] = self.outputs[f'value_embeds.{i}'] + self.outputs[f'ngram_proj.{i}']
 
     def head_error(self, sigma=0.1):
         raw = self.outputs['lm_head'][..., :self.model.config.vocab_size]
@@ -852,25 +1005,6 @@ class Capture:
             weight_error = torch.zeros_like(module.weight, dtype=torch.float32)
             return weight_error.index_add_(0, x.reshape(-1), error.reshape(-1, error.shape[-1]))
         return torch.einsum('btd,bti->di', error, x)
-
-    def embedding_gradients(self, gradients, credit, sequence=None):
-        """Add the gradients of everything summed into the embedding, from the credit there ([batch, token,
-        width], or sequence `sequence`'s [token, width]): token and n-gram rows index it. Neither takes a step
-        through a nonlinearity."""
-        def inputs(site):
-            return self.inputs[site] if sequence is None else self.inputs[site][sequence]
-
-        def grad(site):
-            if site + '.weight' not in gradients:
-                gradients[site + '.weight'] = torch.zeros_like(self.modules[site].weight, dtype=torch.float32)
-            return gradients[site + '.weight']
-
-        credit = credit.reshape(-1, credit.shape[-1]).float()
-        grad('transformer.wte').index_add_(0, inputs('transformer.wte').reshape(-1), credit)
-        if 'ngram.table' in self.inputs:  # each order's heads hold the width side by side
-            ids = inputs('ngram.table').reshape(credit.shape[0], -1)
-            error = credit.unsqueeze(1).expand(-1, self.model.ngram.orders, -1)
-            grad('ngram.table').index_add_(0, ids.reshape(-1), error.reshape(ids.numel(), -1))
 
 class Boost:
     """Phase 1: stagewise credit, each sub-block against the shared head reading the stream right after it."""
@@ -1052,8 +1186,9 @@ class Boost:
         qp, kp = unit(rot(q_raw)), unit(rot(k_raw))
         logits = (qp @ kp.transpose(1, 2)) / hd**.5
         A = torch.softmax(logits.masked_fill(allowed == 0, float('-inf')), -1)
+        out = A @ values
         hub = target[sequence].view(t, h, hd).transpose(0, 1)
-        C = (hub @ values.transpose(1, 2) - (hub * (A @ values)).sum(-1, keepdim=True)) * allowed
+        C = (hub @ values.transpose(1, 2) - (hub * out).sum(-1, keepdim=True)) * allowed
         return qp, kp, k_raw, cos, sin, A, C
 
     def exact_key_errors(self, targets, layers=None):
@@ -1072,9 +1207,8 @@ class Boost:
             errors[prefix + 'c_k'] = credit_all.permute(0, 2, 1, 3).reshape(b, t, h * hd)
         return errors
 
-    def key_errors_from_context(self, layer, context, moments=None):
-        """Raw-K finite experiments, sharing the input-K context and skipping masked query blocks; with key
-        moments (mk, mkk) of the context, scored by them as the input-K probes are."""
+    def key_errors_from_context(self, layer, context):
+        """Raw-K finite experiments, sharing the input-K context and skipping masked query blocks."""
         qp, kp, raw, cos, sin, A, C = context
         h, t, hd = raw.shape
         lo, hi = self.share(hd)
@@ -1085,12 +1219,6 @@ class Boost:
             t1 = min(t0 + KEY_BUCKET, t)
             q1 = min(t, t1 + self.model.window_sizes[layer][0])
             source, query = slice(t0, t1), slice(t0, q1)
-            if moments is not None:
-                moves = raw_key_moves(kp[:, source], raw[:, source], steps[:, source], cos[source], sin[source],
-                                      eye[lo:hi])
-                scored = key_moment_scores(moves, moments[0][:, source], moments[1][:, source])
-                result[:, source, lo:hi] = scored.transpose(1, 2) / steps[:, source]
-                continue
             if raw.is_cuda and hd in (32, 64):
                 moves = raw_key_moves(kp[:, source], raw[:, source], steps[:, source],
                                       cos[source], sin[source], eye[lo:hi])
@@ -1162,14 +1290,21 @@ class Boost:
             raw = None if raw_values is None else raw_values[i]
             errors.update({site: error / self.split
                            for site, error in self.exact_values(i, target, value_target, raw).items()})
+        cfg = self.model.config
+        ngram_error = torch.zeros(b, t, cfg.ngram_dim, device=self.device) if cfg.ngram_rows else None
         for site, error in errors.items():
             gradients[site + '.weight'] = d.reassemble(site, error)
             if site.endswith('attn.c_v'):
                 i = int(site.split('.')[2])
-                if has_ve(i, self.model.config.n_layer):
+                if has_ve(i, cfg.n_layer):
                     gate = 2 * torch.sigmoid(d.outputs[f'transformer.h.{i}.attn.ve_gate'].float())
                     ve_error = (error.view(b, t, gate.shape[-1], -1) * gate.unsqueeze(-1)).view(b, t, -1)
                     gradients[f'value_embeds.{i}.weight'] = d.reassemble(f'value_embeds.{i}', ve_error)
+                    if cfg.ngram_rows:  # the value embedding's error reaches the projection and the rows linearly
+                        gradients[f'ngram_proj.{i}.weight'] = d.reassemble(f'ngram_proj.{i}', ve_error)
+                        ngram_error += ve_error @ self.model.ngram_proj[str(i)].weight.float()
+        for n in cfg.ngram_orders if cfg.ngram_rows else ():
+            gradients[f'ngram_embeds.{n}.weight'] = d.reassemble(f'ngram_embeds.{n}', ngram_error)
 
     @torch.no_grad()
     def estimate(self, x, y):
@@ -1215,7 +1350,7 @@ class Boost:
         self.internals(gradients, targets, b, t)
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         emb = self.embedding_block0(e, yf.view(b, t), x)
-        d.embedding_gradients(gradients, emb.view(b, t, self.width))
+        gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', emb.view(b, t, self.width))
         scalars = torch.zeros(2, L, device=self.device)
         step = s.scalar_step
         for i in range(self.part, L, self.split):
@@ -1246,7 +1381,9 @@ class Boost:
         if self.world > 1:
             torch.distributed.all_reduce(flat)
         flat /= sequences
-        if not bool(torch.isfinite(flat).all()):
+        if ASYNC_STEPS:  # checked when the training loop next synchronizes
+            self.nonfinite = (~torch.isfinite(flat)).any() | getattr(self, 'nonfinite', False)
+        elif not bool(torch.isfinite(flat).all()):
             raise FloatingPointError('Non-finite estimate')
         offset = 0
         for name, p in params:
@@ -1254,12 +1391,19 @@ class Boost:
             offset += p.numel()
         optimizer.step()
         self.maps.clear()
-        return average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1)).item()
+        loss = average_ranks(self.capture.clean_loss[y != -1].mean().reshape(1))
+        return loss if ASYNC_STEPS else loss.item()
 
 class Cut(Boost):
     """Own-query forward loss probes, optionally augmented by PR #23's value path."""
 
     def __init__(self, model, settings, seed, rank, world, split=1, group=None):
+        global ROUTED_ONE_EXP, OWN_PROJECTION_BF16, CHAIN_ACT_BF16, FUSED_QUERY, FOLD_NORM, MOMENT_KERNEL
+        ROUTED_ONE_EXP = OWN_PROJECTION_BF16 = settings.chain_fast
+        CHAIN_ACT_BF16 = settings.chain_act == 'bf16'
+        FUSED_QUERY = settings.fused_query
+        FOLD_NORM = settings.fold_norm
+        MOMENT_KERNEL = settings.moment_kernel
         # split > 1: the GPUs of a sequence each take a share of every cycle of moves and draws
         super().__init__(model, settings, seed, rank, world, split=split, group=group)
 
@@ -1309,9 +1453,7 @@ class Cut(Boost):
             for r in range(d.batch):
                 context = self.key_context(i, r, target)
                 qp, _, raw, cos, sin, A, C = context
-                moments = key_moments(qp, A, C) if s.key_moments and self.device.type == 'cuda' else None
-                raw_credit[r] = self.key_errors_from_context(
-                    i, context, moments if s.raw_key_moments else None).transpose(0, 1).reshape(d.length, self.width)
+                raw_credit[r] = self.key_errors_from_context(i, context).transpose(0, 1).reshape(d.length, self.width)
                 xin = d.blocks[i][r].float()
                 projected_x = xin @ w_key.T
                 steps = s.key_path_sigma * xin.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
@@ -1326,19 +1468,10 @@ class Cut(Boost):
                     if xin.is_cuda and raw.shape[-1] in (32, 64):
                         # All directions share a source tile. The fused scorer
                         # reduces query tiles without writing H*P*Q*M intermediates.
-                        if moments is not None and s.key_fused:
-                            scores = fused_key_moment_scores(xin[sl], steps[sl], rows, projected_x[sl],
-                                                             projected_rows, raw[:, sl], cos[sl], sin[sl],
-                                                             moments[0][:, sl], moments[1][:, sl])
-                            estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
-                            continue
                         moves = prepared_key_moves(xin[sl], steps[sl], rows, projected_x[sl],
                                                    projected_rows, raw[:, sl], cos[sl], sin[sl])
-                        if moments is not None:
-                            scores = key_moment_scores(moves, moments[0][:, sl], moments[1][:, sl])
-                        else:
-                            scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
-                                                        t0, qs.start, self.model.window_sizes[i][0])
+                        scores = fused_key_response(qp[:, qs], moves, A[:, qs, sl], C[:, qs, sl],
+                                                    t0, qs.start, self.model.window_sizes[i][0])
                         estimate[r, sl] = decode_key_pairs(scores, steps[sl], rows) * (len(rows) / total_rows)
                         continue
                     derivatives = torch.empty(len(xin[sl]), len(rows), device=self.device)
@@ -1429,14 +1562,17 @@ class Cut(Boost):
         xL = outs[-1]
         base = xL @ weight.T
         target_w = weight[y.clamp(min=0)]
+        moments = head_moments(xL, base, weight) if s.head_moments else None
         n, m, h = e.shape[0], s.chain_tokens, s.scalar_step
         # Draw bases in the original site order. Replay one sequence at a time
         # so routed K/V storage does not grow with the per-GPU batch size.
         probes = []
-        lo, hi = self.share(self.width)  # this GPU's share of each cycle; the scalar moves on the first GPU
+        lo, hi = self.share(self.width)  # this GPU's share of each root's moves; the scalar moves on the first GPU
         P, scalars_here = hi - lo, self.part == 0
         for site in range(-1, L):
             H = self.basis()[lo:hi]
+            if site < 0 and s.emb_credit == 'mid0':  # the embedding's credit comes from block 0's instead (below)
+                continue
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
             credit = torch.empty(n, self.width, device=self.device)
@@ -1449,8 +1585,6 @@ class Cut(Boost):
                 own = self.own_query_inputs(start // length)
                 if s.query_keys:
                     own = self.strong_keys(own, s.query_keys)
-                    if s.future_routed:
-                        self.routed[start // length] = own
             for t0 in range(start, start + length, m):
                 t1 = min(t0 + m, start + length)
                 sl = slice(t0, t1)
@@ -1469,18 +1603,21 @@ class Cut(Boost):
                 selected_fc = [w[r[0][sl]] for w, r in zip(w_fc, routes)]
                 selected_out = [w[r[0][sl]] for w, r in zip(w_out_t, routes)]
                 for site, H, steps, credit, lam in probes:
-                    move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
+                    move = None if s.fused_moves else steps[sl].unsqueeze(-1) * H.unsqueeze(0)
+                    extra = None
                     scale = steps[sl].expand(-1, P)
                     if site >= 0 and scalars_here:  # symmetric probes of both linear mixing scalars
                         prev = (x0 if site == 0 else outs[site - 1])[sl].unsqueeze(1)
-                        move = torch.cat([move, h * prev, h * x0[sl].unsqueeze(1),
-                                          -h * prev, -h * x0[sl].unsqueeze(1)], 1)
+                        extra = torch.cat([h * prev, h * x0[sl].unsqueeze(1), -h * prev, -h * x0[sl].unsqueeze(1)], 1)
+                        if move is not None:
+                            move = torch.cat([move, extra], 1)
                         scale = torch.cat([scale, torch.full_like(scale[:, :2], h),
                                            torch.full_like(scale[:, :2], -h)], 1)
                     derivative = kernel(
-                        site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
+                        site, move if move is not None else (steps[sl], H, extra), scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                         [r[1][sl] for r in routes], lam_r, lam_0, selected_fc, selected_out, weight_t,
-                        base[sl], target_w[sl], y[sl], own_sl, packed=True)
+                        base[sl], target_w[sl], y[sl], own_sl, packed=True,
+                        moments=None if moments is None else tuple(z[sl] for z in moments))
                     credit[sl] = derivative[:, :P] @ H / self.width
                     if site >= 0 and scalars_here:
                         lam += (derivative[:, P:P + 2] + derivative[:, P + 2:]).sum(0) / 2
@@ -1493,6 +1630,9 @@ class Cut(Boost):
             credits['emb' if site < 0 else site] = self.group_sum(credit)
             if site >= 0:
                 credits['lam', site] = self.group_sum(lam)
+        if s.emb_credit == 'mid0':  # block 0's measured credit, back along its residual, one step through the norm
+            credits['emb'] = norm_input_credit(e, (lam_r[0] + lam_0[0]) * credits[0], s.chain_sigma,
+                                               hadamard(self.width, self.device, torch.float32))
         return credits
 
     def own_query_inputs(self, sequence=0):
@@ -1512,10 +1652,11 @@ class Cut(Boost):
             if block.attn.ve_gate is not None:
                 gate = 2 * torch.sigmoid(d.outputs[prefix + 've_gate'][sequence].float().view(length, heads, 1))
                 v = v + gate * d.outputs[f'value_embeds.{i}'][sequence].float().view(length, heads, width)
+            k, v = k.transpose(0, 1), v.transpose(0, 1)
             inputs.append(d.blocks[i][sequence].float())
             w_q.append(block.attn.c_q.weight.float())
-            keys.append(k.transpose(0, 1).to(torch.bfloat16).contiguous())
-            values.append(v.transpose(0, 1).to(torch.bfloat16).contiguous())
+            keys.append(k.to(torch.bfloat16).contiguous())
+            values.append(v.to(torch.bfloat16).contiguous())
             w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
             windows.append(model.window_sizes[i][0])
         return (torch.arange(length, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
@@ -1534,8 +1675,8 @@ class Cut(Boost):
                                 r[..., :width // 2] * -s + r[..., width // 2:] * c], -1))
             lag = pos[:, None] - pos[None]
             allowed = (lag >= 0) & (lag <= window)
-            prob = torch.softmax((torch.einsum('thd,hsd->hts', q.to(kk.dtype), kk).float() * width ** -0.5)
-                                 .masked_fill(~allowed, float('-inf')), -1)
+            logits = torch.einsum('thd,hsd->hts', q.to(kk.dtype), kk).float() * width ** -0.5
+            prob = torch.softmax(logits.masked_fill(~allowed, float('-inf')), -1)
             p, idx = prob.topk(min(k, length), dim=-1)
             gather = lambda z: z.unsqueeze(1).expand(-1, length, -1, -1).gather(
                 2, idx.unsqueeze(-1).expand(-1, -1, -1, width))
@@ -1552,7 +1693,7 @@ class Cut(Boost):
     def own_query_window(own, t0, t1):
         """Slice clean context windows, with the same 256-token buckets as PR #19."""
         pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
-        total = keys[0].shape[1]
+        total = len(pos)
         rels, ks, vs = [], [], []
         for k, v, window in zip(keys, values, windows):
             need = t1 - max(0, t0 - window)
@@ -1575,11 +1716,6 @@ class Cut(Boost):
         self.maps.clear()
         self._input_key_errors = None
         self.measured = {}  # Last step's diagnostic credits are not inputs to this estimate.
-        self.routed = {}  # chain_credits' routed own-query contexts, reused by the future probes
-        global MOVE_DTYPE, FUTURE_DTYPE, MOMENT_DTYPE  # read by the compiled replays and the moments
-        MOVE_DTYPE = torch.bfloat16 if s.own_query_precision == 'bf16' else torch.float32
-        FUTURE_DTYPE = torch.bfloat16 if s.future_precision == 'bf16' else torch.float32
-        MOMENT_DTYPE = torch.bfloat16 if s.moment_precision == 'bf16' else torch.float32
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1592,16 +1728,18 @@ class Cut(Boost):
         mids, outs, routes = [], [], []
         for i in range(L):
             p = f'transformer.h.{i}.'
-            mid = d.blocks[i].float().flatten(0, 1) + d.outputs[p + 'attn.c_proj'].float().flatten(0, 1)
+            xin = d.blocks[i].float().flatten(0, 1)
+            mid = xin + d.outputs[p + 'attn.c_proj'].float().flatten(0, 1)  # what the MLP reads: the block's chain root
             mlp = model.transformer.h[i].mlp
             hpre = F.linear(norm(mid), mlp.c_fc.weight.float())
             r = F.relu(hpre).square()
-            out = mid + F.linear(r, mlp.c_proj.weight.float())
             top = self.select_mlp_routes(i, mid, hpre, r)
+            out = mid + F.linear(r, mlp.c_proj.weight.float())
             mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
         g_top = self.probe(outs[-1], yf)  # the top stream's credit, through the head alone
         chain = self.chain_credits(e, x0, mids, outs, routes, yf)
         lam_r = model.resid_lambdas.float()
+        outputs = {i: g_top if i == L - 1 else lam_r[i + 1] * chain[i + 1] for i in range(L)}  # block output credits
         targets = {i: (chain[i] @ block.attn.c_proj.weight.float()).view(b, t, self.width)
                    for i, block in enumerate(model.transformer.h)}
         # Reuse only directly measured hub credit, scoped to this capture.
@@ -1613,11 +1751,7 @@ class Cut(Boost):
         for i in range(L):
             p = f'transformer.h.{i}.'
             block = model.transformer.h[i]
-            d_mid = chain[i]
-            if i == L - 1:
-                d_out = g_top
-            else:
-                d_out = lam_r[i + 1] * chain[i + 1]
+            d_mid, d_out = chain[i], outputs[i]
             x_mid, x_out = (d_mid, d_out) if extra is None else (d_mid + extra[i], d_out + extra[i])
             gradients[p + 'attn.c_proj.weight'] = x_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
             gradients[p + 'mlp.c_proj.weight'] = x_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
@@ -1633,7 +1767,8 @@ class Cut(Boost):
         self.measured = dict(chain=chain, g_top=g_top, targets=targets)
         self.internals(gradients, targets, b, t, value_targets or None, self._input_key_errors, raw_values)
         self._input_key_errors = None
-        d.embedding_gradients(gradients, chain['emb'].view(b, t, self.width))
+        emb = chain['emb'].view(b, t, self.width)
+        gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', emb)
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
         for name, p in model.named_parameters():
             if name not in gradients:
@@ -1642,8 +1777,7 @@ class Cut(Boost):
             # internals split or average their own: keys share dims, queries share draws, hidden units share units)
             for name in list(gradients):
                 if name == 'lm_head.weight' or name.endswith('c_proj.weight') or name in (
-                        'transformer.wte.weight', 'ngram.table.weight', 'resid_lambdas',
-                        'x0_lambdas'):
+                        'transformer.wte.weight', 'resid_lambdas', 'x0_lambdas'):
                     gradients[name] = torch.zeros_like(gradients[name])
         if s.future_draws:
             # Use this capture's original measured hub targets, never corrected
@@ -1653,9 +1787,6 @@ class Cut(Boost):
 
 
 # -------------------------------------------------------------------------------------------------- future probes
-
-
-SCORE_COLUMNS = 32  # Smaller tiles avoid shared-memory/occupancy pressure on RTX 5090.
 
 
 def norm_delta(x, delta):
@@ -1719,88 +1850,66 @@ def score_kernel():
                GH: tl.constexpr, GT: tl.constexpr, GD: tl.constexpr,
                AH: tl.constexpr, AT: tl.constexpr, AM: tl.constexpr,
                CH: tl.constexpr, CT: tl.constexpr, CM: tl.constexpr,
-               Start, Window: tl.constexpr, BC: tl.constexpr, BQ: tl.constexpr):
-        head = tl.program_id(1)
-        col = tl.program_id(0)*BC+tl.arange(0, BC)
-        source = col % M
+               Start, Window: tl.constexpr, BP: tl.constexpr, BM: tl.constexpr, BQ: tl.constexpr,
+               PREC: tl.constexpr):
+        # One program: one head, BP probes x BM sources. The attention and contrast tiles depend only on (query,
+        # source): load each once per query tile and broadcast it over the probes.
+        head = tl.program_id(2)
+        probe = tl.program_id(1)*BP+tl.arange(0, BP)
+        source = tl.program_id(0)*BM+tl.arange(0, BM)
+        col = (probe[:, None]*M+source[None, :]).reshape(BP*BM)
+        live = ((probe[:, None] < P) & (source[None, :] < M)).reshape(BP*BM)
         features = tl.arange(0, D)
         offsets = (head*P*M+col[None, :])*D+features[:, None]
-        dk = tl.load(DK+offsets, col[None, :]<P*M, 0)
-        dv = tl.load(DV+offsets, col[None, :]<P*M, 0)
-        first = (Start+tl.min(source, 0))//BQ*BQ
-        last = tl.minimum(T, Start+tl.max(source, 0)+Window+1)
-        result = tl.full((BC,), 0, tl.float32)
+        dk = tl.load(DK+offsets, live[None, :], 0)
+        dv = tl.load(DV+offsets, live[None, :], 0)
+        s0 = tl.program_id(0)*BM
+        first = (Start+s0)//BQ*BQ
+        last = tl.minimum(T, Start+s0+BM+Window)
+        result = tl.full((BP*BM,), 0, tl.float32)
         for start in range(first, last, BQ):
             query = start+tl.arange(0, BQ)
-            q = tl.load(Q+head*QH+query[:, None]*QT+features[None, :]*QD,
-                        query[:, None]<T, 0)
-            g = tl.load(G+head*GH+query[:, None]*GT+features[None, :]*GD,
-                        query[:, None]<T, 0)
-            ds = tl.dot(q, dk, input_precision="tf32x3")*(D**-.5)
-            vs = tl.dot(g, dv, input_precision="tf32x3")
-            valid = (query[:, None]<T)&(col[None, :]<P*M)
-            a = tl.load(A+head*AH+query[:, None]*AT+source[None, :]*AM, valid, 0)
-            c = tl.load(C+head*CH+query[:, None]*CT+source[None, :]*CM, valid, 0)
+            q = tl.load(Q+head*QH+query[:, None]*QT+features[None, :]*QD, query[:, None] < T, 0)
+            g = tl.load(G+head*GH+query[:, None]*GT+features[None, :]*GD, query[:, None] < T, 0)
+            ds = tl.dot(q, dk, input_precision=PREC)*(D**-.5)
+            vs = tl.dot(g, dv, input_precision=PREC)
+            rel = query[:, None]-Start-source[None, :]
+            keep = (query[:, None] < T) & (source[None, :] < M) & (rel > 0) & (rel <= Window)
+            a = tl.load(A+head*AH+query[:, None]*AT+source[None, :]*AM, keep, 0)
+            c = tl.load(C+head*CH+query[:, None]*CT+source[None, :]*CM, keep, 0)
+            a = tl.broadcast_to(a[:, None, :], (BQ, BP, BM)).reshape(BQ, BP*BM)
+            c = tl.broadcast_to(c[:, None, :], (BQ, BP, BM)).reshape(BQ, BP*BM)
             changed = a*libdevice.expm1(ds)
-            allowed = (query[:, None]>Start+source[None, :])&(
-                query[:, None]-Start-source[None, :]<=Window)
-            response = (changed*c+(a+changed)*vs)/(1+changed)
-            result += tl.sum(tl.where(valid&allowed, response, 0), 0)
-        tl.store(Out+head*P*M+col, result, col<P*M)
+            result += tl.sum((changed*c+(a+changed)*vs)/(1+changed), 0)  # a = 0 outside the window
+        tl.store(Out+head*P*M+col, result, live)
 
     return kernel
+
+
+SCORE_PROBES, SCORE_SOURCES, SCORE_QUERIES = 4, 16, 64
 
 
 @torch.library.custom_op("noise_record::future_scores", mutates_args=())
 def fused_scores(q: torch.Tensor, target: torch.Tensor, dk: torch.Tensor, dv: torch.Tensor,
                  a: torch.Tensor, contrast: torch.Tensor, source_start: int,
-                 window: int) -> torch.Tensor:
+                 window: int, precision: str) -> torch.Tensor:
     if not q.is_cuda:
         return joint_scores(q, target, dk, dv, a, contrast, source_start, window)
     import triton
     h, p, m, d = dk.shape
     out = torch.empty((h, p, m), device=q.device, dtype=torch.float32)
-    score_kernel()[(triton.cdiv(p*m, SCORE_COLUMNS), h)](
+    score_kernel()[(triton.cdiv(m, SCORE_SOURCES), triton.cdiv(p, SCORE_PROBES), h)](
         q, target, dk.contiguous(), dv.contiguous(), a, contrast, out,
         q.shape[1], m, p, d, *q.stride(), *target.stride(),
-        *a.stride(), *contrast.stride(), source_start, window, SCORE_COLUMNS, 64,
-        num_warps=4, num_stages=1, enable_fp_fusion=False)
+        *a.stride(), *contrast.stride(), source_start, window, SCORE_PROBES, SCORE_SOURCES, SCORE_QUERIES,
+        precision, num_warps=4, num_stages=2, enable_fp_fusion=False)
     return out
 
 
 @fused_scores.register_fake
-def _(q, target, dk, dv, a, contrast, source_start, window):
+def _(q, target, dk, dv, a, contrast, source_start, window, precision):
     return torch.empty(dk.shape[:-1], device=q.device,
                        dtype=torch.float32 if q.is_cuda else q.dtype)
-
-
-def future_moments(q, target, a, contrast, window):
-    """Degree-2 moments over each source token's receiving queries (one layer, all heads), so that moment_scores
-    gives joint_scores' exact single-column update to third order in the change, for every direction at once.
-
-    With u = q_s.dk / sqrt(D), w = target_s.dv and changed = a (e^u - 1), the update
-    (changed c + (a + changed) w) / (1 + changed) = a c u + (a c / 2 - a^2 c) u^2 + a w + (a - a^2) u w + O(3),
-    so its sum over the queries s is linear and quadratic forms in (dk, dv) with per-source moments: the
-    construction of the merged track 2 kernels (#29), here over the future probes' receivers.
-    """
-    h, t, dh = q.shape
-    s = torch.arange(t, device=q.device)
-    lag = s[:, None]-s[None, :]
-    a = a*((lag > 0) & (lag <= window))  # [head, query, source], the queries that see the source
-    ac = a*contrast
-    mk = torch.einsum('hst,hsd->htd', ac, q)*dh**-.5
-    mv = torch.einsum('hst,hsd->htd', a, target)
-    qq = (q[..., :, None]*q[..., None, :]).flatten(-2)
-    qg = (q[..., :, None]*target[..., None, :]).flatten(-2)
-    mkk = moment_product(ac*(.5-a), qq).view(h, t, dh, dh)/dh
-    mkv = moment_product(a-a*a, qg).view(h, t, dh, dh)*dh**-.5
-    return mk, mv, mkk, mkv
-
-
-def moment_scores(dk, dv, mk, mv, mkk, mkv):
-    """Summed future scores [P, M] of key and value changes [H, P, M, D] from the moments of their tokens M."""
-    quadratic = torch.einsum('hpmd,hmde->hpme', dk, mkk)*dk+torch.einsum('hpmd,hmde->hpme', dk, mkv)*dv
-    return (quadratic+dk*mk[:, None]+dv*mv[:, None]).sum((0, 3))
 
 
 def signed_hidden_moves(raw, directions, step, weight):
@@ -1813,8 +1922,8 @@ def signed_hidden_moves(raw, directions, step, weight):
     plus, minus = (raw+step).relu(), (raw-step).relu()
     dp, dm = (plus-base)*(plus+base), (minus-base)*(minus+base)
     odd, even = (dp-dm)*.5, (dp+dm)*.5
-    moved = future_linear(directions*odd[:, None], weight)
-    center = future_linear(even, weight)[:, None]
+    moved = F.linear(directions*odd[:, None], weight)
+    center = F.linear(even, weight)[:, None]
     return torch.cat((center+moved, center-moved), 1)
 
 
@@ -1905,10 +2014,10 @@ def mlp_output_moves(mid, move, hidden, w_fc, w_out):
     anchors K/V. This uses finite forward responses, including ReLU crossings.
     The incoming attention/residual move remains part of the block output.
     """
-    dh = future_linear(norm_delta(mid[:, None], move), w_fc)
+    dh = F.linear(norm_delta(mid[:, None], move), w_fc)
     base = hidden[:, None].relu()
     moved = (hidden[:, None] + dh).relu()
-    return move + future_linear((moved-base)*(moved+base), w_out)
+    return move + F.linear((moved-base)*(moved+base), w_out)
 
 
 compiled_hidden = torch.compile(signed_hidden_moves, dynamic=False)
@@ -1918,196 +2027,9 @@ compiled_query = torch.compile(streamed_query_moves, dynamic=False)
 
 @torch.compile(dynamic=True)
 def receiver_scores(move, coefficient, x, kraw, gate, ve, wkv, wg, cos, sin,
-                    q, target, a, contrast, start, window):
+                    q, target, a, contrast, start, window, precision):
     dk, dv = receiver_changes(x, move*coefficient, kraw, gate, ve, wkv, wg, cos, sin)
-    return fused_scores(q, target, dk, dv, a, contrast, start, window).sum(0).T
-
-
-@torch.compile(dynamic=True)
-def receiver_moment_scores(move, coefficient, x, kraw, gate, ve, wkv, wg, cos, sin, mk, mv, mkk, mkv):
-    dk, dv = receiver_changes(x, move*coefficient, kraw, gate, ve, wkv, wg, cos, sin)
-    return moment_scores(dk, dv, mk, mv, mkk, mkv).T
-
-
-@torch.compile(dynamic=False)
-def stacked_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, mk, mv, mkk, mkv):
-    """receiver_moment_scores summed over every receiver of one source chunk, with one projection of the move for
-    all of them: norm_delta(x_j, c_j move) = c_j inv'_j move + (inv'_j - inv_j) x_j, so its K/V products are
-    c_j inv'_j (move W_kv,j) + (inv'_j - inv_j) (x_j W_kv,j). Stacked per receiver j: coeffs [J], x [J, m, W],
-    kraw [J, m, H, hd], wkv [J, 2W, W], gate [J, m, H], ve [J, m, H, hd], wg [J, H, G] (zeros for blocks without
-    value embeddings, whose gate change is then zero), moments [J, H, m, ...]. Returns [m, P]."""
-    J, m, width = x.shape
-    p = move.shape[1]
-    heads, hd = kraw.shape[-2:]
-    eps = torch.finfo(x.dtype).eps
-    c = coeffs[:, None, None]
-    square = x.square().sum(-1)[..., None]  # [J, m, 1]
-    inv = torch.rsqrt(square/width+eps)
-    moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
-    proj = torch.einsum('mpw,jow->jmpo', move.to(FUTURE_DTYPE), wkv.to(FUTURE_DTYPE))  # read once, in its dtype
-    xproj = torch.einsum('jmw,jow->jmo', x, wkv)[:, :, None]
-    dproj = ((c*moved)[..., None]*proj+(moved-inv)[..., None]*xproj).view(J, m, p, 2, heads, hd)
-    cc, ss = cos[None, :, None, None], sin[None, :, None, None]
-    dk = norm_delta(rotate(kraw[:, :, None], cc, ss), rotate(dproj[:, :, :, 0], cc, ss))  # [J, m, P, H, hd]
-    g = wg.shape[-1]
-    dn = (c*moved)[..., None]*move[None, ..., :g]+(moved-inv)[..., None]*x[:, :, None, :g]
-    dg = torch.einsum('jmpg,jhg->jmph', dn, wg)
-    dv = dproj[:, :, :, 1]+(2*((gate[:, :, None]+dg).sigmoid()-gate[:, :, None].sigmoid()))[..., None]*ve[:, :, None]
-    quadratic = (torch.einsum('jmphd,jhmde->jmphe', dk, mkk)*dk+torch.einsum('jmphd,jhmde->jmphe', dk, mkv)*dv)
-    linear = dk*mk.transpose(1, 2)[:, :, None]+dv*mv.transpose(1, 2)[:, :, None]
-    return (quadratic+linear).sum((0, 3, 4))
-
-
-@cache
-def receiver_moment_kernel():
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def kernel(Proj, XProj, A, B, Kraw, Cos, Sin, Gate, Ve, Mk, Mv, Mkk, Mkv, Out,
-               M: tl.constexpr, P: tl.constexpr, H: tl.constexpr, D: tl.constexpr, BP: tl.constexpr,
-               EPS: tl.constexpr, PJ: tl.constexpr, PT: tl.constexpr, PPROBE: tl.constexpr, XROW: tl.constexpr,
-               VALUES: tl.constexpr, VJ, VH, QJ, QH):
-        # Proj strides PJ, PT, PPROBE per receiver, token and probe (PT 0: every token shares the probes'
-        # products); VALUES False: keys alone (no V, gate or V moments). Moments are strided views: VJ, VH (QJ, QH)
-        # the receiver and head strides of the vectors (matrices), tokens D (D * D) apart.
-        token, jh = tl.program_id(0), tl.program_id(1)
-        j, head = jh // H, jh % H
-        row = j * M + token  # (receiver, token)
-        d = tl.arange(0, D)
-        partner = (d + D // 2) % D  # rotate(u) = u cos + u[partner] sin, the sine signed by half
-        cos = tl.load(Cos + token * (D // 2) + d % (D // 2))
-        sin = tl.load(Sin + token * (D // 2) + d % (D // 2)) * tl.where(d < D // 2, 1.0, -1.0)
-        kraw = Kraw + (row * H + head) * D
-        r0 = tl.load(kraw + d) * cos + tl.load(kraw + partner) * sin
-        square = tl.sum(r0 * r0, 0)
-        inv0 = tl.rsqrt(square / D + EPS)
-        xproj = XProj + row * XROW + head * D
-        xk, xk_partner = tl.load(xproj + d), tl.load(xproj + partner)
-        vector = j * VJ + head * VH + token * D
-        matrix = j * QJ + head * QH + token * D * D + d[:, None] * D + d[None, :]
-        mk = tl.load(Mk + vector + d)
-        mkk = tl.load(Mkk + matrix)
-        if VALUES:
-            xv = tl.load(xproj + H * D + d)
-            ve = tl.load(Ve + (row * H + head) * D + d)
-            mv = tl.load(Mv + vector + d)
-            mkv = tl.load(Mkv + matrix)
-        for p0 in range(0, P, BP):
-            probe = p0 + tl.arange(0, BP)
-            valid = probe < P
-            a = tl.load(A + row * P + probe, valid, 0)[:, None]
-            b = tl.load(B + row * P + probe, valid, 0)[:, None]
-            proj = Proj + j * PJ + token * PT + probe[:, None] * PPROBE + head * D
-            k = a * tl.load(proj + d[None, :], valid[:, None], 0).to(tl.float32) + b * xk[None, :]
-            k_partner = a * tl.load(proj + partner[None, :], valid[:, None], 0).to(tl.float32) + b * xk_partner[None, :]
-            dr = k * cos[None, :] + k_partner * sin[None, :]
-            moved = tl.rsqrt((square + 2 * tl.sum(r0[None, :] * dr, 1) + tl.sum(dr * dr, 1)) / D + EPS)[:, None]
-            dk = dr * moved + r0[None, :] * (moved - inv0)
-            score = (tl.dot(dk, mkk) + mk[None, :]) * dk
-            if VALUES:
-                gate = tl.load(Gate + (row * P + probe) * H + head, valid, 0)[:, None]
-                dv = (a * tl.load(proj + H * D + d[None, :], valid[:, None], 0).to(tl.float32) + b * xv[None, :]
-                      + gate * ve[None, :])
-                score += (tl.dot(dk, mkv) + mv[None, :]) * dv
-            tl.store(Out + (jh * M + token) * P + probe, tl.sum(score, 1), valid)
-
-    return kernel
-
-
-RECEIVERS = (64, 4)  # receiver_moments kernel: probe block, warps (bench.py's choice)
-
-
-@torch.library.custom_op('noise_record::receiver_moments', mutates_args=())
-def receiver_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, b: torch.Tensor, kraw: torch.Tensor,
-                     cos: torch.Tensor, sin: torch.Tensor, gate: torch.Tensor, ve: torch.Tensor, mk: torch.Tensor,
-                     mv: torch.Tensor, mkk: torch.Tensor, mkv: torch.Tensor) -> torch.Tensor:
-    """Moment scores [J H, m, P] of each receiver j and head: its input change a proj + b xproj (proj [m, P, J, 2W]
-    the move's K/V products, contiguous as one matmul leaves them; xproj [J, m, 2W] the clean ones, a and b
-    [J, m, P]) through RoPE and QK-norm to dk, plus the VE gate change gate [J, m, P, H] times ve to dv; moments
-    as in stacked_receiver_scores ([J, H, m, ...] views, tokens contiguous)."""
-    m, P, J, width = proj.shape
-    heads, hd = kraw.shape[-2:]
-    assert proj.is_contiguous()  # a copy would cost more than the kernel
-    assert mk.stride() == mv.stride() and mkk.stride() == mkv.stride() and moment_layout(mk, mkk, hd)
-    out = torch.empty((J * heads, m, P), device=proj.device, dtype=torch.float32)
-    block, warps = RECEIVERS
-    receiver_moment_kernel()[(m, J * heads)](
-        proj, *(t.contiguous() for t in (xproj, a, b, kraw, cos, sin, gate, ve)), mk, mv, mkk, mkv, out,
-        m, P, heads, hd, block, EPS, width, P * J * width, J * width, width, True,
-        mk.stride(0), mk.stride(1), mkk.stride(0), mkk.stride(1), num_warps=warps)
-    return out
-
-
-def moment_layout(mk, mkk, hd):
-    """The token and feature strides receiver_moment_kernel assumes for moment views."""
-    return mk.stride()[-2:] == (hd, 1) and mkk.stride()[-3:] == (hd * hd, hd, 1)
-
-
-@receiver_moments.register_fake
-def _(proj, xproj, a, b, kraw, cos, sin, gate, ve, mk, mv, mkk, mkv):
-    return proj.new_empty((proj.shape[2] * kraw.shape[-2], *proj.shape[:2]), dtype=torch.float32)
-
-
-@torch.library.custom_op('noise_record::key_moments', mutates_args=())
-def key_input_moments(proj: torch.Tensor, xproj: torch.Tensor, a: torch.Tensor, b: torch.Tensor, kraw: torch.Tensor,
-                      cos: torch.Tensor, sin: torch.Tensor, mk: torch.Tensor, mkk: torch.Tensor) -> torch.Tensor:
-    """receiver_moments for keys alone, every token sharing the probes' K products proj [P, W]: scores [H, m, P]
-    of the key changes a proj + b xproj (xproj [m, W], a and b [m, P]); kraw [m, H, hd], moments [H, m, ...]."""
-    P, m = proj.shape[0], xproj.shape[0]
-    heads, hd = kraw.shape[-2:]
-    out = torch.empty((heads, m, P), device=proj.device, dtype=torch.float32)
-    block, warps = RECEIVERS
-    assert moment_layout(mk, mkk, hd)
-    receiver_moment_kernel()[(m, heads)](
-        proj.contiguous(), xproj.contiguous(), a.contiguous(), b.contiguous(), kraw.contiguous(), cos.contiguous(),
-        sin.contiguous(), mk, mk, mk, mk, mkk, mkk, out,
-        m, P, heads, hd, block, EPS, 0, 0, heads * hd, heads * hd, False,
-        0, mk.stride(0), 0, mkk.stride(0), num_warps=warps)
-    return out
-
-
-@key_input_moments.register_fake
-def _(proj, xproj, a, b, kraw, cos, sin, mk, mkk):
-    return proj.new_empty((kraw.shape[-2], xproj.shape[0], proj.shape[0]), dtype=torch.float32)
-
-
-@torch.compile(dynamic=False)
-def fused_key_moment_scores(x, steps, rows, projected_x, projected_rows, k_raw, cos, sin, mk, mkk):
-    """key_moment_scores(prepared_key_moves(...), mk, mkk) [H, 2P, m], the key changes formed inside the
-    receiver_moments kernel: each pair's RMSNorm responses inv_up/down, then a proj + b xproj as there."""
-    width = x.shape[-1]
-    square = x.square().sum(-1, keepdim=True)
-    dots = x @ rows.T
-    moved_square = square + steps.square() * rows.square().sum(-1)
-    inv0 = torch.rsqrt(square / width + EPS)
-    inv_up = torch.rsqrt((moved_square + 2 * steps * dots) / width + EPS)
-    inv_down = torch.rsqrt((moved_square - 2 * steps * dots) / width + EPS)
-    a = torch.cat((steps * inv_up, -steps * inv_down), 1)
-    b = torch.cat((inv_up, inv_down), 1) - inv0
-    return key_input_moments(torch.cat((projected_rows, projected_rows)), projected_x, a, b, k_raw.transpose(0, 1),
-                             cos, sin, mk, mkk).transpose(1, 2)
-
-
-@torch.compile(dynamic=False)
-def fused_receiver_scores(move, coeffs, x, kraw, wkv, gate, ve, wg, cos, sin, mk, mv, mkk, mkv):
-    """stacked_receiver_scores with every per-direction K/V change and moment form in one kernel
-    (receiver_moments); only the move's K/V products and the small gate products stay separate."""
-    J, m, width = x.shape
-    eps = torch.finfo(x.dtype).eps
-    c = coeffs[:, None, None]
-    square = x.square().sum(-1)[..., None]
-    inv = torch.rsqrt(square/width+eps)
-    moved = torch.rsqrt((square+2*c*(x[:, :, None]*move).sum(-1)+c*c*move.square().sum(-1))/width+eps)
-    a, b = c*moved, moved-inv  # norm_delta(x_j, c_j move) = a move + b x_j
-    p = move.shape[1]
-    proj = (move.reshape(m*p, width).to(FUTURE_DTYPE) @ wkv.reshape(-1, width).to(FUTURE_DTYPE).T).view(m, p, J, -1)
-    g = wg.shape[-1]
-    dg = (a[..., None]*torch.einsum('mpg,jhg->jmph', move[..., :g], wg)
-          + b[..., None]*torch.einsum('jmg,jhg->jmh', x[..., :g], wg)[:, :, None])
-    gate_change = 2*((gate[:, :, None]+dg).sigmoid()-gate[:, :, None].sigmoid())
-    return receiver_moments(proj, torch.einsum('jmw,jow->jmo', x, wkv), a, b, kraw, cos, sin, gate_change, ve,
-                            mk, mv, mkk, mkv).sum(0)
+    return fused_scores(q, target, dk, dv, a, contrast, start, window, precision).sum(0).T
 
 
 @torch.compile(dynamic=False)
@@ -2117,27 +2039,10 @@ def query_mlp_moves(raw, directions, step, cos, sin, keys, values, probabilities
     return mlp_output_moves(mid, move, hidden, w_fc, w_out)
 
 
-@torch.compile(dynamic=False)
-def routed_query_mlp_moves(raw, directions, step, cos, sin, top_keys, top_values, top_p, rest, weight,
-                           mid, hidden, w_fc, w_out):
-    """query_mlp_moves with the chain's routed own-query response (its query_keys strongest keys per head move,
-    the rest rescale exactly) in place of every key."""
-    m, p, width = directions.shape
-    heads, hd = top_keys.shape[1], top_keys.shape[-1]
-    delta = torch.cat((step[:, None]*directions, -step[:, None]*directions), 1)
-    c, s = cos[:, None, None], sin[:, None, None]
-    r0 = rotate(raw.reshape(m, 1, heads, hd), c, s)
-    dr = rotate(delta.reshape(m, 2*p, heads, hd), c, s)
-    change = routed_output_change(norm_delta(r0, dr), top_keys, top_values, top_p, rest, FUTURE_DTYPE)
-    return mlp_output_moves(mid, future_linear(change.flatten(-2), weight), hidden, w_fc, w_out)
-
-
 class FiniteFuture:
     def __init__(self, estimator, source_layers=4, tokens=64, chunk=512, sigma=.01, seed=9181,
-                 query_mlp=True, timing=True, moments=False, stacked=False, fused=False):
+                 query_mlp=True, timing=True):
         self.e = estimator
-        self.moments, self.stacked, self.fused = moments, stacked, fused
-        self.routed = None  # the chain's routed own-query context of this sequence, when set
         self.source_layers, self.tokens, self.chunk = source_layers, tokens, chunk
         self.sigma, self.seed = sigma, seed
         self.query_mlp = query_mlp
@@ -2175,17 +2080,11 @@ class FiniteFuture:
                 target=target, gate=gate, ve=ve, wg=wg,
                 wkv=torch.cat((block.attn.c_k.weight, block.attn.c_v.weight)).float(),
                 window=model.window_sizes[i][0]))
-            if self.moments:
-                contexts[-1]["moments"] = future_moments(q, target, a, contrast, model.window_sizes[i][0])
             if self.query_mlp and i < self.source_layers:
                 contexts[-1]["source_mlp"] = (
                     d.blocks[i][sequence].float()+d.outputs[prefix+"c_proj"][sequence].float(),
                     d.outputs[f"transformer.h.{i}.mlp.c_fc"][sequence].float(),
                     block.mlp.c_fc.weight.float(), block.mlp.c_proj.weight.float())
-        if self.moments:  # one [L, H, T, ...] buffer per kind: the stacked scorer reads receiver ranges as views
-            self.stacked_moments = [torch.stack([c["moments"][k] for c in contexts]) for k in range(4)]
-            for i, c in enumerate(contexts):
-                c["moments"] = tuple(m[i] for m in self.stacked_moments)
         self.contexts, self.sequence = contexts, sequence
         self.cos, self.sin = cos[0, :, 0], sin[0, :, 0]
         return self
@@ -2207,15 +2106,6 @@ class FiniteFuture:
                                weight=model.transformer.h[layer].mlp.c_proj.weight.float())
         elif family == "wte":
             response = partial(compiled_embedding, raw[sl])
-        elif self.routed is not None and self.query_mlp:
-            ctx = self.contexts[layer]
-            _, _, _, _, top_keys, top_values, top_p, rests, _, _ = self.routed
-            mid, hidden, w_fc, w_out = ctx["source_mlp"]
-            response = partial(routed_query_mlp_moves, raw[sl], cos=self.cos[sl], sin=self.sin[sl],
-                               top_keys=top_keys[layer][sl], top_values=top_values[layer][sl],
-                               top_p=top_p[layer][sl], rest=rests[layer][sl],
-                               weight=model.transformer.h[layer].attn.c_proj.weight.float(),
-                               mid=mid[sl], hidden=hidden[sl], w_fc=w_fc, w_out=w_out)
         else:
             ctx = self.contexts[layer]
             kwargs = dict(cos=self.cos[sl], sin=self.sin[sl], keys=ctx["k"], values=ctx["values"],
@@ -2225,22 +2115,17 @@ class FiniteFuture:
                 mid, hidden, w_fc, w_out = ctx["source_mlp"]
                 kwargs.update(mid=mid[sl], hidden=hidden[sl], w_fc=w_fc, w_out=w_out)
             response = partial(query_mlp_moves if self.query_mlp else compiled_query, raw[sl], **kwargs)
-        if self.stacked and receivers and all("moments" in self.contexts[j] for j, _ in receivers):
-            return LocalExperiment(response, self.stacked_scorer(receivers, sl))
         scorers = []
         for j, coefficient in receivers:
             ctx = self.contexts[j]
-            changes = dict(coefficient=coefficient, x=ctx["x"][sl], kraw=ctx["kraw"][sl],
-                           gate=None if ctx["gate"] is None else ctx["gate"][sl],
-                           ve=None if ctx["ve"] is None else ctx["ve"][sl],
-                           wkv=ctx["wkv"], wg=ctx["wg"], cos=self.cos[sl], sin=self.sin[sl])
-            if "moments" in ctx:
-                mk, mv, mkk, mkv = (m[:, sl] for m in ctx["moments"])
-                scorers.append(partial(receiver_moment_scores, **changes, mk=mk, mv=mv, mkk=mkk, mkv=mkv))
-            else:
-                scorers.append(partial(receiver_scores, **changes, q=ctx["q"], target=ctx["target"],
-                                       a=ctx["a"][:, :, sl], contrast=ctx["contrast"][:, :, sl], start=start,
-                                       window=ctx["window"]))
+            scorers.append(partial(receiver_scores, coefficient=coefficient,
+                x=ctx["x"][sl], kraw=ctx["kraw"][sl],
+                gate=None if ctx["gate"] is None else ctx["gate"][sl],
+                ve=None if ctx["ve"] is None else ctx["ve"][sl],
+                wkv=ctx["wkv"], wg=ctx["wg"], cos=self.cos[sl], sin=self.sin[sl],
+                q=ctx["q"], target=ctx["target"], a=ctx["a"][:, :, sl],
+                contrast=ctx["contrast"][:, :, sl], start=start, window=ctx["window"],
+                precision=self.e.s.future_precision))
 
         def score(move):
             if not scorers:
@@ -2250,25 +2135,6 @@ class FiniteFuture:
                 total = total + receiver(move)
             return total
         return LocalExperiment(response, score)
-
-    def stacked_scorer(self, receivers, sl):
-        """stacked_receiver_scores bound to these receivers' clean tensors at tokens sl."""
-        ctxs = [self.contexts[j] for j, _ in receivers]
-        x = torch.stack([c["x"][sl] for c in ctxs])
-        kraw = torch.stack([c["kraw"][sl] for c in ctxs])
-        heads, g = kraw.shape[-2], self.e.model.transformer.h[0].attn.ve_gate_channels
-        some = lambda name, shape: torch.stack([c[name][sl] if c[name] is not None else
-                                                x.new_zeros(shape) for c in ctxs])
-        wg = torch.stack([c["wg"] if c["wg"] is not None else x.new_zeros(heads, g) for c in ctxs])
-        first, last = receivers[0][0], receivers[-1][0]
-        assert [j for j, _ in receivers] == list(range(first, last + 1))
-        moments = [m[first:last + 1, :, sl] for m in self.stacked_moments]
-        scores = fused_receiver_scores if self.fused and x.is_cuda else stacked_receiver_scores
-        return partial(scores, coeffs=torch.stack([coefficient for _, coefficient in receivers]),
-                       x=x, kraw=kraw, wkv=torch.stack([c["wkv"] for c in ctxs]),
-                       gate=some("gate", (x.shape[1], heads)), ve=some("ve", kraw.shape[1:]), wg=wg,
-                       cos=self.cos[sl], sin=self.sin[sl], mk=moments[0], mv=moments[1], mkk=moments[2],
-                       mkv=moments[3])
 
     @torch.no_grad()
     def estimate(self, budgets=(512,), families=("hidden", "query", "wte")):
@@ -2355,11 +2221,9 @@ def add_future_gradients(estimator, gradients):
                              generator=d.shared_generator if e.split > 1 else d.generator).item())
     future = FiniteFuture(e, source_layers=s.future_layers, tokens=s.future_tokens,
                           chunk=s.future_chunk, sigma=s.future_sigma, seed=seed,
-                          query_mlp=True, timing=False, moments=s.future_moments,
-                          stacked=s.future_stacked, fused=s.future_fused)
+                          query_mlp=True, timing=False)
     for sequence in range(d.batch):
         future.seed = seed + 104729 * sequence
-        future.routed = getattr(e, 'routed', {}).get(sequence)
         future.prepare(sequence)
         corrections = future.estimate((s.future_draws,))[s.future_draws]
         for site, credit in corrections.items():
@@ -2372,10 +2236,10 @@ def add_future_gradients(estimator, gradients):
                 # response; remove their partial-cycle decoding cross-talk.
                 credit = credit * (raw+step > 0)[None]
             if site == 'transformer.wte':
-                d.embedding_gradients(gradients, credit[0], sequence)
+                gradient.index_add_(0, inputs.flatten(), credit[0].flatten(0, -2))
             else:
                 gradient.addmm_(credit[0].T, inputs)
-        future.contexts = future.stacked_moments = None
+        future.contexts = None
         del corrections
 
 
@@ -2601,8 +2465,10 @@ def make_optimizer(model, recipe, steps):
         if name.startswith('transformer.h.') and parameter.ndim == 2 and 've_gate' not in name:
             matrices.append(parameter)
             continue
-        scale = (recipe.ngram_lr_scale if 'ngram' in name else 300 if ('wte' in name or 'value_embeds' in name)
-                 else 30 if 'lambdas' in name else 1)
+        scale = (recipe.emb_scale if ('wte' in name or 'value_embeds' in name)
+                 else (recipe.ngram_scale or recipe.emb_scale) if 'ngram_embeds' in name
+                 else recipe.ngram_proj_scale if 'ngram_proj' in name
+                 else recipe.lambda_scale if 'lambdas' in name else 1)
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW(
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
@@ -2703,15 +2569,24 @@ def handoff_optimizer(old, new, phase_step):
     new.optimizers[0].t = phase_step - 1
 
 
+def holdout_sum(model, x, y):
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        return model(x, y, loss_reduction='sum')
+
+
+holdout_sum_graphed = torch.compile(holdout_sum, mode='reduce-overhead', dynamic=False)
+MERGE_GRAPH = False  # set from Settings.merge_graph
+
+
 def holdout_loss(model, rows, rank, world):
     """Mean next-token loss over the held-out training sequences, split across ranks."""
     device = next(model.parameters()).device
     total = torch.zeros(2, dtype=torch.float64, device=device)
+    forward = holdout_sum_graphed if MERGE_GRAPH else holdout_sum
     with torch.no_grad():
         for batch in rows[rank::world].split(8):
             batch = batch.to(device)
-            with torch.autocast('cuda', dtype=torch.bfloat16):
-                loss = model(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), loss_reduction='sum')
+            loss = forward(model, batch[:, :-1].contiguous(), batch[:, 1:].contiguous())
             total[0] += loss.double()
             total[1] += batch[:, 1:].numel()
     if torch.distributed.is_initialized():
@@ -2725,7 +2600,7 @@ def merge_part(name):
     return 've_gates' if 've_gate' in name else name
 
 
-HOLDOUT = 32  # training sequences that feed no update and score the end merge
+HOLDOUT = 64  # training sequences that feed no update and score the end merge
 MERGE_FROM, MERGE_EVERY = 0.6, 5  # the exponential means follow the weights from 60% of the epoch, every 5 updates
 MERGE_DECAYS = (0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01)  # weight of the newest weights in each mean
 MERGE_RHOS = (0.0, 0.5, 1.0)  # how far a candidate moves outside the high-curvature subspace
@@ -2779,12 +2654,14 @@ def subspace_move(name, move, bases, order):
     return move
 
 
-MERGE_COEFS = (0.75, 1.0, 1.25)  # multiples of each move in the joint search
+MERGE_COEFS = (0.75, 1.0, 1.25)
+MERGE_CACHE_NUMEL = 1 << 24  # parameters above this size recompute their moves instead of caching them
+MERGE_FIRST_KEYS = 0  # 0: the first sweep tries every key per part; else the best this many (Settings.merge_keys)  # multiples of each move in the joint search
 
 
 @torch.no_grad()
-def joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain, load,
-                sweeps=2, shortlist=8):
+def joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain,
+                sweeps=2, shortlist=8, first_keys=0):
     """The joint search over keys (rho, j, c) = final + c * move(rho, j) per part (None = the final weights):
     the best single key for every part, then coordinate sweeps (all keys per part, then each part's best `shortlist`)."""
     parts = sorted({merge_part(n) for n, _ in named})
@@ -2794,19 +2671,34 @@ def joint_parts(model, named, params, final, move, candidates, rows, rank, world
     def value(i, key):
         if key is None:
             return final[i]
+        if final[i].numel() > MERGE_CACHE_NUMEL:  # big tables: recompute (27 cached moves of a 2^20-row table: 14 GB)
+            return final[i] + key[2] * move(i, key[0], key[1])
         if (i, key[0], key[1]) not in cache:
             cache[i, key[0], key[1]] = move(i, key[0], key[1])
         return final[i] + key[2] * cache[i, key[0], key[1]]
 
-    def state(choice):
-        return [value(i, choice[merge_part(n)]) for i, (n, _) in enumerate(named)]
+    members = {}
+    for i, (n, _) in enumerate(named):
+        members.setdefault(merge_part(n), []).append(i)
+    held = dict.fromkeys(parts)  # the key each part's weights hold now (the final weights on entry)
+
+    def show(choice):  # load only the parts whose key changed: the same weights as loading all
+        for p in parts:
+            if held[p] != choice[p]:
+                for i in members[p]:
+                    params[i].copy_(value(i, choice[p]).to(params[i].dtype))
+                held[p] = choice[p]
     best_key, best = None, plain
+    global_losses = []
     for key in keys[1:]:
-        load([value(i, key) for i in range(len(params))])
+        show(dict.fromkeys(parts, key))
         loss = holdout_loss(model, rows, rank, world)
+        global_losses.append((loss, key))
         if loss < best:
             best_key, best = key, loss
     choice = {p: best_key for p in parts}
+    if first_keys:  # the first sweep tries only the keys that did best for all parts at once (and no move)
+        keys = [None] + [k for _, k in sorted(global_losses, key=lambda x: x[0])[:first_keys]]
     ranked = {}
     for sweep in range(sweeps):
         for p in parts:
@@ -2817,14 +2709,14 @@ def joint_parts(model, named, params, final, move, candidates, rows, rank, world
                     continue
                 trial = dict(choice)
                 trial[p] = key
-                load(state(trial))
+                show(trial)
                 loss = holdout_loss(model, rows, rank, world)
                 tried.append((loss, key))
                 if loss < best:
                     best, choice = loss, trial
             if sweep == 0:
                 ranked[p] = [k for _, k in sorted(tried, key=lambda x: x[0])[:shortlist]]
-    load(state(choice))
+    show(choice)
     return dict(holdout_plain=plain, holdout_merged=best,
                 merge_choices={p: (None if k is None else [k[0], MERGE_DECAYS[k[1]], k[2]]) for p, k in choice.items()})
 
@@ -2847,12 +2739,9 @@ def end_merge(model, means, rows, rank, world):
             return full
         inside = subspace_move(named[i][0], full, bases, order)
         return inside + rho * (full - inside)
-
-    def load(ws):
-        for q, w in zip(params, ws):
-            q.copy_(w.to(q.dtype))
     plain = holdout_loss(model, rows, rank, world)
-    return joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain, load)
+    return joint_parts(model, named, params, final, move, candidates, rows, rank, world, plain,
+                       first_keys=MERGE_FIRST_KEYS)
 
 
 def train_stages(args, settings, device, rank, world):
@@ -2862,7 +2751,12 @@ def train_stages(args, settings, device, rank, world):
     training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
     training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
     holdout_rows, training = training[-HOLDOUT:], training[:-HOLDOUT]  # these feed no update, only the end merge
+    if args.rows:  # a prefix of the shuffled epoch; the schedule follows its length
+        training = training[:args.rows]
     means = None  # the exponential means of the end merge, one per MERGE_DECAYS entry
+    global MERGE_FIRST_KEYS, MERGE_GRAPH
+    MERGE_FIRST_KEYS = settings.merge_keys
+    MERGE_GRAPH = settings.merge_graph
     schedule = stage_schedule(len(training), settings)
     steps = min(args.steps or len(schedule), len(schedule))
     stop = min(steps, args.stop_after_step or steps)
@@ -2909,7 +2803,7 @@ def train_stages(args, settings, device, rank, world):
     for phase, horizon in phases.items():
         model = make_model(device, SEED, settings.model, settings.projection_std, settings.head_std)
         optimizer, estimator = make_optimizer(model, settings, horizon), estimator_for(model, phase)
-        size = settings.boost_batch if phase == 'boost' else settings.cut_batch
+        size = settings.cut_batch if phase == 'cut' else settings.boost_batch
         batch = rank_slice(noise[:size], phase)
         estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
         estimator.close()
@@ -2934,9 +2828,16 @@ def train_stages(args, settings, device, rank, world):
     if args.resume:
         completed, previous_seconds = restore_training_state(args.resume, model, optimizer, estimator, recipe=recipe_state)
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
+    if MERGE_GRAPH and HOLDOUT:  # compile and capture the merge's held-out forward on random tokens, this model's weights
+        for _ in range(3):
+            holdout_loss(model, torch.randint(0, settings.model.vocab_size, (HOLDOUT, settings.model.sequence_len + 1),
+                                              generator=torch.Generator().manual_seed(SEED + 2)), rank, world)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     start, paused, elapsed = time.perf_counter(), 0., previous_seconds
+    pending_losses = []
+    global ASYNC_STEPS
+    ASYNC_STEPS = args.async_steps
     try:
         for step in range(completed+1, stop+1):
             current, phase_step, begin, end, horizon = schedule[step-1]
@@ -2948,12 +2849,29 @@ def train_stages(args, settings, device, rank, world):
             batch = rank_slice(training[begin:end], phase)
             set_rate(optimizer, phase_step, horizon, settings.warmdown, settings.final)
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+            evaluating = bool(args.eval_every and step % args.eval_every == 0 and step < steps)
+            if args.async_steps:  # queue updates without host round trips; report every ASYNC_LOG updates
+                pending_losses.append(loss)
+                if not (evaluating or step % ASYNC_LOG == 0 or step == stop):
+                    if (step % MERGE_EVERY == 0 or step == stop) and begin / len(training) >= MERGE_FROM:
+                        with torch.no_grad():
+                            if means is None:
+                                means = [[q.detach().float().clone() for q in model.parameters()] for _ in MERGE_DECAYS]
+                            else:
+                                for a, mean in zip(MERGE_DECAYS, means):
+                                    for m, q in zip(mean, model.parameters()):
+                                        m.lerp_(q.detach().float(), a)
+                    continue
+                loss = torch.cat(pending_losses).mean().item()
+                pending_losses.clear()
+                if bool(getattr(estimator, 'nonfinite', False)):
+                    raise FloatingPointError('Non-finite estimate')
             torch.cuda.synchronize()
             elapsed = previous_seconds + time.perf_counter()-start-paused
             record = dict(step=step, phase=phase, phase_step=phase_step, seqs=end,
                           tokens=end*settings.model.sequence_len, train_loss=loss, train_seconds=round(elapsed, 2),
                           peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3))
-            if args.eval_every and step % args.eval_every == 0 and step < steps:
+            if evaluating:
                 pause = time.perf_counter()
                 record['val_loss'] = evaluate(model.state_dict(), args.data_dir, model_file=MODEL_FILE)
                 paused += time.perf_counter()-pause
@@ -3007,22 +2925,54 @@ def train_stages(args, settings, device, rank, world):
             log.close()
 
 
+def overrides(pairs):
+    """Settings fields from KEY=VALUE strings (values as Python literals, else strings)."""
+    import ast
+    kinds = {f.name: f.type for f in fields(Settings)}
+    out = {}
+    for pair in pairs:
+        key, _, text = pair.partition('=')
+        if key not in kinds:
+            raise SystemExit(f'--set: unknown Settings field {key!r}')
+        if kinds[key] in (str, 'str'):  # string fields keep their text, unparsed
+            out[key] = text
+            continue
+        try:
+            out[key] = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            out[key] = text
+    return out
+
+
 def main():
+    global HOLDOUT
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output', type=Path, default=Path('logs/arch'))
     parser.add_argument('--checkpoint-every', type=int, default=0)
-    parser.add_argument('--eval-every', type=int, default=0)
+    parser.add_argument('--eval-every', type=int, default=125)  # the record's untimed validations
     parser.add_argument('--resume', type=Path)
     parser.add_argument('--stop-after-step', type=int)
     parser.add_argument('--steps', type=int, help='Diagnostic prefix; preserves the full-epoch LR schedule.')
     # Execution chunks only: the default command reproduces the logged algorithm and budgets.
     parser.add_argument('--chain-tokens', type=int, default=512)
     parser.add_argument('--key-chunk', type=int, default=32)
-    parser.add_argument('--key-path-tokens', type=int, default=256)
-    parser.add_argument('--future-tokens', type=int, default=512)
+    parser.add_argument('--key-path-tokens', type=int, default=64)
+    parser.add_argument('--future-tokens', type=int, default=128)
     parser.add_argument('--future-chunk', type=int, default=512)
+    parser.add_argument('--rows', type=int, help='Train on the first ROWS rows of the shuffled epoch.')
+    parser.add_argument('--future-precision', choices=('tf32x3', 'tf32'), default='tf32x3')
+    parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE',
+                        help='Override Settings fields, e.g. --set future_draws=0 key_path_draws=0.')
+    parser.add_argument('--switch', type=float, default=Settings.switch, help='Boost fraction of the updates.')
+    parser.add_argument('--async-steps', action='store_true',
+                        help='No host synchronization per update: losses and the finite check are read every '
+                             f'{ASYNC_LOG} updates (and at validations).')
+    parser.add_argument('--holdout', type=int, default=HOLDOUT, help='Training rows held out to score the end merge.')
     args = parser.parse_args()
+    HOLDOUT = args.holdout
+    if args.rows is not None and not 0 < args.rows <= TRAIN_ROWS - HOLDOUT:
+        parser.error('rows must be in 1..TRAIN_ROWS - HOLDOUT')
     for key in ('steps', 'stop_after_step'):
         if getattr(args, key) is not None and getattr(args, key) < 1:
             parser.error(key + ' must be positive')
@@ -3030,7 +2980,8 @@ def main():
         parser.error('Logging intervals must be nonnegative')
     settings = Settings(chain_tokens=args.chain_tokens, key_chunk=args.key_chunk,
                         key_path_tokens=args.key_path_tokens, future_tokens=args.future_tokens,
-                        future_chunk=args.future_chunk)
+                        future_chunk=args.future_chunk, switch=args.switch,
+                        future_precision=args.future_precision, **overrides(args.set))
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', 0)))
     device = torch.device('cuda', torch.cuda.current_device())
