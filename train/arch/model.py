@@ -1,13 +1,12 @@
-"""Track 3: the fixed GPT of Noise with a quarter turn of the previous token mixed into the token embedding.
+"""Track 3's model: the GPT of the Dust paper (width 512) on 6 blocks instead of 8, with an n-gram memory.
 
-The only change from utils/model.py is the embedding lookup: z_t = E[x_t] + 0.5 * R(E[x_(t-1)]), where
-R[a, b] = [-b, a] acts on the two halves of the embedding channels. R is orthogonal and skew-symmetric, so
-the transpose of this linear lookup map applies R.T = -R: credit_t + 0.5 * R.T(credit_(t+1)). The first
-position of every row has no predecessor. Parameter names, shapes, initialization (and its random draws),
-attention, blocks and readout are unchanged; utils/eval.py scores this file with --model train/arch/model.py.
+The n-gram memory follows DeepSeek's Engram ("Conditional Memory via Scalable Lookup"), without its gate and
+convolution: hashed rows for the last 2 and 3 tokens, added to the token embedding. It also starts at zero.
+eval.py scores this module with --model train/arch/model.py.
 """
 from dataclasses import dataclass
 from functools import cache
+import random
 
 import torch
 from torch import nn
@@ -38,14 +37,18 @@ def attention(q, k, v, window):
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 4096
-    n_layer: int = 8
+    n_layer: int = 6  # two blocks fewer than Dust's 8: the n-gram tables more than make up the loss
     n_head: int = 8
     n_kv_head: int = 8
     n_embd: int = 512
     # Per block, repeating: S = half-sequence window, L = full. The last block is always L.
     window_pattern: str = 'SSSL'
-    # Track 3: weight of the quarter-turned previous-token embedding added to each token's embedding.
-    embedding_coefficient: float = 0.5
+    # n-gram memory: n = 2..ngram_max, each hashed into ngram_heads tables of about ngram_rows rows (16 times
+    # Engram's 5x the vocabulary: lookups cost no compute, and backprop's loss kept falling to here); ngram_max < 2
+    # turns it off.
+    ngram_max: int = 3
+    ngram_heads: int = 8
+    ngram_rows: int = 16 * 5 * 4096
 
 
 def norm(x):
@@ -55,6 +58,47 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Value embeddings on every other block, counting back from the last."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def next_prime(n):
+    n += 1
+    while any(n % p == 0 for p in range(2, int(n ** 0.5) + 1)):
+        n += 1
+    return n
+
+
+class NgramMemory(nn.Module):
+    """Hashed n-gram embeddings. For each n, every head hashes the last n tokens (XOR of token times an odd
+    multiplier, mod its own prime) into its own table rows of width n_embd / heads; a position's memory is the
+    sum over n of its heads' rows side by side. The hash is fixed, so the rows are a plain lookup table."""
+
+    def __init__(self, config, seed=0):
+        super().__init__()
+        self.orders, self.heads = config.ngram_max - 1, config.ngram_heads
+        self.pad = config.vocab_size  # stands for the tokens before the sequence start
+        rng = random.Random(seed)
+        self.multipliers = [2 * rng.randrange(2 ** 30) + 1 for _ in range(config.ngram_max)]
+        self.primes, self.offsets, p, rows = [], [], config.ngram_rows, 0
+        for _ in range(self.orders * self.heads):
+            p = next_prime(p)
+            self.primes.append(p)
+            self.offsets.append(rows)
+            rows += p
+        self.table = nn.Embedding(rows, config.n_embd // self.heads)
+
+    def ids(self, idx):
+        """Table rows of each position, [batch, token, orders * heads], n = 2 first."""
+        mix, out = idx * self.multipliers[0], []
+        for k in range(1, self.orders + 1):
+            mix = mix ^ (F.pad(idx[:, :-k], (k, 0), value=self.pad) * self.multipliers[k])
+            for h in range(self.heads):
+                j = (k - 1) * self.heads + h
+                out.append(torch.remainder(mix, self.primes[j]) + self.offsets[j])
+        return torch.stack(out, -1)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        return self.table(self.ids(idx)).view(B, T, self.orders, -1).sum(2)
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -125,41 +169,6 @@ class Block(nn.Module):
         return x
 
 
-class CausalEmbedding(nn.Embedding):
-    """Token embedding plus a fixed quarter turn of the previous token's; no new parameters or random draws."""
-
-    def __init__(self, num_embeddings, embedding_dim, coefficient=0.5):
-        if embedding_dim % 2:
-            raise ValueError('Quarter-turn context requires an even embedding width.')
-        super().__init__(num_embeddings, embedding_dim)
-        self.coefficient = coefficient
-
-    def forward(self, idx):
-        """current + coefficient * R(previous) along the token axis; position 0 gets no context."""
-        raw = super().forward(idx)
-        if self.coefficient == 0:
-            return raw
-        half = self.embedding_dim // 2
-        mixed = raw.clone()
-        mixed[..., 1:, :half].add_(raw[..., :-1, half:], alpha=-self.coefficient)
-        mixed[..., 1:, half:].add_(raw[..., :-1, :half], alpha=self.coefficient)
-        return mixed
-
-    def linear_embedding_credit(self, credit):
-        """The lookup map's transpose: credit at each position plus coefficient * R.T(credit of its successor).
-
-        R.T[a, b] = [b, -a]. The last position has no successor; leading batch/probe dimensions stay
-        independent. The training script applies this linear map to measured credit; it is no backward pass.
-        """
-        if self.coefficient == 0:
-            return credit
-        half = self.embedding_dim // 2
-        original = credit.clone()
-        original[..., :-1, :half].add_(credit[..., 1:, half:], alpha=self.coefficient)
-        original[..., :-1, half:].add_(credit[..., 1:, :half], alpha=-self.coefficient)
-        return original
-
-
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         super().__init__()
@@ -167,10 +176,11 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab = (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to * pad_vocab_size_to
         self.transformer = nn.ModuleDict({
-            'wte': CausalEmbedding(padded_vocab, config.n_embd, config.embedding_coefficient),
+            'wte': nn.Embedding(padded_vocab, config.n_embd),
             'h': nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)  # untied from the embedding
+        self.ngram = NgramMemory(config) if config.ngram_max >= 2 else None
         # The stream entering block i is resid_lambdas[i] * x + x0_lambdas[i] * x0, a learned mix of the
         # previous block's output and the normalized token embedding.
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
@@ -190,6 +200,8 @@ class GPT(nn.Module):
     def init_weights(self):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        if self.ngram is not None:
+            torch.nn.init.zeros_(self.ngram.table.weight)
         s = 3 ** 0.5 * self.config.n_embd ** (-0.5)
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
@@ -211,6 +223,8 @@ class GPT(nn.Module):
         # Token and value embeddings are stored in bfloat16 on the GPU
         if self.transformer.wte.weight.device.type == 'cuda':
             self.transformer.wte.to(dtype=torch.bfloat16)
+            if self.ngram is not None:
+                self.ngram.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
 
@@ -230,16 +244,27 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)
         return sizes
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
-        B, T = idx.size()
-        cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        x = norm(self.transformer.wte(idx))
+    def stack(self, e, idx, cos_sin):
+        """The blocks on embedding e, ending at the final norm."""
+        x = norm(e)
         x0 = x
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
+        return norm(x)
+
+    def embed(self, idx):
+        """The token embedding plus the n-gram memory."""
+        e = self.transformer.wte(idx)
+        if self.ngram is not None:
+            e = e + self.ngram(idx).to(e.dtype)
+        return e
+
+    def forward(self, idx, targets=None, loss_reduction='mean'):
+        B, T = idx.size()
+        cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        x = self.stack(self.embed(idx), idx, cos_sin)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # soft cap
         if targets is not None:
