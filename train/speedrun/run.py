@@ -1,56 +1,59 @@
 """Track 2: an identity-path phase hands off to Cut; held-out training rows then select a merge of weight averages.
 
-1. Identity phase: 300 updates of 8 rows of #44's 1831-update plan (#44: 660), with #29's identity-path credit
-   (full-cycle readout credit, finite MLP responses and #29's attention moments). Both hand off at full rate; these
-   300 updates lie inside the plan's 368-update ANVIL momentum ramp, which #44's 660 outlast, and end before the
-   late skip, tail average and cooldown that #44 reaches. ANVIL updates the matrices and Adam the rest. Listed under
-   "identity" in config.json: each attn.c_proj starts as the norm-matched transpose of its c_v, and each wte row
-   starts with 1/256 of its energy in the 32 gate channels; for the first 195 updates, wte rows keep that split,
-   the value embeddings' vocabulary-common Adam motion is amplified 4x at fixed energy, the VE gates' head-mean
-   credit is pooled over the four VE layers, and each VE layer's centered Adam motion is joined by its partner
-   layer's (1-5, 3-7), mapped through the partner's c_proj and back through its own and scaled to half the
-   receiving layer's norm, then rescaled to the receiving layer's energy.
-2. Cut phase: 1523 updates of 8 of the remaining rows. Each batch takes one row from each of 8 difficulty strata:
+Builds on qlabs-eng/noise#51 (itself on #44); the kernels it calls live next to this file (visit_chain*.py,
+visit_gluon_root.py, query_factored_gluon.py, query_gluon.py, moment_kernels.py, window_topk.py, project_values.py).
+
+1. Identity phase: 355 updates of 8 rows of #44's 1831-update plan (#51: 300), with #29's identity-path credit
+   (full-cycle readout credit, finite MLP responses and #29's attention moments). It hands off at full rate; these
+   355 updates lie inside the plan's 368-update ANVIL momentum ramp. ANVIL updates the matrices and Adam the rest.
+   Listed under "identity" in config.json: each attn.c_proj starts as the norm-matched transpose of its c_v, and each
+   wte row starts with 1/256 of its energy in the 32 gate channels; for the first 195 updates, wte rows keep that
+   split, the value embeddings' vocabulary-common Adam motion is amplified 4x at fixed energy, the VE gates'
+   head-mean credit is pooled over the four VE layers, and each VE layer's centered Adam motion is joined by its
+   partner layer's (1-5, 3-7). Those mechanisms are exact no-ops after update 195, so a second captured graph
+   without them runs the remaining updates.
+2. Cut phase: 1468 updates of 8 of the remaining rows. Each batch takes one row from each of 8 difficulty strata:
    rows ranked by the mean add-one-smoothed unigram surprisal of their target tokens, with the counts taken over the
    Cut rows inside the timer. The Cut estimator:
-   - #44's measured full-cycle readout probe;
-   - MLP roots at blocks 0, 1, 2, 4, 6 and 7, measured in pairs (0-1, 2-4, 6-7): one forward replay moves both roots
-     of a pair along signed Hadamard frames with independent random signs per token (the same on every GPU, whose
-     rows differ), through routed MLPs (each token's 128 units with the largest |relu^2(h + r) - relu^2(h - r)| times
-     output-weight norm, h the unit's pre-activation and r = chain_sigma times its input-weight norm; #44: the 192
-     largest relu^2(h) times output-weight norm) and routed attention at block 3 only (16 strong keys shifted by the
-     tail centroid; #44: 32 keys at every later block), and scores it with diagonal readout moments (the diagonal of
-     #44's per-token readout curvature). Each root's identity-path prediction (the readout credit times the residual
-     scalars above it) is subtracted from the replay and added back to that root's credit, so the partner enters only
-     through its deviation from its prediction, with a zero-mean random sign. Blocks 3 and 5 take the next block's
-     credit times its residual scalar;
-   - mixing scalars: each block's mid credit contracted with the scalar's two inputs, a linear step (#44's Cut
-     probed them; #29's identity-path credit contracts them the same way), plus #44's path term (the value- and
-     gate-path input credits contracted the same way);
-   - the embedding's credit: every block's mid credit summed along its x0 skip (#44: block 0's only), one finite step
-     back through the norm;
-   - #44's finite query probes and its value and gate paths (exact linear value credit; one finite norm or gate
-     step whose credit feeds only linear consumers). The key credit moves each raw key coordinate by a finite step
-     through the key norm and RoPE in closed form and scores the softmax's response with its degree-2 moment expansion
-     (the moment model of #29's and #44's identity-phase key credit; #44's Cut used the exact single-key
-     response).
-   ANVIL weight decay is zero after the first 275/1043 of the updates.
-3. Weight averages kept over the last 40% of the Cut updates are merged part by part, chosen on 64 held-out rows
-   (Nystrom-sketched input-covariance bases; candidates screened on 8 of the rows, finalists scored on all 64).
+   - the readout probe from the second-order expansion of the softcapped log-sum-exp in the moved logits (its
+     quadratic term exact over the vocabulary for every frame direction), the target logit and norm exact;
+   - two single MLP roots, at blocks 4 and 6 (#51: pairs 0-1, 2-4, 6-7): each forward replay moves its root's mid
+     stream along a full 512-direction signed Hadamard frame with random signs per token (the same on every GPU,
+     whose rows differ), through routed MLPs (each token's 64 units from block 2 on with the largest
+     |relu^2(h + r) - relu^2(h - r)| times output-weight norm, h the unit's pre-activation and r = chain_sigma times
+     its input-weight norm), to the readout, scored with diagonal readout moments. The block-4 replay also replays
+     attention at block 5 (16 strong keys per moved query, shifted by the tail centroid); its moved queries are
+     computed from the root's 64-wide routed change against each token's Wo[routes] @ W_q^T, an identity of the same
+     move. Each root's identity-path prediction (the readout credit times the residual scalars above it) is
+     subtracted from the replay and added back to that root's credit. Block 7 takes the readout credit, the other
+     blocks the next block's credit times its residual scalar;
+   - mixing scalars: each block's mid credit contracted with the scalar's two inputs, a linear step, plus #44's path
+     term (the value- and gate-path input credits contracted the same way);
+   - the embedding's credit: every block's mid credit summed along its x0 skip, one finite step back through the
+     norm;
+   - query and key credits from the degree-2 moment model of the softmax's response to a finite step of each raw
+     coordinate through the norm and RoPE (the moment model of #29's identity-phase credits); #44's value and gate
+     paths (exact linear value credit; one finite norm or gate step whose credit feeds only linear consumers).
+   ANVIL weight decay is zero after the first 275/1043 of the updates. Each rank updates 1/8 of every ANVIL shape
+   batch (bf16 reduce-scatter, polar step, all-gather); the other gradients are all-reduced in bf16; the collectives
+   are waited where first read.
+3. Weight averages (decays 0.03 and 0.02, every 5 updates over the last 70% of the Cut rows) are merged part by part
+   at 0.75 or 1.0, chosen on 64 held-out rows (a race over 4 keys).
 
 config.json lists the changes against #44 (qlabs-eng/noise@3343973b) under "additions".
 
 Run on one 8xH100 node, seed 0; measured results are in train/speedrun/log/.
 As in #44, train.pt is read (with its pinned-hash check) and split by seeded permutations, and the identity batches
 are put on the GPUs, before the timer; apart from the organizers' pinned-hash check, the difficulty order is the only
-computation on the rows' contents before the first update, and it is timed. The random-token warmup (the identity
-graph, a throwaway Cut, the Cut-estimate graph capture and the merge scorer, whose inputs the held-out rows overwrite
+computation on the rows' contents before the first update, and it is timed. The random-token warmup (both identity
+graphs, a throwaway Cut, the Cut-estimate graph capture and the merge scorer, whose inputs the held-out rows overwrite
 before scoring) is discarded or reset before timed training starts from seed 0; final validation is untimed.
 metrics.jsonl writes the Cut records every 16 updates, each with the time of its flush.
 
     uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 """
 import argparse
+import ast
 from dataclasses import asdict, dataclass, field
 import gc
 import hashlib
@@ -60,7 +63,6 @@ import os
 import sys
 from pathlib import Path
 import time
-from typing import Optional
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 import torch
 from torch import nn
@@ -72,7 +74,15 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-from utils.model import GPT, GPTConfig, apply_rotary_emb, attention, has_ve, norm
+from utils.model import GPT, GPTConfig, apply_rotary_emb, attention, has_ve, norm, window_mask
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import visit_gluon_root  # noqa: E402  (next to this file)
+import visit_chain  # noqa: E402
+import visit_chain3  # noqa: E402
+import query_factored_gluon  # noqa: E402
+import window_topk  # noqa: E402
+import project_values  # noqa: E402
+import moment_kernels  # noqa: E402
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
 BEGIN_MARKER = 'NOISE_TRAINING_BEGIN'
@@ -98,7 +108,7 @@ def end_training() -> None:
 
 
 SEED = 0
-IDENTITY_UPDATES, IDENTITY_SCHEDULE = 300, 1831  # hand off to Cut after 300 of 1831 planned identity updates
+IDENTITY_UPDATES, IDENTITY_SCHEDULE = 355, 1831  # hand off to Cut after 355 of 1831 planned identity updates
 EPS = torch.finfo(torch.float32).eps
 HADAMARDS = {}
 torch._dynamo.config.cache_size_limit = 64
@@ -114,43 +124,42 @@ class Settings:
     model: GPTConfig = field(default_factory=model_config)
     late_cut_decay_multiplier: float = 0.0  # ANVIL weight-decay factor after the first 275/1043 of Cut updates
     cut_batch: int = 8
-    lr: float = 0.0021
+    lr: float = 0.0028
     betas: tuple = (0.5, 0.98)
-    warmdown: float = 0.4
-    final: float = 0.3
-    anvil_lr: float = 0.026
+    warmdown: float = 0.5
+    cut_warmup: int = 0  # Cut updates over which both optimizers' rates ramp up linearly from the hand-off
+    final: float = 0.5
+    anvil_lr: float = 0.036
     anvil_wd: float = 2.25
     fast_weight: float = 1.0
     polar_margin: float = 1.1
     telemetry_batch: int = 16
     fc_sigma: float = 0.05
-    query_draws: int = 64
-    query_sigma: float = 0.1
+    route_k_late: int = 64  # this many routes from block route_split on (0: route_k everywhere)
+    route_split: int = 2
+    query_moment_sigma: float = 0.003
     chain_sigma: float = 0.01
-    chain_depth_roots: tuple = (0, 1, 2, 4, 6, 7)
-    joint_root_groups: tuple = ((0, 1), (2, 4), (6, 7))
+    chain_depth_roots: tuple = (4, 6)
     route_k: int = 128
-    chain_tokens: int = 1024
-    query_replay_long_layers: tuple = (3,)
+    chain_tokens: int = 2048
+    query_replay_long_layers: tuple = (5,)
     gate_path_sigma: float = 0.01
     query_keys: int = 16
     key_sigma: float = 0.003
     merge_screen_rows: int = 8
     merge_screen_global: int = 16
     merge_screen_coordinate: int = 2
-    merge_keys: int = 8
+    merge_keys: int = 4
+    merge_sweeps: int = 0
     emb_scale: float = 750.0
     lambda_scale: float = 15.0
     def __post_init__(self):
-        flattened_groups = tuple(site for group in self.joint_root_groups for site in group)
-        if (tuple(sorted(flattened_groups)) != self.chain_depth_roots
-        or any(tuple(sorted(group)) != group or not group for group in self.joint_root_groups)):
-            raise ValueError('joint_root_groups must split chain_depth_roots into ascending groups')
         last = self.model.n_layer - 1
-        if any(p < last and (p + 1 in group or p + 1 in self.query_replay_long_layers)
-               for group in self.joint_root_groups for p in group[1:]):
-            raise ValueError('A partner root must be the last block or be followed by a block '
-                             'that is neither replayed with attention nor another partner')
+        for root in self.chain_depth_roots:  # the two layouts chain_chunk replays
+            replays = tuple(b for b in range(root + 1, last + 1) if b in self.query_replay_long_layers)
+            if not ((root == last - 1 and not replays) or (root == last - 3 and replays == (last - 2,))):
+                raise ValueError('a chain root must be block L-2 (no attention replay after it) or block L-4 with '
+                                 'the attention replayed at L-3')
 
 
 @torch.compile
@@ -178,35 +187,6 @@ def average_ranks(tensor):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     tensor.div_(torch.distributed.get_world_size())
     return tensor
-
-
-@torch.compile(dynamic=False)
-def moved_heads(raw, a, sigma, cos, sin):
-    moved = (raw.unsqueeze(0) + sigma * a.float()).flatten(0, 1)
-    return norm(apply_rotary_emb(moved, cos, sin)).to(a.dtype)
-
-
-def query_probe_attention(moved, keys, values, window, count, batch):
-    _, length, heads, width = keys.shape
-    repeat = lambda z: z.unsqueeze(0).expand(count, -1, -1, -1, -1).reshape(count*batch, length, heads, width)
-    return attention(moved, repeat(keys), repeat(values), window).view(count, batch, length, heads, width)
-
-
-@torch.compile(dynamic=False)
-def head_scores(out, baseline, hub):
-    change = out.float() - baseline.float()
-    return (change * hub.float().unsqueeze(0)).sum(-1).permute(1, 3, 2, 0)
-
-
-@torch.compile(dynamic=False)
-def code_estimate(credited, a):
-    return decode_local_scores(credited.permute(0, 2, 1, 3), a.float().permute(1, 2, 3, 0, 4))
-
-
-def decode_local_scores(scores, directions):
-    if directions.ndim == 2:
-        return scores @ directions
-    return (scores.unsqueeze(-1) * directions).sum(-2)
 
 
 @torch.compile(dynamic=False)
@@ -246,19 +226,27 @@ def norm_move(x, v, sigma=0.01):
 
 
 @torch.compile(dynamic=False)
-def prepared_gate_input_response(x, weight, kappa, rows, projected_rows, row_square, sigma):
+def stacked_gate_input_responses(raws, ves, blocks, weights, rows, sigma: float):
+    """gate_input_responses with the layers stacked along a batch axis (each GEMM once, as a bmm) and the kappas
+    (raws (tokens, width) and ves the layers' value embeddings) and casts inside the graph."""
+    x = torch.stack(blocks).float().flatten(1, 2)
+    weight = torch.stack(weights).float()
+    r = torch.stack(rows)
+    heads, k = weight.shape[1:]
+    raw = torch.stack(raws)
+    kappa = (raw.view(*raw.shape[:2], heads, -1) * torch.stack(ves).float().view(*raw.shape[:2], heads, -1)).sum(-1)
+    projected = r[..., :k] @ weight.transpose(1, 2)
+    row_square = r.square().mean(-1)
     steps = sigma * x.square().mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
     square = x.square().mean(-1, keepdim=True)
-    cross = (x @ rows.T) / x.shape[-1]
-    direction_square = row_square.unsqueeze(0)
-    base = F.linear(x[:, :weight.shape[1]], weight).unsqueeze(1)
-    direction = projected_rows.unsqueeze(0)
-    positive = torch.rsqrt(square + 2 * steps * cross + steps.square() * direction_square + EPS)
-    negative = torch.rsqrt(square - 2 * steps * cross + steps.square() * direction_square + EPS)
-    zp = (base + steps.unsqueeze(-1) * direction) * positive.unsqueeze(-1)
-    zm = (base - steps.unsqueeze(-1) * direction) * negative.unsqueeze(-1)
-    response = ((torch.sigmoid(zp) - torch.sigmoid(zm)) * kappa.unsqueeze(1)).sum(-1) / steps
-    return decode_local_scores(response, rows) / len(rows)
+    cross = (x @ r.transpose(1, 2)) / x.shape[-1]
+    base = (x[..., :k] @ weight.transpose(1, 2)).unsqueeze(2)
+    positive = torch.rsqrt(square + 2 * steps * cross + steps.square() * row_square.unsqueeze(1) + EPS)
+    negative = torch.rsqrt(square - 2 * steps * cross + steps.square() * row_square.unsqueeze(1) + EPS)
+    zp = (base + steps.unsqueeze(-1) * projected.unsqueeze(1)) * positive.unsqueeze(-1)
+    zm = (base - steps.unsqueeze(-1) * projected.unsqueeze(1)) * negative.unsqueeze(-1)
+    response = ((torch.sigmoid(zp) - torch.sigmoid(zm)) * kappa.unsqueeze(2)).sum(-1) / steps
+    return (response @ r / r.shape[1]).unbind(0)
 
 
 def center_routed_values(values, probabilities, rest):
@@ -266,94 +254,77 @@ def center_routed_values(values, probabilities, rest):
     return (values.float() - origin.unsqueeze(-2)).to(values.dtype)
 
 
-@torch.compile(dynamic=False)
-def preproject_routed_values(values, probabilities, rest, w_proj_t):
-    centered = center_routed_values(values, probabilities, rest)
-    heads, tokens, count, width = centered.shape
-    output_width = w_proj_t.shape[1]
-    projected = torch.bmm(centered.reshape(heads, tokens * count, width),
-      w_proj_t.to(centered.dtype).reshape(heads, width, output_width))
-    return projected.view(heads, tokens, count, output_width)
+def project_routed_values_token_major(values, probabilities, rest, w_proj_t):
+    """preproject_routed_values(...).transpose(0, 1).contiguous() without the transposed copy."""
+    centered = center_routed_values_compiled(values, probabilities, rest).contiguous()
+    # 4 tokens x 256 columns per program: each head's weight slice read once (bitwise)
+    return project_values.project_values(centered, w_proj_t)
 
 
-@triton.jit
-def _fused_query_replay(Raw, R0, Cos, Sin, Inv, Shift, KeysPtr, Prob, Out,
-    P: tl.constexpr, H: tl.constexpr, D: tl.constexpr, K: tl.constexpr,
-    BP: tl.constexpr, BK: tl.constexpr, EPS_: tl.constexpr):
-    token, head = tl.program_id(1) // H, tl.program_id(1) % H
-    pp = tl.program_id(0) * BP + tl.arange(0, BP)
-    hh = tl.arange(0, D // 2)
-    dd = tl.arange(0, D)
-    base = ((token * P + pp[:, None]) * H + head) * D
-    a = tl.load(Raw + base + hh[None, :], pp[:, None] < P, 0).to(tl.float32)
-    b = tl.load(Raw + base + D // 2 + hh[None, :], pp[:, None] < P, 0).to(tl.float32)
-    c = tl.load(Cos + token * (D // 2) + hh)
-    s = tl.load(Sin + token * (D // 2) + hh)
-    r0a = tl.load(R0 + (token * H + head) * D + hh)
-    r0b = tl.load(R0 + (token * H + head) * D + D // 2 + hh)
-    ra = a * c[None, :] + b * s[None, :]
-    rb = -a * s[None, :] + b * c[None, :]
-    g = tl.load(Inv + token * P + pp, pp < P, 0)[:, None]
-    h = tl.load(Shift + token * P + pp, pp < P, 0)[:, None]
-    ra, rb = ra * g + h * r0a[None, :], rb * g + h * r0b[None, :]
-    sq = tl.sum(r0a * r0a, 0) + tl.sum(r0b * r0b, 0)
-    dots = tl.sum(ra * r0a[None, :], 1) + tl.sum(rb * r0b[None, :], 1)
-    moved = tl.sum(ra * ra, 1) + tl.sum(rb * rb, 1)
-    inv0 = tl.math.rsqrt(sq / D + EPS_)
-    inv = tl.math.rsqrt((sq + 2 * dots + moved) / D + EPS_)
-    shift = (inv - inv0)[:, None]
-    dqa = (ra * inv[:, None] + r0a[None, :] * shift).to(tl.bfloat16)
-    dqb = (rb * inv[:, None] + r0b[None, :] * shift).to(tl.bfloat16)
-    dq = tl.reshape(tl.trans(tl.join(dqa, dqb), (0, 2, 1)), (BP, D))
-    rr = tl.arange(0, BK)
-    offsets = ((token * H + head) * K + rr[:, None]) * D + dd[None, :]
-    keys = tl.load(KeysPtr + offsets, rr[:, None] < K, 0)
-    prob = tl.load(Prob + (token * H + head) * K + rr, rr < K, 0)
-    ds = tl.dot(dq, tl.trans(keys)).to(tl.bfloat16).to(tl.float32) * (D ** -.5)
-    u = tl.exp(ds) - 1.0
-    z = tl.sum(prob[None, :] * u, 1)
-    weights = prob[None, :] * u / (1.0 + z[:, None])
-    tl.store(Out + ((token * P + pp[:, None]) * H + head) * K + rr[None, :],
-      weights.to(tl.bfloat16), (pp[:, None] < P) & (rr[None, :] < K))
+center_routed_values_compiled = torch.compile(lambda v, p, r: center_routed_values(v, p, r), dynamic=False)
 
 
-@torch.library.custom_op('noise_record::fused_query_weights', mutates_args=())
-def fused_query_weights(raw: torch.Tensor, r0: torch.Tensor,
-    cos: torch.Tensor, sin: torch.Tensor, inv: torch.Tensor, shift: torch.Tensor,
-    keys: torch.Tensor, prob: torch.Tensor) -> torch.Tensor:
-    m, probes = raw.shape[:2]
-    heads, width = r0.shape[1:]
-    count = keys.shape[2]
-    out = torch.empty((m, probes, heads * count), device=raw.device, dtype=torch.bfloat16)
-    _fused_query_replay[(triton.cdiv(probes, 32), m * heads)](
-      raw.contiguous(), r0.float().contiguous(), cos.float().contiguous(),
-      sin.float().contiguous(), inv.float().contiguous(), shift.float().contiguous(),
-      keys.contiguous(), prob.contiguous(), out,
-      probes, heads, width, count, 32, max(16, triton.next_power_of_2(count)), EPS, num_warps=4)
-    return out
-
-
-@fused_query_weights.register_fake
-def _(raw, r0, cos, sin, inv, shift, keys, prob):
-    return torch.empty((raw.shape[0], raw.shape[1], keys.shape[1] * keys.shape[2]),
-      device=raw.device, dtype=torch.bfloat16)
-
-
-def fused_projected_response(raw, r0, cos, sin, inv, shift, keys, projected_values, prob):
-    weights = fused_query_weights(raw, r0, cos, sin, inv, shift, keys, prob)
-    return torch.bmm(weights, projected_values.flatten(1, 2)).float()
-
-
-def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, cos, sin, query_inv):
-    m, probes, _ = delta.shape
+def query_change_routed(x, pos, w_q, top_keys, top_values, top_p, cos, sin, query_inv, factored):
+    """The attention replay's response weights right after a root, the query change from the root's routed factors
+    (factored); returns them with the projected top values."""
+    m = x.shape[0]
     _, heads, _, width = top_keys.shape
     c, s = cos[pos][:, None], sin[pos][:, None]
     q0 = (norm(x) @ w_q.T).view(m, heads, width)
     r0 = torch.cat([q0[..., :width // 2] * c + q0[..., width // 2:] * s,
       q0[..., :width // 2] * -s + q0[..., width // 2:] * c], -1)
     inv0, inv = query_inv
-    raw = (delta @ w_q.T.to(torch.bfloat16)).view(m, probes, heads, width)
-    return fused_projected_response(raw, r0, cos[pos], sin[pos], inv, inv / inv0 - 1, top_keys, top_values, top_p)
+    change, steps, scale, wo, routes, basis = factored
+    # A_t transposed and w_q's rows interleaved per head: its own factors op
+    at, f = query_factored_gluon.query_factors_t(wo, routes, basis, w_q)
+    weights = query_factored_gluon.fused_query_replay_factored_gluon(change, steps, scale, at, f, r0,
+        cos[pos], sin[pos], inv, inv / inv0 - 1, top_keys, top_p)
+    return weights, top_values.flatten(1, 2)
+
+
+@torch.compile(dynamic=False)
+def key_context_group(qs, ks, vs, ves, gates, targets, cos, sin, heads: int):
+    """key_context_tensors for several layers, stacked along the head axis in the same compiled graph."""
+    t = qs[0].shape[0]
+    hd = qs[0].shape[1] // heads
+    split = lambda z_: z_.float().view(t, heads, hd).transpose(0, 1)
+    rot = lambda z_: torch.cat([z_[..., :hd // 2] * cos + z_[..., hd // 2:] * sin,
+                                -z_[..., :hd // 2] * sin + z_[..., hd // 2:] * cos], -1)
+    unit = lambda z_: z_ * torch.rsqrt(z_.square().mean(-1, keepdim=True) + EPS)
+    out = [], [], [], [], []
+    for q, k, v, ve, z, target in zip(qs, ks, vs, ves, gates, targets):
+        k_raw, values = split(k), split(v)
+        if ve is not None:
+            values = values + 2 * torch.sigmoid(z.float().view(t, heads)).T.unsqueeze(-1) * split(ve)
+        for acc, part in zip(out, (unit(rot(split(q))), unit(rot(k_raw)), k_raw, values, split(target))):
+            acc.append(part)
+    return tuple(torch.cat(acc, 0) for acc in out)
+
+
+@torch.compile(dynamic=False)
+def key_context_group_moments(qs, ks, vs, ves, gates, targets, cos, sin, heads: int, sigma: float):
+    """key_context_group, and query_moment_inputs' outputs for the stacked layers, in one compiled graph (the bf16
+    copies written while the fp32 tensors are formed, not reread)."""
+    qp, kp, k_raw, values, hub = key_context_group(qs, ks, vs, ves, gates, targets, cos, sin, heads)
+    q_out = torch.cat(qs, 1)
+    return (qp, kp, k_raw, values, hub), query_moment_inputs(q_out, qp, kp, values, hub, sigma)
+
+
+@torch.compile(dynamic=False)
+def query_moment_inputs(q_out, qp, kp, values, hub, sigma: float):
+    heads, t, hd = qp.shape
+    q_raw = q_out.float().view(t, heads, hd).transpose(0, 1)
+    sq = q_raw.square().sum(-1)
+    steps = sigma * (sq / hd).sqrt().clamp(min=1e-6)
+    b16 = lambda z_: z_.to(torch.bfloat16).contiguous()
+    return b16(qp), b16(kp), b16(values), b16(hub), q_raw.contiguous().unsqueeze(0), sq.contiguous(), steps.contiguous()
+
+
+@torch.compile(dynamic=False)
+def response_scores(hpre, radius, out_norm):
+    plus = F.relu(hpre + radius).square()
+    minus = F.relu(hpre - radius).square()
+    return (plus - minus).abs() * out_norm
 
 
 @torch.compile(dynamic=False)
@@ -370,231 +341,6 @@ def norm_input_credit(x, g, sigma, H):
     return ((up - down) / (2 * step)) @ H / width
 
 
-@torch.no_grad()
-@torch.compile(dynamic=False)
-def readout_curvature_diagonal(weight, c2):
-    """Diagonal of each token's readout curvature W^T diag(c2) W; the readout moments keep only this diagonal."""
-    return c2 @ weight.square()
-
-
-@torch.no_grad()
-def head_moments(xL, base, weight):
-    width = xL.shape[-1]
-    inv0 = torch.rsqrt(xL.square().sum(-1, keepdim=True) / width + EPS)
-    t = torch.tanh(base * inv0 / 15)
-    f, f1 = 15 * t, 1 - t.square()
-    f2 = -(2 / 15) * t * f1
-    prob = torch.softmax(f, -1)
-    c1, c2 = prob * f1, prob * (f2 + f1.square()) / 2
-    b1, b2 = (c1 * base).sum(-1), (c2 * base.square()).sum(-1)
-    mu1, nu = c1 @ weight, (c2 * base) @ weight
-    second = readout_curvature_diagonal(weight, c2)
-    return b1, b2, mu1, nu, second
-
-
-@triton.jit
-def _route_gate_kernel(Delta, Weight, Routes, Clean, Inv0, Inv, Out, Steps, Projection,
-    P: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
-    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr, ROOT: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    token = tl.program_id(2)
-    pp = tl.program_id(0) * BM + tl.arange(0, BM)
-    rr = tl.program_id(1) * BN + tl.arange(0, BN)
-    chosen = tl.load(Routes + token * R + rr, rr < R, 0)
-    acc = tl.zeros((BM, BN), tl.float32)
-    if ROOT:
-        q = tl.load(Projection + chosen[:, None] * P + pp[None, :],
-        (rr[:, None] < R) & (pp[None, :] < P), 0)
-        step16 = tl.load(Steps + token).to(tl.bfloat16).to(tl.float32)
-        acc = tl.trans(q) * step16
-    else:
-        for k0 in range(0, D, BK):
-            kk = k0 + tl.arange(0, BK)
-            a = tl.load(Delta + token * S0 + pp[:, None] * S1 + kk[None, :] * S2,
-          (pp[:, None] < P) & (kk[None, :] < D), 0).to(tl.bfloat16)
-            b = tl.load(Weight + chosen[:, None] * D + kk[None, :],
-          (rr[:, None] < R) & (kk[None, :] < D), 0).to(tl.bfloat16)
-            acc += tl.dot(a, tl.trans(b))
-    moved = acc.to(tl.bfloat16).to(tl.float32)
-    inv = tl.load(Inv + token * P + pp, pp < P, 0)
-    inv0 = tl.load(Inv0 + token)
-    h = tl.load(Clean + token * R + rr, rr < R, 0).to(tl.float32)
-    dh = inv[:, None] * moved + (inv / inv0 - 1)[:, None] * h[None, :]
-    up, down = tl.maximum(h[None, :] + dh, 0), tl.maximum(h[None, :], 0)
-    changed = ((up - down) * (up + down)).to(tl.bfloat16)
-    tl.store(Out + (token * P + pp[:, None]) * R + rr[None, :], changed,
-      (pp[:, None] < P) & (rr[None, :] < R))
-
-
-@triton.jit
-def _route_output_parts(Change, Weight, Routes, Delta, Steps, Basis,
-    token, pp, dd, P: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
-    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr, ROOT: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, INJECT: tl.constexpr):
-    acc = tl.zeros((BM, BN), tl.float32)
-    for r0 in range(0, R, BK):
-        rr = r0 + tl.arange(0, BK)
-        chosen = tl.load(Routes + token * R + rr, rr < R, 0)
-        a = tl.load(Change + (token * P + pp[:, None]) * R + rr[None, :],
-        (pp[:, None] < P) & (rr[None, :] < R), 0)
-        b = tl.load(Weight + chosen[:, None] * D + dd[None, :],
-        (rr[:, None] < R) & (dd[None, :] < D), 0).to(tl.bfloat16)
-        acc += tl.dot(a, b)
-    moved = acc.to(tl.bfloat16).to(tl.float32)
-    if ROOT:
-        step = tl.load(Steps + token)
-        basis = tl.load(Basis + pp[:, None] * D + dd[None, :],
-        (pp[:, None] < P) & (dd[None, :] < D), 0).to(tl.float32)
-        old = step * basis
-    else:
-        old = tl.load(Delta + token * S0 + pp[:, None] * S1 + dd[None, :] * S2,
-        (pp[:, None] < P) & (dd[None, :] < D), 0).to(tl.float32)
-        if INJECT:
-            step = tl.load(Steps + token)
-            frame = tl.load(Basis + pp[:, None] * D + dd[None, :],
-          (pp[:, None] < P) & (dd[None, :] < D), 0).to(tl.float32)
-            old = old + step * frame
-    return old, moved
-
-
-@triton.jit
-def _route_output_kernel(Change, Weight, Routes, Delta, Out, Steps, Basis, Scale,
-    P: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
-    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr, ROOT: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    token = tl.program_id(2)
-    pp = tl.program_id(0) * BM + tl.arange(0, BM)
-    dd = tl.program_id(1) * BN + tl.arange(0, BN)
-    old, moved = _route_output_parts(
-        Change, Weight, Routes, Delta, Steps, Basis, token, pp, dd,
-        P, D, R, S0, S1, S2, ROOT, BM, BN, BK, False)
-    result = (old + moved).to(tl.bfloat16)
-    result = (result.to(tl.float32) * tl.load(Scale)).to(tl.bfloat16)
-    tl.store(Out + (token * P + pp[:, None]) * D + dd[None, :], result,
-      (pp[:, None] < P) & (dd[None, :] < D))
-
-
-@torch.library.custom_op('noise_record::route_mlp', mutates_args=())
-def route_mlp(delta: torch.Tensor, fc: torch.Tensor, wo: torch.Tensor,
-    routes: torch.Tensor, clean: torch.Tensor,
-    inv0: torch.Tensor, inv: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
-    n, p, d = delta.shape
-    r = routes.shape[1]
-    routes, clean = routes.contiguous(), clean.contiguous()
-    change = torch.empty((n, p, r), device=delta.device, dtype=torch.bfloat16)
-    out = torch.empty((n, p, d), device=delta.device, dtype=torch.bfloat16)
-    _route_gate_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(r, meta['BN']), n)](
-      delta, fc, routes, clean, inv0.contiguous(), inv.contiguous(), change, delta, delta,
-      p, d, r, *delta.stride(), False, BM=64, BN=min(128, r), BK=64, num_warps=8, num_stages=3)
-    _route_output_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(d, meta['BN']), n)](
-      change, wo, routes, delta, out, delta, delta, out_scale, p, d, r, *delta.stride(),
-      False, BM=64, BN=128, BK=r, num_warps=8, num_stages=2)
-    return out
-
-
-@route_mlp.register_fake
-def _(delta, fc, wo, routes, clean, inv0, inv, out_scale):
-    return torch.empty(delta.shape, device=delta.device, dtype=torch.bfloat16)
-
-
-def mlp_statistics_storage(n, p, ns, nb, device):
-    # Stored as (token, statistic, tile, probe) and viewed as (token, probe, statistic, tile).
-    return torch.empty((n, ns, nb, p), device=device, dtype=torch.float32).permute(0, 3, 1, 2)
-
-
-@triton.jit
-def _mlp_output_stats_kernel(Change, Weight, Routes, Delta, Out, Stats, X, Lambda,
-    Target, Mu, Nu, Diag, Steps, Basis,
-    P: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
-    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
-    MODE: tl.constexpr, NS: tl.constexpr, NB: tl.constexpr, INJECT: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    token = tl.program_id(2)
-    pp = tl.program_id(0) * BM + tl.arange(0, BM)
-    dd = tl.program_id(1) * BN + tl.arange(0, BN)
-    old, moved = _route_output_parts(
-        Change, Weight, Routes, Delta, Steps, Basis, token, pp, dd,
-        P, D, R, S0, S1, S2, False, BM, BN, BK, INJECT)
-    value = (old + moved).to(tl.bfloat16).to(tl.float32)
-    if MODE == 1:
-        value = value * tl.load(Lambda).to(tl.float32)
-        tl.store(Out + (token * P + pp[:, None]) * D + dd[None, :], value.to(tl.bfloat16),
-          (pp[:, None] < P) & (dd[None, :] < D))
-    xx = tl.load(X + token * D + dd, dd < D, 0).to(tl.float32)
-    pos = (token * NS * NB + tl.program_id(1)) * P + pp
-    ss: tl.constexpr = NB * P
-    tl.store(Stats + pos, tl.sum(value * xx[None, :], 1), pp < P)
-    tl.store(Stats + pos + ss, tl.sum(value * value, 1), pp < P)
-    if MODE == 2:
-        target = tl.load(Target + token * D + dd, dd < D, 0).to(tl.float32)
-        mu = tl.load(Mu + token * D + dd, dd < D, 0).to(tl.float32)
-        nu = tl.load(Nu + token * D + dd, dd < D, 0).to(tl.float32)
-        diag = tl.load(Diag + token * D + dd, dd < D, 0).to(tl.float32)
-        tl.store(Stats + pos + 2 * ss, tl.sum(value * target[None, :], 1), pp < P)
-        tl.store(Stats + pos + 3 * ss, tl.sum(value * mu[None, :], 1), pp < P)
-        tl.store(Stats + pos + 4 * ss, tl.sum(value * nu[None, :], 1), pp < P)
-        tl.store(Stats + pos + 5 * ss, tl.sum(value * value * diag[None, :], 1), pp < P)
-
-
-def launch_mlp_output_stats(out, delta, fc, wo, routes, clean, inv0, inv, x, scale, target, mu, nu, diag, mode,
-    steps, frame, packed):
-    n, p, d = delta.shape
-    r = routes.shape[1]
-    routes, clean = routes.contiguous(), clean.contiguous()
-    ns, nb = (2 if mode == 1 else 6), triton.cdiv(d, 64 if mode == 1 else 128)
-    change = torch.empty((n, p, r), device=delta.device, dtype=torch.bfloat16)
-    stats = mlp_statistics_storage(n, p, ns, nb, delta.device)
-    tile = min(64, r)
-    inject = steps is not None
-    steps = delta if steps is None else steps.contiguous()
-    frame = delta if frame is None else frame.contiguous()
-    gate_input = delta if packed is None else packed
-    _route_gate_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(r, meta['BN']), n)](
-      gate_input, fc, routes, clean, inv0.contiguous(), inv.contiguous(), change, delta, delta,
-      p, d, r, *gate_input.stride(), False, BM=64, BN=min(128, r), BK=64, num_warps=8, num_stages=3)
-    _mlp_output_stats_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(d, meta['BN']), n)](
-      change, wo, routes, delta, out, stats, x.contiguous(), scale, target.contiguous(),
-      mu.contiguous(), nu.contiguous(), diag.contiguous(), steps, frame, p, d, r, *delta.stride(),
-      mode, ns, nb, inject, BM=64, BN=64 if mode == 1 else 128, BK=r if mode == 1 else tile,
-      num_warps=4, num_stages=2 if mode == 1 else 3, enable_fp_fusion=False)
-    return stats
-
-
-@torch.library.custom_op('noise_record::mlp_output_stats', mutates_args=())
-def mlp_output_stats(delta: torch.Tensor, fc: torch.Tensor, wo: torch.Tensor,
-    routes: torch.Tensor, clean: torch.Tensor, inv0: torch.Tensor,
-    inv: torch.Tensor, x: torch.Tensor, scale: torch.Tensor, steps: Optional[torch.Tensor],
-    frame: Optional[torch.Tensor], packed: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Routed MLP output scaled by the next block's residual scalar, with the partials of the next block's norm."""
-    out = torch.empty(delta.shape, device=delta.device, dtype=torch.bfloat16)
-    stats = launch_mlp_output_stats(out, delta, fc, wo, routes, clean, inv0, inv, x, scale, x, x, x, x, 1,
-      steps, frame, packed)
-    return out, stats
-
-
-@mlp_output_stats.register_fake
-def _(delta, fc, wo, routes, clean, inv0, inv, x, scale, steps, frame, packed):
-    n, p, d = delta.shape
-    return (torch.empty(delta.shape, device=delta.device, dtype=torch.bfloat16),
-      mlp_statistics_storage(n, p, 2, triton.cdiv(d, 64), delta.device))
-
-
-@torch.library.custom_op('noise_record::mlp_readout_stats', mutates_args=())
-def mlp_readout_stats(delta: torch.Tensor, fc: torch.Tensor, wo: torch.Tensor,
-    routes: torch.Tensor, clean: torch.Tensor, inv0: torch.Tensor, inv: torch.Tensor,
-    x: torch.Tensor, target: torch.Tensor, mu: torch.Tensor, nu: torch.Tensor, diag: torch.Tensor,
-    steps: Optional[torch.Tensor], frame: Optional[torch.Tensor], packed: Optional[torch.Tensor]) -> torch.Tensor:
-    """Last block's routed MLP: partials of the readout moments only (the output itself is not written)."""
-    return launch_mlp_output_stats(delta, delta, fc, wo, routes, clean, inv0, inv, x, x, target, mu, nu, diag, 2,
-      steps, frame, packed)
-
-
-@mlp_readout_stats.register_fake
-def _(delta, fc, wo, routes, clean, inv0, inv, x, target, mu, nu, diag, steps, frame, packed):
-    n, p, d = delta.shape
-    return mlp_statistics_storage(n, p, 6, triton.cdiv(d, 128), delta.device)
-
-
 def root_norm_inverses(x, steps, basis):
     d = x.shape[-1]
     sq = x.square().sum(-1, keepdim=True)
@@ -603,192 +349,8 @@ def root_norm_inverses(x, steps, basis):
     return torch.rsqrt(sq / d + EPS), torch.rsqrt((sq + 2 * dots + moved_sq) / d + EPS)
 
 
-@torch.library.custom_op('noise_record::route_mlp_root', mutates_args=())
-def route_mlp_root(steps: torch.Tensor, basis: torch.Tensor, projection: torch.Tensor,
-    wo: torch.Tensor, routes: torch.Tensor, clean: torch.Tensor,
-    inv0: torch.Tensor, inv: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
-    n, d, p = steps.shape[0], wo.shape[1], basis.shape[0]
-    r = routes.shape[1]
-    steps, basis = steps.contiguous(), basis.contiguous()
-    routes, clean = routes.contiguous(), clean.contiguous()
-    change = torch.empty((n, p, r), device=wo.device, dtype=torch.bfloat16)
-    out = torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16)
-    _route_gate_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(r, meta['BN']), n)](
-      steps, steps, routes, clean, inv0.contiguous(), inv.contiguous(), change, steps, projection,
-      p, d, r, 0, 0, 0, True, BM=64, BN=64, BK=64, num_warps=4, num_stages=3)
-    _route_output_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(d, meta['BN']), n)](
-      change, wo, routes, steps, out, steps, basis, out_scale, p, d, r, 0, 0, 0,
-      True, BM=64, BN=64, BK=64, num_warps=4, num_stages=3)
-    return out
-
-
-@route_mlp_root.register_fake
-def _(steps, basis, projection, wo, routes, clean, inv0, inv, out_scale):
-    return torch.empty((steps.shape[0], basis.shape[0], wo.shape[1]), device=wo.device, dtype=torch.bfloat16)
-
-
-@triton.jit
-def _injected_norm_kernel(X, Delta, Steps, Basis, Inv0, Inv, Mixed,
-    P: tl.constexpr, D: tl.constexpr,
-    S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
-    BM: tl.constexpr, BD: tl.constexpr, EPSILON: tl.constexpr):
-    token = tl.program_id(0)
-    pp = tl.program_id(1) * BM + tl.arange(0, BM)
-    dd = tl.arange(0, BD)
-    x = tl.load(X + token * D + dd, dd < D, 0).to(tl.float32)
-    delta = tl.load(Delta + token * S0 + pp[:, None] * S1 + dd[None, :] * S2,
-      (pp[:, None] < P) & (dd[None, :] < D), 0).to(tl.float32)
-    frame = tl.load(Basis + pp[:, None] * D + dd[None, :],
-      (pp[:, None] < P) & (dd[None, :] < D), 0).to(tl.float32)
-    step = tl.load(Steps + token)
-    moved = delta + step * frame
-    tl.store(Mixed + (token * P + pp[:, None]) * D + dd[None, :], moved.to(tl.bfloat16),
-      (pp[:, None] < P) & (dd[None, :] < D))
-    square = tl.sum(x * x, 0)
-    dot = tl.sum(moved * x[None, :], 1)
-    move_square = tl.sum(moved * moved, 1)
-    inv = tl.rsqrt((square + 2 * dot + move_square) / D + EPSILON)
-    tl.store(Inv + token * P + pp, inv, pp < P)
-    if tl.program_id(1) == 0:
-        tl.store(Inv0 + token, tl.rsqrt(square / D + EPSILON))
-
-
-@torch.library.custom_op('noise_record::injected_norm_packed', mutates_args=())
-def injected_norm_packed(x: torch.Tensor, delta: torch.Tensor, steps: torch.Tensor,
-    basis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    n, p, d = delta.shape
-    x, steps, basis = x.contiguous(), steps.contiguous(), basis.contiguous()
-    inv0 = torch.empty((n, 1), device=x.device, dtype=torch.float32)
-    inv = torch.empty((n, p), device=x.device, dtype=torch.float32)
-    mixed = torch.empty((n, p, d), device=x.device, dtype=torch.bfloat16)
-    _injected_norm_kernel[(n, triton.cdiv(p, 8))](
-      x, delta, steps, basis, inv0, inv, mixed, p, d, *delta.stride(),
-      BM=8, BD=triton.next_power_of_2(d), EPSILON=EPS, num_warps=4, enable_fp_fusion=False)
-    return inv0, inv, mixed
-
-
-@injected_norm_packed.register_fake
-def _(x, delta, steps, basis):
-    return (torch.empty((delta.shape[0], 1), device=x.device, dtype=torch.float32),
-      torch.empty(delta.shape[:2], device=x.device, dtype=torch.float32),
-      torch.empty(delta.shape, device=x.device, dtype=torch.bfloat16))
-
-
 def attention_replay_layers(roots, layers, long_layers):
     return tuple(b for b in range(roots[0] + 1, layers) if b in long_layers)
-
-
-@triton.jit
-def _route_output_query_stats_kernel(
-  Change, Weight, Routes, Delta, Out, Steps, Basis,
-  NextX, Scale, Stats,
-  P: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
-  S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
-  ROOT: tl.constexpr,
-  NB: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-):
-    token = tl.program_id(2)
-    pp = tl.program_id(0) * BM + tl.arange(0, BM)
-    dd = tl.program_id(1) * BN + tl.arange(0, BN)
-    old, moved = _route_output_parts(
-        Change, Weight, Routes, Delta, Steps, Basis, token, pp, dd,
-        P, D, R, S0, S1, S2, ROOT, BM, BN, BK, False)
-    result = (old + moved).to(tl.bfloat16)
-    result = (result.to(tl.float32) * tl.load(Scale)).to(tl.bfloat16)
-    tl.store(
-      Out + (token * P + pp[:, None]) * D + dd[None, :],
-      result, (pp[:, None] < P) & (dd[None, :] < D),
-    )
-    value = result.to(tl.float32)
-    x = tl.load(NextX + token * D + dd, dd < D, 0).to(tl.float32)
-    dot = tl.sum(value * x[None, :], 1)
-    square = tl.sum(value * value, 1)
-    position = (token * 2 * NB + tl.program_id(1)) * P + pp
-    ss: tl.constexpr = NB * P
-    tl.store(Stats + position, dot, pp < P)
-    tl.store(Stats + position + ss, square, pp < P)
-
-
-@torch.library.custom_op('noise_record::route_mlp_query_stats', mutates_args=())
-def route_mlp_query_stats(
-  delta: torch.Tensor, fc: torch.Tensor, wo: torch.Tensor,
-  routes: torch.Tensor, clean: torch.Tensor,
-  inv0: torch.Tensor, inv: torch.Tensor,
-  out_scale: torch.Tensor, next_x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n, p, d = delta.shape
-    r = routes.shape[1]
-    routes, clean, next_x = routes.contiguous(), clean.contiguous(), next_x.contiguous()
-    tile, nb = min(64, r), triton.cdiv(d, 64)
-    change = torch.empty((n, p, r), device=delta.device, dtype=torch.bfloat16)
-    out = torch.empty((n, p, d), device=delta.device, dtype=torch.bfloat16)
-    partials = mlp_statistics_storage(n, p, 2, nb, delta.device)
-    _route_gate_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(r, meta['BN']), n)](
-      delta, fc, routes, clean, inv0.contiguous(), inv.contiguous(),
-      change, delta, delta,
-      p, d, r, *delta.stride(), False,
-      BM=64, BN=tile, BK=64, num_warps=4, num_stages=3,
-    )
-    _route_output_query_stats_kernel[
-      lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(d, meta['BN']), n)
-    ](
-      change, wo, routes, delta, out, delta, delta,
-      next_x, out_scale, partials,
-      p, d, r, *delta.stride(), False, nb,
-      BM=64, BN=64, BK=tile, num_warps=4, num_stages=3,
-    )
-    return out, partials
-
-
-@route_mlp_query_stats.register_fake
-def _(delta, fc, wo, routes, clean, inv0, inv, out_scale, next_x):
-    n, p, d = delta.shape
-    return (
-      torch.empty(delta.shape, device=delta.device, dtype=torch.bfloat16),
-      mlp_statistics_storage(n, p, 2, triton.cdiv(d, 64), delta.device),
-    )
-
-
-@torch.library.custom_op('noise_record::route_mlp_root_query_stats', mutates_args=())
-def route_mlp_root_query_stats(
-  steps: torch.Tensor, basis: torch.Tensor,
-  projection: torch.Tensor, wo: torch.Tensor,
-  routes: torch.Tensor, clean: torch.Tensor,
-  inv0: torch.Tensor, inv: torch.Tensor,
-  out_scale: torch.Tensor, next_x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n, d, p = steps.shape[0], wo.shape[1], basis.shape[0]
-    r = routes.shape[1]
-    steps, basis = steps.contiguous(), basis.contiguous()
-    routes, clean, next_x = routes.contiguous(), clean.contiguous(), next_x.contiguous()
-    nb = triton.cdiv(d, 64)
-    change = torch.empty((n, p, r), device=wo.device, dtype=torch.bfloat16)
-    out = torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16)
-    partials = mlp_statistics_storage(n, p, 2, nb, wo.device)
-    _route_gate_kernel[lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(r, meta['BN']), n)](
-      steps, steps, routes, clean, inv0.contiguous(), inv.contiguous(),
-      change, steps, projection,
-      p, d, r, 0, 0, 0, True,
-      BM=64, BN=64, BK=64, num_warps=4, num_stages=3,
-    )
-    _route_output_query_stats_kernel[
-      lambda meta: (triton.cdiv(p, meta['BM']), triton.cdiv(d, meta['BN']), n)
-    ](
-      change, wo, routes, steps, out, steps, basis,
-      next_x, out_scale, partials,
-      p, d, r, 0, 0, 0, True, nb,
-      BM=64, BN=64, BK=64, num_warps=4, num_stages=3,
-    )
-    return out, partials
-
-
-@route_mlp_root_query_stats.register_fake
-def _(steps, basis, projection, wo, routes, clean, inv0, inv, out_scale, next_x):
-    n, p, d = steps.shape[0], basis.shape[0], wo.shape[1]
-    return (
-      torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16),
-      mlp_statistics_storage(n, p, 2, triton.cdiv(d, 64), wo.device),
-    )
 
 
 def query_inverses_from_output_partials(next_x, partials):
@@ -802,61 +364,36 @@ def query_inverses_from_output_partials(next_x, partials):
 
 
 def chain_chunk_eager(site, root_moves, mids, xL, idx, hs, lam_r, w_fc, w_out_t, base,
-    target_logit_w, y, own, moments, root_projection, injections, query_layers):
-    """Replay one root group: the first root's signed frame moves enter at site and each partner's at its own
-    block, through routed MLPs, with attention replayed only at query_layers. A partner must be the last block
-    or be followed by a block that is neither replayed with attention nor another partner. Returns each token's
-    moved-minus-clean loss for every move, from diagonal readout moments."""
+    target_logit_w, y, own, moments, root_projection, query_layers):
+    """Replay one root: its signed frame moves enter at block site, through routed MLPs, with attention replayed only
+    at query_layers. Two layouts: a root at block L-2 (root visit and readout in one kernel, visit_chain), or a root at
+    L-4 with the attention replayed at L-3 (the root's routed change feeds the factored query replay; blocks L-3 to
+    L-1 in one kernel, visit_chain3). Returns each token's moved-minus-clean loss for every move, from diagonal readout
+    moments."""
     L = len(mids)
-    pending_inv = pending_query_inv = None
-    delta = None
-    for b in range(site, L):
-        query_inv, pending_query_inv = pending_query_inv, None
-        next_scale = lam_r[b + 1] if b + 1 < L else None
-        next_query_x = own[1][b + 1] if b + 1 in query_layers else None
-        if b > site:
-            if b in query_layers:
-                pos, inputs, w_q, keys, values, prob, cos_sin = own
-                delta = delta + query_change_routed(inputs[b], delta, pos, w_q[b], keys[b], values[b],
-                    prob[b], cos_sin[0], cos_sin[1], query_inv=query_inv)
-            delta = delta.to(torch.bfloat16)
-        if b == site:
-            inv0, inv = root_norm_inverses(mids[b], *root_moves)
-            if next_query_x is None:
-                delta = route_mlp_root(*root_moves, root_projection, w_out_t[b],
-                    idx[b], hs[b], inv0, inv, next_scale)
-            else:
-                delta, partials = route_mlp_root_query_stats(*root_moves, root_projection,
-                    w_out_t[b], idx[b], hs[b], inv0, inv, next_scale, next_query_x)
-                pending_query_inv = query_inverses_from_output_partials(next_query_x, partials)
-            continue
-        injected = next(((steps, frame) for i, steps, frame in injections if i == b), None)
-        if injected is not None:
-            steps, frame = injected
-            inv0, inv, packed = injected_norm_packed(mids[b], delta, steps, frame)
-        else:
-            steps = frame = packed = None
-            inv0, inv = norm_inverses(mids[b], delta) if pending_inv is None else pending_inv
-            pending_inv = None
-        next_attention_held = (b + 1 < L and b + 1 not in query_layers
-            and all(i != b + 1 for i, _, _ in injections))
-        if next_attention_held:
-            delta, partials = mlp_output_stats(delta, w_fc[b], w_out_t[b], idx[b], hs[b], inv0, inv,
-                mids[b+1], lam_r[b+1], steps, frame, packed)
-            stats = partials.sum(-1)
-            clean_sq = mids[b+1].square().sum(-1, keepdim=True)
-            pending_inv = (torch.rsqrt(clean_sq / mids[b+1].shape[-1] + EPS),
-                torch.rsqrt((clean_sq + 2*stats[:, :, 0] + stats[:, :, 1]) / mids[b+1].shape[-1] + EPS))
-        elif b == L - 1:
-            terminal_stats = mlp_readout_stats(delta, w_fc[b], w_out_t[b], idx[b], hs[b], inv0, inv,
-                xL, target_logit_w, moments[2], moments[3], moments[4], steps, frame, packed).sum(-1)
-        else:
-            if next_query_x is None:
-                delta = route_mlp(delta, w_fc[b], w_out_t[b], idx[b], hs[b], inv0, inv, next_scale)
-            else:
-                delta, partials = route_mlp_query_stats(delta, w_fc[b], w_out_t[b], idx[b],
-                    hs[b], inv0, inv, next_scale, next_query_x)
-                pending_query_inv = query_inverses_from_output_partials(next_query_x, partials)
+    tail = (mids[L - 1], w_fc[L - 1], w_out_t[L - 1], idx[L - 1], hs[L - 1], xL, target_logit_w,
+            moments[2], moments[3], moments[4])
+    assert all(idx[b].shape[1] == 64 for b in range(site, L)), 'the fused chain kernels take 64 routes'
+    inv0, inv = root_norm_inverses(mids[site], *root_moves)
+    if site == L - 2:
+        assert not query_layers
+        terminal_stats = visit_chain.fused_root_readout_fast(*root_moves, root_projection, w_out_t[site], idx[site],
+            hs[site], inv0, inv, lam_r[site + 1], *tail)
+    else:
+        b, m = site + 1, site + 2
+        assert site == L - 4 and tuple(query_layers) == (b,)
+        pos, inputs, w_q, keys, values, prob, cos_sin = own
+        assert keys[b].shape[1] * keys[b].shape[2] == 128
+        next_query_x = own[1][b]
+        delta, change, partials = visit_gluon_root.fused_root_visit_change(*root_moves, root_projection,
+            w_out_t[site], idx[site], hs[site], inv0, inv, lam_r[b], next_query_x)
+        factored = (change, root_moves[0], lam_r[b], w_out_t[site], idx[site], root_moves[1])
+        query_inv = query_inverses_from_output_partials(next_query_x, partials)
+        replay_add = query_change_routed(inputs[b], pos, w_q[b], keys[b], values[b], prob[b], cos_sin[0], cos_sin[1],
+            query_inv, factored)
+        delta = delta.to(torch.bfloat16)
+        terminal_stats = visit_chain3.fused_resp_visit_readout_fast(delta, mids[b], w_fc[b], w_out_t[b], idx[b],
+            hs[b], lam_r[b + 1], *replay_add, mids[m], w_fc[m], w_out_t[m], idx[m], hs[m], lam_r[m + 1], *tail)
     sq = xL.square().sum(-1, keepdim=True)
     dots, dsq, target_dot = terminal_stats[:, :, 0], terminal_stats[:, :, 1], terminal_stats[:, :, 2]
     inv = torch.rsqrt((sq + 2 * dots + dsq) / xL.shape[-1] + EPS)
@@ -878,169 +415,87 @@ def chain_chunk_eager(site, root_moves, mids, xL, idx, hs, lam_r, w_fc, w_out_t,
 chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
 
 
-@triton.jit
-def _implicit_key_statistics(Q, K, Values, Hub, LSE, Center,
-    T: tl.constexpr, Window: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr):
-    tile, head = tl.program_id(0), tl.program_id(1)
-    query = tile * BM + tl.arange(0, BM)
-    dims = tl.arange(0, 64)
-    src = tl.arange(0, BN)
-    base = head * T * 64
-    q = tl.load(Q + base + query[:, None] * 64 + dims[None, :])
-    hub = tl.load(Hub + base + query[:, None] * 64 + dims[None, :])
-    maximum = tl.full((BM,), float('-inf'), tl.float32)
-    total = tl.zeros((BM,), tl.float32)
-    score_sum = tl.zeros((BM,), tl.float32)
-    first = tl.maximum(tile * BM - Window, 0) // BN
-    last = tl.cdiv((tile + 1) * BM, BN)
-    for block in range(first, last):
-        source = block * BN + src
-        k = tl.load(K + base + source[:, None] * 64 + dims[None, :])
-        v = tl.load(Values + base + source[:, None] * 64 + dims[None, :])
-        logits = tl.dot(q, tl.trans(k), input_precision='tf32x3') * 0.125
-        scores = tl.dot(hub, tl.trans(v), input_precision='tf32x3')
-        allowed = (source[None, :] <= query[:, None]) & (query[:, None] - source[None, :] <= Window)
-        logits = tl.where(allowed, logits, float('-inf'))
-        next_max = tl.maximum(maximum, tl.max(logits, 1))
-        safe_max = tl.where(next_max == float('-inf'), 0.0, next_max)
-        rescale = tl.exp(maximum - safe_max)
-        prob = tl.exp(logits - safe_max[:, None])
-        total = total * rescale + tl.sum(prob, 1)
-        score_sum = score_sum * rescale + tl.sum(prob * scores, 1)
-        maximum = next_max
-    tl.store(LSE + head * T + query, maximum + tl.log(total))
-    tl.store(Center + head * T + query, score_sum / total)
+# the capture's flex attention tiles: BLOCK_N 128 as the default keeps it bitwise, BLOCK_M 64 / 4 warps / 3 stages
+# fastest (None: the defaults)
+CAPTURE_FLEX_OPTIONS = dict(BLOCK_M=64, BLOCK_N=128, num_warps=4, num_stages=3)
 
 
-def implicit_key_context(q, k, values, hub, window):
-    h, t, _ = q.shape
-    q, k, values, hub = (z.contiguous() for z in (q, k, values, hub))
-    lse = torch.empty((h, t), device=q.device)
-    center = torch.empty_like(lse)
-    _implicit_key_statistics[(t // 16, h)](q, k, values, hub, lse, center,
-      T=t, Window=window, BM=16, BN=64, num_warps=4, num_stages=2)
-    return lse, center
+def capture_attention(q, k, v, window):
+    """utils.model.attention with CAPTURE_FLEX_OPTIONS (inside capture_forward's graph)."""
+    if CAPTURE_FLEX_OPTIONS is None:
+        return attention(q, k, v, window)
+    mask = window_mask(window, q.shape[1], q.device)
+    return flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=mask,
+                          kernel_options=CAPTURE_FLEX_OPTIONS).transpose(1, 2)
 
 
-@triton.jit
-def _key_perturbation_geometry(Raw, Cos, Sin, base, target, dims, dirs, pair, D: tl.constexpr, Sigma: tl.constexpr):
-    raw = tl.load(Raw + base + target[:, None] * D + dims[None, :])
-    raw_j = tl.load(Raw + base + target[:, None] * D + dirs[None, :])
-    sq = tl.sum(raw * raw, 1)[:, None] / D
-    step = Sigma * tl.maximum(tl.sqrt(sq), 1e-06)
-    ratio = (2 * step * raw_j + step * step) / D / (sq + 1.1920928955078125e-07)
-    ca = libdevice.expm1(-0.5 * libdevice.log1p(ratio))
-    cb = step * libdevice.rsqrt(sq + 1.1920928955078125e-07) * (1 + ca)
-    cs = tl.load(Cos + target[:, None] * (D // 2) + pair[None, :])
-    sn = tl.load(Sin + target[:, None] * (D // 2) + pair[None, :])
-    bu = cb * tl.where(dirs[None, :] < D // 2, cs, sn)
-    bw = cb * tl.where(dirs[None, :] < D // 2, -sn, cs)
-    return (ca, bu, bw, step)
+@torch.compile(dynamic=False, options={'combo_kernels': True})
+def capture_forward(model, idx, targets, weights=None):
+    """GPT.forward (utils/model.py) under bf16 autocast, returning the tensors Capture's hooks record: each Linear's
+    input (fp32) and output, the embeddings' outputs, each block's input and the per-token loss. weights: the Linears'
+    bf16 weights by module name (cast once by the caller), else autocast casts them."""
+    inputs, outputs, blocks = {}, {}, {}
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        b, t = idx.shape
+        cos, sin = model.cos[:, :t], model.sin[:, :t]
+        def linear(name, module, z):
+            inputs[name] = z.float()
+            out = module(z) if weights is None else F.linear(z, weights[name])
+            outputs[name] = out
+            return out
+        e = model.transformer.wte(idx)
+        inputs['transformer.wte'], outputs['transformer.wte'] = idx, e
+        x = norm(e)
+        x0 = x
+        for i, block in enumerate(model.transformer.h):
+            x = model.resid_lambdas[i] * x + model.x0_lambdas[i] * x0
+            blocks[i] = x
+            p = f'transformer.h.{i}.'
+            attn = block.attn
+            ve = None
+            if str(i) in model.value_embeds:
+                ve = model.value_embeds[str(i)](idx)
+                inputs[f'value_embeds.{i}'], outputs[f'value_embeds.{i}'] = idx, ve
+            xn = norm(x)
+            h, hd = attn.n_head, attn.head_dim
+            if weights is not None and p + 'attn.qkv' in weights:  # one GEMM, outputs its column slices
+                inputs[p + 'attn.c_q'] = xn.float()
+                qkv = F.linear(xn, weights[p + 'attn.qkv'])
+                c, ck = attn.c_q.weight.shape[0], attn.c_k.weight.shape[0]
+                q, k, v = qkv[..., :c], qkv[..., c:c + ck], qkv[..., c + ck:]
+                outputs[p + 'attn.c_q'], outputs[p + 'attn.c_k'], outputs[p + 'attn.c_v'] = q, k, v
+                q, k, v = q.view(b, t, h, hd), k.view(b, t, attn.n_kv_head, hd), v.view(b, t, attn.n_kv_head, hd)
+            else:
+                q = linear(p + 'attn.c_q', attn.c_q, xn).view(b, t, h, hd)
+                k = linear(p + 'attn.c_k', attn.c_k, xn).view(b, t, attn.n_kv_head, hd)
+                v = linear(p + 'attn.c_v', attn.c_v, xn).view(b, t, attn.n_kv_head, hd)
+            if ve is not None:
+                gate = 2 * torch.sigmoid(linear(p + 'attn.ve_gate', attn.ve_gate, xn[..., :attn.ve_gate_channels]))
+                v = v + gate.unsqueeze(-1) * ve.view(b, t, attn.n_kv_head, hd)
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)
+            y = capture_attention(q, k, v, model.window_sizes[i][0]).contiguous().view(b, t, -1)
+            x = x + linear(p + 'attn.c_proj', attn.c_proj, y)
+            hid = linear(p + 'mlp.c_fc', block.mlp.c_fc, norm(x))
+            x = x + linear(p + 'mlp.c_proj', block.mlp.c_proj, F.relu(hid).square())
+        logits = linear('lm_head', model.lm_head, norm(x))[..., :model.config.vocab_size].float()
+        logits = 15 * torch.tanh(logits / 15)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1,
+                               reduction='none')
+    # each kind of block input stacked over the blocks ('stack:<kind>'; the per-block ones are views)
+    L = len(model.transformer.h)
+    for kind in STACKED_INPUTS:
+        stack = torch.stack([inputs[f'transformer.h.{i}.{kind}'] for i in range(L)])
+        inputs['stack:' + kind] = stack
+        for i in range(L):
+            inputs[f'transformer.h.{i}.{kind}'] = stack[i]
+    for i in range(L):  # the same normed block input
+        inputs[f'transformer.h.{i}.attn.c_k'] = inputs[f'transformer.h.{i}.attn.c_v'] = (
+            inputs[f'transformer.h.{i}.attn.c_q'])
+    return inputs, outputs, blocks, loss
 
 
-@triton.jit
-def _key_scan_kernel(Q, K, Raw, LSE, Values, Hub, Center, Cos, Sin, Out, T: tl.constexpr, D: tl.constexpr,
-    Window: tl.constexpr, Sigma: tl.constexpr, BT: tl.constexpr, BS: tl.constexpr, J: tl.constexpr):
-    head = tl.program_id(0)
-    t0 = tl.program_id(1) * BT
-    target = t0 + tl.arange(0, BT)
-    dims = tl.arange(0, D)
-    dirs = tl.arange(0, D)
-    feature_pair = tl.arange(0, J)
-    pair = dirs % (D // 2)
-    base = head * T * D
-    key = tl.load(K + base + target[:, None] * D + dims[None, :])
-    value = tl.load(Values + base + target[:, None] * D + dims[None, :])
-    p2 = tl.zeros((BT, 2 * J), tl.float32)
-    q2 = tl.zeros((BT, 2 * J), tl.float32)
-    qxy = tl.zeros((BT, J), tl.float32)
-    r2 = tl.zeros((BT, 2 * J), tl.float32)
-    s1 = tl.zeros((BT,), tl.float32)
-    s2 = tl.zeros((BT,), tl.float32)
-    first = t0 // BS
-    last = tl.minimum((t0 + BT - 1 + Window) // BS + 1, T // BS)
-    for it in range(first, last):
-        source = it * BS + tl.arange(0, BS)
-        query = tl.load(Q + base + source[:, None] * D + dims[None, :])
-        logit = tl.dot(key, tl.trans(query), input_precision='tf32x3') * D ** (-0.5)
-        valid = (source[None, :] >= target[:, None]) & (source[None, :] - target[:, None] <= Window)
-        hub = tl.load(Hub + base + source[:, None] * D + dims[None, :])
-        score = tl.dot(value, tl.trans(hub), input_precision='tf32x3')
-        center = tl.load(Center + head * T + source)
-        c = tl.where(valid, score - center[None, :], 0.0)
-        lse = tl.load(LSE + head * T + source)
-        a = tl.where(valid, tl.exp(logit - lse[None, :]), 0.0)
-        x = tl.load(Q + base + source[:, None] * D + feature_pair[None, :]) * D ** (-0.5)
-        y = tl.load(Q + base + source[:, None] * D + (feature_pair + D // 2)[None, :]) * D ** (-0.5)
-        f2 = tl.reshape(tl.join(x, y), (BS, 2 * J))
-        g2 = tl.reshape(tl.join(x * x, y * y), (BS, 2 * J))
-        xy = x * y
-        w1 = a * c
-        w2 = (0.5 * a - a * a) * c
-        w2l = w2 * logit
-        w1d, w2d, w2ld = (w1.to(tl.bfloat16), w2.to(tl.bfloat16), w2l.to(tl.bfloat16))
-        f2d, g2d, xyd = (f2.to(tl.bfloat16), g2.to(tl.bfloat16), xy.to(tl.bfloat16))
-        p2 += tl.dot(w1d, f2d)
-        q2 += tl.dot(w2d, g2d)
-        qxy += tl.dot(w2d, xyd)
-        r2 += tl.dot(w2ld, f2d)
-        s1 += tl.sum(w1 * logit, 1)
-        s2 += tl.sum(w2 * logit * logit, 1)
-    ca, bu, bw, step = _key_perturbation_geometry(Raw, Cos, Sin, base, target, dims, dirs, pair, D, Sigma)
-    px, py = tl.split(tl.reshape(p2, (BT, J, 2)))
-    qx, qy = tl.split(tl.reshape(q2, (BT, J, 2)))
-    rx, ry = tl.split(tl.reshape(r2, (BT, J, 2)))
-    gather_pair = tl.broadcast_to(pair[None, :], (BT, D))
-    px, py = (tl.gather(px, gather_pair, 1), tl.gather(py, gather_pair, 1))
-    qx, qy = (tl.gather(qx, gather_pair, 1), tl.gather(qy, gather_pair, 1))
-    rx, ry = (tl.gather(rx, gather_pair, 1), tl.gather(ry, gather_pair, 1))
-    qxy = tl.gather(qxy, gather_pair, 1)
-    response = px * bu + py * bw + qx * bu * bu + qy * bw * bw + 2 * qxy * bu * bw + 2 * ca * (rx * bu + ry * bw) + s1[:, None] * ca + s2[:, None] * ca * ca
-    tl.store(Out + base + target[:, None] * D + dirs[None, :], response / step)
-
-
-@triton.jit
-def _value_credit_kernel(Q,K,LSE,Hub,Out,T:tl.constexpr,Window:tl.constexpr,
-    BT:tl.constexpr,BS:tl.constexpr,Channels:tl.constexpr):
-    head,tile=tl.program_id(0),tl.program_id(1)
-    target=tile*BT+tl.arange(0,BT)
-    dims=tl.arange(0,64)
-    channels=tl.arange(0,Channels)
-    base=head*T*64
-    key=tl.load(K+base+target[:,None]*64+dims[None,:])
-    acc=tl.zeros((BT,Channels),tl.float32)
-    first=tile*BT//BS
-    last=tl.minimum((tile*BT+BT-1+Window)//BS+1,T//BS)
-    for it in range(first,last):
-        receiver=it*BS+tl.arange(0,BS)
-        query=tl.load(Q+base+receiver[:,None]*64+dims[None,:])
-        hub=tl.load(Hub+head*T*Channels+receiver[:,None]*Channels+channels[None,:])
-        lse=tl.load(LSE+head*T+receiver)
-        logits=tl.dot(key,tl.trans(query),input_precision='tf32x3')*.125
-        valid=(receiver[None,:]>=target[:,None]) & (receiver[None,:]-target[:,None]<=Window)
-        prob=tl.where(valid,tl.exp(logits-lse[None,:]),0.).to(tl.bfloat16)
-        hi=hub.to(tl.bfloat16)
-        lo=(hub-hi.to(tl.float32)).to(tl.bfloat16)
-        acc+=tl.dot(prob,hi)
-        acc+=tl.dot(prob,lo)
-    tl.store(Out+head*T*Channels+target[:,None]*Channels+channels[None,:],acc)
-
-
-def key_and_value_credits(context, corrected, sigma, window):
-    q, k, raw, cos, sin, lse, (v, hub, center) = context
-    q, k, raw, cos, sin, lse, v, hub, center, corrected = (z.contiguous() for z in (q, k, raw, cos, sin, lse, v, hub, center, corrected))
-    h, t, d = raw.shape
-    key = torch.empty_like(raw)
-    _key_scan_kernel[h, t // 32](
-        q, k, raw, lse, v, hub, center, cos, sin, key, T=t, D=d, Window=window, Sigma=sigma,
-        BT=32, BS=64, J=32, num_warps=4, num_stages=2,
-    )
-    paired = torch.cat((hub, corrected), dim=-1)
-    out = torch.empty_like(paired)
-    _value_credit_kernel[h, t // 32](q, k, lse, paired, out, T=t, Window=window, BT=32, BS=64, Channels=128, num_warps=4, num_stages=2)
-    value, terminal = (out[..., :64].contiguous(), out[..., 64:].contiguous())
-    return (key, value, terminal)
+STACKED_INPUTS = ('attn.c_q', 'attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')
 
 
 class Capture:
@@ -1052,6 +507,7 @@ class Capture:
         self.shared_generator = torch.Generator(self.device).manual_seed(seed + 5)
         self.modules = {n: m for n, m in model.named_modules() if isinstance(m, (nn.Linear, nn.Embedding))}
         self.inputs, self.outputs, self.blocks = {}, {}, {}
+        self.weights = None  # (the Linears' bf16 weights, set by Cut.estimate)
         self.capturing = False
         self.hooks = [m.register_forward_hook(self.output_hook(n)) for n, m in self.modules.items()]
         for layer, block in enumerate(model.transformer.h):
@@ -1073,22 +529,11 @@ class Capture:
     def signs(self, *shape, shared=False):
         generator = self.shared_generator if shared else self.generator
         return torch.randint(0, 2, shape, device=self.device, generator=generator).to(self.dtype) * 2 - 1
-    def query_noise(self, draws, b, t, d):
-        patterns = self.signs(1, d, shared=True)
-        offset = torch.randint(0, d, (b, t), device=self.device, generator=self.shared_generator)
-        signs = self.signs(draws, b, t, 1)
-        index = torch.arange(draws, device=self.device)
-        rows = (offset.unsqueeze(0) + index[:, None, None]) % d
-        return hadamard(d, self.device, self.dtype)[rows] * patterns[0] * signs
     def capture(self, x, y):
         self.y = y
         self.batch, self.length = x.shape
-        self.capturing = True
-        try:
-            with torch.autocast(self.device.type, dtype=self.dtype):
-                self.clean_loss = self.model(x, y, loss_reduction='none').view_as(y).float()
-        finally:
-            self.capturing = False
+        self.inputs, self.outputs, self.blocks, loss = capture_forward(self.model, x, y, self.weights)
+        self.clean_loss = loss.view_as(y).float()
     def head_error(self, sigma=0.1):
         return coordinate_differences(self.outputs['lm_head'], self.y, sigma)
     def reassemble(self, site, error):
@@ -1136,35 +581,287 @@ def _route_moment_stream_kernel(Scores, K, V, Top, Probability, OutV, OutK,
     tl.store(OutK + dest, ak.to(tl.bfloat16).to(tl.float32))
 
 
+@torch.compile(dynamic=False)
+def pack_gradients(gradients, divisor, bf16: bool):
+    """Cut.step's flat gradient buffer, torch.cat(...) / divisor, and (bf16) its bf16 copy, in one compiled graph."""
+    flat = torch.cat([g.float().reshape(-1) for g in gradients]) / divisor
+    return flat, flat.to(torch.bfloat16) if bf16 else flat
+
+
+@torch.compile(dynamic=False)
+def chain_transposes(weights):
+    """Each weight transposed, contiguous."""
+    return [w.T.contiguous() for w in weights]
+
+
+@torch.compile(dynamic=False)
+def root_projections_of(fc_weights, frames):
+    """Each root's bf16 c_fc rows projected on its frame (fp32, contiguous)."""
+    return [(w.float() @ frame.T).contiguous() for w, frame in zip(fc_weights, frames)]
+
+
+# kernels write the (layers, tokens, width) layout the reassembly reads, the chain and the path scalars in one graph
+
+
+@torch.compile(dynamic=False)
+def block_recompute(blocks, attn_outs, fc_weights, proj_weights, first: int, chain_sigma: float):
+    """estimate's fp32 recompute of each block's mid stream, MLP pre-activations and output, and (from block first on)
+    the stacked route scores (route_scores) for the batched MLP routes."""
+    mids, hpres, outs, scores = [], [], [], []
+    for i, (block, attn_out, w_fc, w_proj) in enumerate(zip(blocks, attn_outs, fc_weights, proj_weights)):
+        mid = block.float().flatten(0, 1) + attn_out.float().flatten(0, 1)
+        hpre = F.linear(norm(mid), w_fc.float())
+        out = mid + F.linear(F.relu(hpre).square(), w_proj.float())
+        mids.append(mid), hpres.append(hpre), outs.append(out)
+        if i >= first:
+            radius = chain_sigma * w_fc.float().norm(dim=1)
+            scores.append(response_scores(hpre, radius, w_proj.float().norm(dim=0)))
+    return mids, hpres, outs, torch.stack(scores)
+
+
+@torch.compile(dynamic=False)
+def weight_credits(chains, g_top, lam_r, extras, attn_proj_in, mlp_proj_in, fc_outs, fc_in, fc_out_weights,
+                   sigma: float):
+    """layer_weight_credits for every block at once: three batched GEMMs over the blocks' stacked credits and the
+    capture's stacked inputs ((blocks, 1, tokens, width)). Returns (blocks, out, in) weight credits."""
+    L = len(chains)
+    d_out = [lam_r[i + 1] * chains[i + 1] for i in range(L - 1)] + [g_top]
+    x_mid = torch.stack([chains[i] + extras[i] for i in range(L)])
+    x_out = torch.stack([d_out[i] + extras[i] for i in range(L)])
+    hidden = []
+    for i in range(L):
+        u = fc_outs[i].float().flatten(0, 1)
+        steps = sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        hidden.append(hidden_local_credit(u, steps, d_out[i], fc_out_weights[i].float()))
+    hidden = torch.stack(hidden)
+    return (torch.bmm(x_mid.transpose(1, 2), attn_proj_in.flatten(1, 2)),
+            torch.bmm(x_out.transpose(1, 2), mlp_proj_in.flatten(1, 2)),
+            torch.bmm(hidden.transpose(1, 2), fc_in.flatten(1, 2)))
+
+
+@torch.compile(dynamic=False)
+def probe_moment_terms(x, y, weight, H):
+    """Cut.probe_moments: the readout credit from the second-order logit expansion (frame H drawn by the caller)
+    and the head moments."""
+    C = H @ weight.T
+    width = x.shape[-1]
+    steps = 0.005 * x.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+    base = x @ weight.T
+    sq = x.square().sum(-1, keepdim=True)
+    inv0 = torch.rsqrt(sq / width + EPS)
+    t = torch.tanh(base * inv0 / 15)
+    f1 = 1 - t.square()
+    prob = torch.softmax(15 * t, -1)
+    c1, c2 = prob * f1, prob * (-(2 / 15) * t * f1 + f1.square()) / 2
+    b1, b2 = (c1 * base).sum(-1), (c2 * base.square()).sum(-1)
+    # products sharing an operand as one GEMM: [c1; c2 base] @ W, c2 @ [W^2 | C^2 T], .. @ H^T
+    n = x.shape[0]
+    first = torch.cat([c1, c2 * base]) @ weight
+    mu1, nu = first[:n], first[n:]
+    second = c2 @ torch.cat([weight.square(), C.square().T], 1)
+    curvature, quad = second[:, :width].contiguous(), second[:, width:]
+    mu1_h, nu_h = (first @ H.T).split(n)
+    moments = (b1, b2, mu1, nu, curvature)
+    inv = torch.rsqrt((sq + 2 * steps * (x @ H.T) + steps.square() * width) / width + EPS)
+    a = inv - inv0
+    lin = a * b1.unsqueeze(1) + inv * steps * mu1_h
+    change = (lin + a.square() * b2.unsqueeze(1) + 2 * a * inv * steps * nu_h
+              + inv.square() * steps.square() * quad - 0.5 * lin.square())
+    target = y.clamp(min=0)
+    base_y = base.gather(1, target.unsqueeze(1))
+    zy = (base_y + steps * C.T[target]) * inv
+    derivative = (change - (15 * torch.tanh(zy / 15) - 15 * torch.tanh(base_y * inv0 / 15))) / steps
+    return (derivative * (y >= 0).unsqueeze(1)) @ H / width, moments
+
+
+def descending_inputs_eager(raws, gates, blocks, c_vs, lam_r, x0, outs):
+    """descending_chain's input responses and carried extras (corrected is formed by the caller), and
+    path_scalar_credit's contractions: raws (tokens, width) per layer, blocks the bf16 block inputs."""
+    L = len(raws)
+    inputs, extra, path = [None] * L, [None] * L, [None] * L
+    extra[L - 1] = torch.zeros_like(x0)
+    for i in reversed(range(L)):
+        inputs[i], carried, path[i] = chain_step(blocks[i], raws[i] @ c_vs[i], gates[i], extra[i], lam_r[i],
+                                                 x0 if i == 0 else outs[i - 1], x0)
+        if i:
+            extra[i - 1] = carried
+    return inputs, extra, torch.stack(path, dim=1)
+
+
+@torch.compile(dynamic=False)
+def chain_step(block, v, gate, extra, lam, previous, x0):
+    """One layer of the descending chain: the value input response (+ the gate's), the extra carried down
+    (lam * credit) and path_scalar_credit's two contractions of the credit (inputs + extra)."""
+    inputs = norm_move(block.float().flatten(0, 1), v)
+    if gate is not None:
+        inputs = inputs + gate
+    credit = inputs + extra
+    return inputs, lam * credit, torch.stack([(credit * previous).sum(), (credit * x0).sum()])
+
+
+@torch.compile(dynamic=False)
+def chain_tail(measured, g_top, lam_r, lam_0, x0, outs):
+    """Each block's mid credit (measured, else carried from the next block by its residual scalar; the last block
+    from the readout), the mixing scalars' contractions and the credit reaching x0."""
+    L = len(measured)
+    credits = [None] * L
+    credits[L - 1] = measured[L - 1] if measured[L - 1] is not None else g_top
+    for i in reversed(range(L - 1)):
+        credits[i] = measured[i] if measured[i] is not None else lam_r[i + 1] * credits[i + 1]
+    lams = [torch.stack([(credits[i] * (x0 if i == 0 else outs[i - 1])).sum(), (credits[i] * x0).sum()])
+            for i in range(L)]
+    x0_credit = lam_r[0] * credits[0] + sum(lam_0[i] * credits[i] for i in range(L))
+    return credits, lams, x0_credit
+
+
+@torch.compile(dynamic=False)
+def group_credits(loss_change, steps, controls, frames, boost: float):
+    """Each root's credit from its replay group's loss changes: the identity-path predictions of every root removed,
+    the remainder read along the root's frame and added back to its own prediction."""
+    residual = loss_change
+    for step, control, frame in zip(steps, controls, frames):
+        residual = residual - step * (control @ frame.T)
+    return [control + boost * ((residual / step) @ frame / frame.shape[0])
+            for step, control, frame in zip(steps, controls, frames)]
+
+
+@torch.compile(dynamic=False)
+def gate_error(gate_out, ve_out, credit, heads: int):
+    """Cut.exact_values' value-gate error: the gate's central-difference slope times the raw value credit's
+    contraction with the value embedding."""
+    b, t, _ = gate_out.shape
+    z = gate_out.float()
+    ve = ve_out.float().view(b, t, heads, -1)
+    slope = (torch.sigmoid(z + 0.1) - torch.sigmoid(z - 0.1)) / 0.1
+    return slope * (ve * credit).sum(-1)
+
+
+@torch.compile(dynamic=False)
+def strong_queries(x, wq, cos, sin, heads: int):
+    """Cut.strong_keys' RoPE'd unit queries (tokens, heads, head_dim) in one compiled graph."""
+    length = x.shape[0]
+    width = wq.shape[0] // heads
+    c, s = cos[:, None], sin[:, None]
+    r = (norm(x) @ wq.T).view(length, heads, width)
+    return norm(torch.cat([r[..., :width // 2] * c + r[..., width // 2:] * s,
+                           r[..., :width // 2] * -s + r[..., width // 2:] * c], -1))
+
+
+@torch.compile(dynamic=False)
+def own_query_tensors(k_out, v_out, gate_out, ve_out, cos, sin, heads: int):
+    """Cut.own_query_inputs' RoPE'd unit keys and gated values of one layer, (heads, tokens, head_dim) bf16."""
+    length = k_out.shape[0]
+    width = k_out.shape[1] // heads
+    k = k_out.float().view(length, heads, width)
+    k1, k2 = k[..., :width // 2], k[..., width // 2:]
+    c, s = cos[:, None], sin[:, None]
+    k = norm(torch.cat([k1 * c + k2 * s, k1 * -s + k2 * c], -1))
+    v = v_out.float().view(length, heads, width)
+    if gate_out is not None:
+        v = v + 2 * torch.sigmoid(gate_out.float().view(length, heads, 1)) * ve_out.float().view(length, heads, width)
+    return k.transpose(0, 1).to(torch.bfloat16).contiguous(), v.transpose(0, 1).to(torch.bfloat16).contiguous()
+
+
+@torch.compile(dynamic=False)
+def strong_key_tensors(kk, vv, idx, p, out, all_keys):
+    """The top keys (shifted by the tail centroid) and values of each query, and the values' tail remainder."""
+    heads, length, width = kk.shape
+    count = idx.shape[-1]
+    flat = idx.reshape(heads, length * count, 1).expand(-1, -1, width)
+    ktop = kk.gather(1, flat).view(heads, length, count, width)
+    vtop = vv.gather(1, flat).view(heads, length, count, width)
+    # the weighted sums over the top keys as fused reductions (not batched gemvs)
+    rest = out - (p.unsqueeze(-1) * vtop.float()).sum(-2)
+    tail_keys = all_keys - (p.unsqueeze(-1) * ktop.float()).sum(-2)
+    mass = (1 - p.sum(-1, keepdim=True)).clamp_min(0)
+    centroid = torch.where(mass > 1e-5, tail_keys / mass.clamp_min(1e-5), 0)
+    shifted = (ktop.float() - centroid.unsqueeze(-2)).to(kk.dtype)
+    # the shifted top keys token-major, (tokens, heads, keys, width), as the replay reads them
+    return shifted.transpose(0, 1).contiguous(), vtop, rest
+
+
+@triton.jit
+def _window_fill_kernel(Scores, T: tl.constexpr, WINDOW: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    """-inf at every (query, key) outside the causal left window (scores (heads, T, T), written only there): tiles of
+    BM queries x BN keys, fully blocked tiles by unmasked (vector) stores, edge tiles masked."""
+    head, tile, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    query = tile * BM + tl.arange(0, BM)
+    keys = block * BN + tl.arange(0, BN)
+    q0, q1, k0, k1 = tile * BM, tile * BM + BM - 1, block * BN, block * BN + BN - 1
+    ptr = Scores + (head * T + query[:, None]).to(tl.int64) * T + keys[None, :]
+    fill = tl.full((BM, BN), float('-inf'), Scores.dtype.element_ty)
+    if (k0 > q1) | (q0 - k1 > WINDOW):  # every key after every query, or before every query's window
+        tl.store(ptr, fill)
+    elif (k1 > q0) | (q1 - k0 > WINDOW):  # an edge tile
+        lag = query[:, None] - keys[None, :]
+        tl.store(ptr, fill, (lag < 0) | (lag > WINDOW))
+
+
+def window_fill_(scores, window):
+    """scores.masked_fill_(window_blocked(...), -inf) writing only the blocked entries."""
+    heads, length, _ = scores.shape
+    assert scores.is_contiguous() and length % 64 == 0
+    _window_fill_kernel[(heads, length // 32, length // 64)](scores, T=length, WINDOW=window, BM=32, BN=64,
+                                                              num_warps=4)
+    return scores
+
+
+@triton.jit
+def _ordered_bits(x):
+    """fp32 -> int32 in the same order (-inf lowest, -0 below +0, as torch's radix select orders them)."""
+    bits = x.to(tl.int32, bitcast=True)
+    return tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+
+
+@triton.jit
+def _route_topk_kernel(Scores, Indices, Scratch, N: tl.constexpr, K: tl.constexpr):
+    """torch.topk(scores, K).indices of one row exactly (values descending, equal values by ascending index): the K-th
+    largest value by binary search over its ordered bits, the values above it and the lowest-index ties, sorted."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, N)
+    key = _ordered_bits(tl.load(Scores + row * N + cols).to(tl.float32))
+    lo = tl.full((), -2147483648, tl.int64)
+    hi = tl.full((), 2147483647, tl.int64)
+    for _ in tl.static_range(32):  # the largest t with count(key >= t) >= K
+        mid = (lo + hi + 1) // 2
+        enough = tl.sum((key >= mid.to(tl.int32)).to(tl.int32), 0) >= K
+        lo = tl.where(enough, mid, lo)
+        hi = tl.where(enough, hi, mid - 1)
+    kth = lo.to(tl.int32)
+    equal = key == kth
+    need = K - tl.sum((key > kth).to(tl.int32), 0)
+    chosen = (key > kth) | (equal & (tl.cumsum(equal.to(tl.int32), 0) <= need))
+    slot = tl.cumsum(chosen.to(tl.int32), 0) - 1
+    tl.store(Scratch + row * K + slot, (key.to(tl.int64) << 32) | (N - 1 - cols).to(tl.int64), chosen)
+    tl.debug_barrier()
+    top = tl.sort(tl.load(Scratch + row * K + tl.arange(0, K)), descending=True)
+    tl.store(Indices + row * K + tl.arange(0, K), N - 1 - (top & 0xFFFFFFFF))
+
+
+def route_topk(scores, count):
+    """scores.topk(count, dim=-1).indices for (..., N) fp32 scores (N a power of two), exactly."""
+    n = scores.shape[-1]
+    rows = scores.numel() // n
+    indices = torch.empty((*scores.shape[:-1], count), device=scores.device, dtype=torch.int64)
+    scratch = torch.empty((rows, count), device=scores.device, dtype=torch.int64)
+    _route_topk_kernel[(rows,)](scores.contiguous(), indices, scratch, N=n, K=count, num_warps=2)
+    return indices
+
+
 def stream_route_moments(q, keys, values, window, count):
     heads, length, width = keys.shape
-    positions = torch.arange(length, device=q.device)
-    lag = positions[:, None] - positions[None, :]
-    allowed = (lag >= 0) & (lag <= window)
-    scores = torch.einsum('thd,hsd->hts', q.to(keys.dtype), keys).contiguous()
-    scores.masked_fill_(~allowed, float('-inf'))
-    tops, indices = scores.topk(count, dim=-1)
+    # (heads, query, key) straight from a batched matmul, no permuted copy
+    scores = torch.bmm(q.to(keys.dtype).transpose(0, 1), keys.transpose(1, 2))
+    # the stream kernel reads it masked
+    window_fill_(scores, window)
+    # torch.topk's selection and order, bitwise (bf16 rows, count <= 32)
+    tops, indices = window_topk.window_topk(scores, count)
     probabilities = torch.empty((heads, length, count), device=q.device)
     out = torch.empty((heads, length, width), device=q.device)
     all_keys = torch.empty_like(out)
     _route_moment_stream_kernel[(length // 32, heads)](scores, keys, values, tops, probabilities, out, all_keys,
       T=length, WINDOW=window, KEYS=count, BM=32, BN=128, num_warps=4, num_stages=2)
     return probabilities, indices, out, all_keys
-
-
-@torch.compile(dynamic=False)
-def cycle_derivatives(base, C, y, steps, sq, dots, dir_sq, width):
-    """PR #44's readout probe, verbatim: forward differences of each token's readout loss along every direction
-    of a full cycle; the moved stream's RMS is evaluated exactly at every probe."""
-    target = y.clamp(min=0)
-    base_y = base.gather(1, target.unsqueeze(1))
-    dirs_y = C.T[target]
-    inv0 = torch.rsqrt(sq / width + EPS)
-    clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(base_y * inv0 / 15)
-    inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
-    z = (base.unsqueeze(1) + steps.unsqueeze(-1) * C) * inv.unsqueeze(-1)
-    moved = torch.exp(15 * torch.tanh(z / 15)).sum(-1).log() - 15 * torch.tanh((base_y + steps * dirs_y) * inv / 15)
-    return (moved - clean) / steps * (y >= 0).unsqueeze(1)
 
 
 class Cut:
@@ -1176,150 +873,217 @@ class Cut:
         self.generator = torch.Generator(self.device).manual_seed(seed + 17 + 1000 * rank)
         self._estimate_graph = None
         self._telemetry_health = []
+        self._query_moment_errors = {}
+        self._side_stream = torch.cuda.Stream()
         self._gate_rows = {i: torch.empty(self.width, self.width, device=self.device)
         for i in range(self.model.config.n_layer)
         if has_ve(i, self.model.config.n_layer)}
     def basis(self):
         signs = torch.randint(0, 2, (self.width,), device=self.device, generator=self.generator).float() * 2 - 1
         return hadamard(self.width, self.device, torch.float32) * signs
-    def query_errors(self, draws, targets):
-        d, model = self.capture, self.model
-        cfg = model.config
-        L, b, t = cfg.n_layer, d.batch, d.length
-        h, hd = cfg.n_head, cfg.n_embd // cfg.n_head
-        cos, sin = model.cos[:, :t].float(), model.sin[:, :t].float()
-        sigma = self.s.query_sigma
-        processed = lambda raw: norm(apply_rotary_emb(raw, cos, sin))
-        dt = d.dtype
-        errors = {}
+    def batched_key_contexts(self, targets):
+        """key_context, the query moments and the key credits of every layer, the layers of one window size stacked
+        along the head axis so that each kernel launches once per window size. Returns per-layer contexts and key
+        credits (heads, tokens, head_dim); the query moment credits go to self._query_moment_errors."""
+        d, model, s = self.capture, self.model, self.s
+        L, h, t = model.config.n_layer, model.config.n_head, d.length
+        cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
+        windows = {}
         for i in range(L):
-            prefix = f'transformer.h.{i}.attn.'
-            site = prefix + 'c_q'
-            window = model.window_sizes[i][0]
-            q_raw, k_raw, v_raw = (d.outputs[prefix + 'c_' + name].float().view(b, t, h, hd) for name in 'qkv')
-            ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, hd) if has_ve(i, L) else None
-            z = d.outputs[prefix + 've_gate'].float() if has_ve(i, L) else None
-            values = v_raw if ve is None else v_raw + (2 * torch.sigmoid(z)).unsqueeze(-1) * ve
-            kp = processed(k_raw)
-            target = targets[i].view(b, t, h, hd)
-            fixed, vals = kp.to(dt), values.to(dt)
-            baseline = attention(processed(q_raw).to(dt), fixed, vals, window)
-            a = d.query_noise(draws, b, t, cfg.n_embd).view(draws, b, t, h, hd)
-            moved = moved_heads(q_raw, a, sigma, cos, sin)
-            out = query_probe_attention(moved, fixed, vals, window, draws, b)
-            estimate = code_estimate(head_scores(out, baseline, target), a)
-            errors[site] = (estimate / (draws * sigma)).reshape(b, t, cfg.n_embd)
-        return errors
-    def hidden_credit(self, u, g, out_weight):
-        steps = self.s.fc_sigma * u.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
-        return hidden_local_credit(u, steps, g, out_weight.float())
+            windows.setdefault(model.window_sizes[i][0], []).append(i)
+        contexts, work = {}, []
+        self._moment_inputs = {}
+        for window, layers in windows.items():
+            pick = lambda name: [d.outputs[f'transformer.h.{i}.attn.{name}'][0] for i in layers]
+            ves = [d.outputs[f'value_embeds.{i}'][0] if has_ve(i, L) else None for i in layers]
+            gates = [d.outputs[f'transformer.h.{i}.attn.ve_gate'][0] if has_ve(i, L) else None for i in layers]
+            (qp, kp, k_raw, values, hub), self._moment_inputs[window] = key_context_group_moments(
+                pick('c_q'), pick('c_k'), pick('c_v'), ves, gates, [targets[i][0] for i in layers], cos, sin, h,
+                s.query_moment_sigma)
+            lse, center = moment_kernels.implicit_key_context_edges(qp, kp, values, hub, window)
+            for j, i in enumerate(layers):
+                rows = slice(j * h, (j + 1) * h)
+                contexts[i] = (qp[rows], kp[rows], k_raw[rows], cos, sin, lse[rows],
+                               (values[rows], hub[rows], center[rows]))
+            work.append((window, layers, qp, kp, k_raw, values, hub, lse, center))
+        return contexts, work
+    def batched_key_scores_by_token(self, work, qkv, maps):
+        """batched_key_scores with each layer's query and key credits written into columns [0, width) and
+        [width, 2 width) of the (layers, tokens, 3 width) buffer qkv (window group g's layers at maps[g]); returns the
+        key credits as (tokens, width) views (the query credits go to self._query_moment_errors as
+        (1, tokens, width) views)."""
+        d, model, s = self.capture, self.model, self.s
+        h, t = model.config.n_head, d.length
+        hd = self.width // h
+        cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
+        keys, w = {}, self.width
+        for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
+            moment_kernels.key_credits_into(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, s.key_sigma,
+                                            qkv[:, :, w:2 * w], maps[g])
+            q16, k16, v16, hub16, q_raw, sq, steps = self._moment_inputs[window]
+            moment_kernels.moment_query_scores_into(
+                q16, k16, v16, hub16, q_raw, sq, kp, cos[:, :hd // 2].contiguous(), sin[:, :hd // 2].contiguous(),
+                lse, center, steps, qkv[:, :, :w], window=window, layers=maps[g])
+            for i in layers:
+                keys[i] = qkv[i, :, w:2 * w]
+                self._query_moment_errors[f'transformer.h.{i}.attn.c_q'] = qkv[i, :, :w].unsqueeze(0)
+        return keys
     def internals(self, gradients, targets, b, t, key_errors, raw_values, terminal_values):
-        d, s = self.capture, self.s
-        errors = self.query_errors(s.query_draws, targets)
+        d = self.capture
+        errors = self._query_moment_errors
         errors.update(key_errors)
         for i in targets:
             errors.update(self.exact_values(i, raw_values[i], terminal_values[i]))
+        # every layer's query, key and value weight credits from one batched GEMM of the side-by-side errors
+        weight = torch.bmm(self._qkv.transpose(1, 2), d.inputs['stack:attn.c_q'].flatten(1, 2))
+        for i in targets:
+            p = f'transformer.h.{i}.attn.'
+            for k, name in enumerate(('c_q', 'c_k', 'c_v')):
+                gradients[p + name + '.weight'] = weight[i, k * self.width:(k + 1) * self.width]
         for site, error in errors.items():
-            gradients[site + '.weight'] = d.reassemble(site, error)
+            if not site.endswith(('attn.c_q', 'attn.c_k', 'attn.c_v')):
+                gradients[site + '.weight'] = d.reassemble(site, error)
             if site.endswith('attn.c_v'):
                 i = int(site.split('.')[2])
                 if has_ve(i, self.model.config.n_layer):
                     gate = 2 * torch.sigmoid(d.outputs[f'transformer.h.{i}.attn.ve_gate'].float())
                     ve_error = (error.view(b, t, gate.shape[-1], -1) * gate.unsqueeze(-1)).view(b, t, -1)
                     gradients[f'value_embeds.{i}.weight'] = d.reassemble(f'value_embeds.{i}', ve_error)
+    def bind_flat_layout(self, optimizer):
+        """Cut.step's flat gradient layout (ANVIL's shape groups first, in its batch order). Bound before the estimate
+        graph's capture, it lets the estimate pack its gradients there."""
+        params = list(self.model.named_parameters())
+        anvil_ids = [id(q) for batch in optimizer.optimizers[0].batches for q in batch[0]]
+        rank_of = {pid: k for k, pid in enumerate(anvil_ids)}
+        self._flat_order = sorted(params, key=lambda item: rank_of.get(id(item[1]), len(anvil_ids)))
     def step(self, x, y, optimizer):
+        if not hasattr(self, '_flat_order'):  # the warmup Cut binds on its first step
+            self.bind_flat_layout(optimizer)
         self.prepare_gate_rows()
         if self._estimate_graph is None:
-            gradients = self.estimate(x, y)
+            self.estimate(x, y)
         else:
             self._static_x.copy_(x)
             self._static_y.copy_(y)
             self._estimate_graph.replay()
-            gradients = self._static_gradients
         valid = (y != -1).sum()
         optimizer.zero_grad(set_to_none=True)
-        params = list(self.model.named_parameters())
-        flat = torch.cat([(gradients[name] / valid).float().reshape(-1) for name, _ in params])
-        torch.distributed.all_reduce(flat)
-        flat /= self.world
-        finite = torch.isfinite(flat).all()
-        self._telemetry_health.append(finite)
-        offset = 0
-        for _, p in params:
-            p.grad = flat[offset:offset + p.numel()].view_as(p).to(p.dtype)
-            offset += p.numel()
-        optimizer.step()
+        # the estimate formed the flat buffer in this layout (ANVIL's shape groups first, so their stacked grads are
+        # views) and its bf16 copy, the wire
+        params = self._flat_order
+        flat, wire = self._packed
+        # ANVIL's grads reduce-scattered in bf16, its shards first: each batch's update waits only for its own
+        # shard, and the rest's all-reduce runs under ANVIL's update
+        anvil = optimizer.optimizers[0]
+        sizes = [sum(q.numel() for q in batch[0]) for batch in anvil.batches]
+        anvil.shard_grads, anvil.shard_works, offset = [], [], 0
+        for (batch_params, *_), size in zip(anvil.batches, sizes):
+            full = wire[offset:offset + size].view(len(batch_params), *batch_params[0].shape)
+            shard = torch.empty((len(batch_params) // self.world, *batch_params[0].shape), device=flat.device,
+                                dtype=wire.dtype)
+            anvil.shard_works.append(torch.distributed.reduce_scatter_tensor(shard, full, async_op=True))
+            anvil.shard_grads.append(shard)
+            offset += size
+        rest = torch.distributed.all_reduce(wire[sum(sizes):], async_op=True)
+        anvil_ids = {id(q) for batch in anvil.batches for q in batch[0]}
+
+        def finish_rest():  # between ANVIL's and the other optimizers' steps
+            rest.wait()
+            # bf16 params' grads are views of the reduced wire (what .to(bf16) of its fp32 copy gives),
+            # fp32 params' slices copied once; the finite check reads the bf16 wire
+            self._telemetry_health.append(torch.isfinite(torch.sum(wire, dtype=torch.float32)))
+            offset = 0
+            for _, p in params:
+                if id(p) not in anvil_ids:
+                    part = slice(offset, offset + p.numel())
+                    if p.dtype == wire.dtype:
+                        p.grad = wire[part].view_as(p)
+                    else:
+                        flat[part] = wire[part]
+                        p.grad = flat[part].view_as(p).to(p.dtype)
+                offset += p.numel()
+        optimizer.step(between=finish_rest)
+        for work in anvil.gather_works:
+            work.wait()
+        anvil.gather_works = []
         diagnostic_loss = torch.where(y != -1, self.capture.clean_loss, 0).sum() / valid
         return average_ranks(diagnostic_loss.reshape(1)).reshape(())
-    def descending_key_values(self, chain, targets):
-        """Topologically schedule independent raw probes; corrected outputs have terminal consumers only."""
-        d,s,model=self.capture,self.s,self.model
-        L=model.config.n_layer
-        errors,raw_values,terminal_values,inputs={},{},{},{}
-        extra={L-1:torch.zeros_like(chain[0])}
-        for i in reversed(range(L)):
-            block=model.transformer.h[i]
-            # extra[i] contains only deeper raw independently measured input responses.
-            corrected=((chain[i]+extra[i])@block.attn.c_proj.weight.float()).view(1,d.length,8,64).transpose(1,2)[0]
-            context=self.key_context(i,targets[i])
-            key,raw,terminal=key_and_value_credits(context,corrected,s.key_sigma,model.window_sizes[i][0])
-            errors[f'transformer.h.{i}.attn.c_k']=key.transpose(0,1).reshape(1,d.length,self.width)
-            raw_values[i]=raw.transpose(0,1).unsqueeze(0)
-            terminal_values[i]=terminal.transpose(0,1).unsqueeze(0)
-            ev=raw_values[i].reshape(-1,self.width)
-            xin=d.blocks[i].float().flatten(0,1)
-            # Only original raw values enter either nonlinear finite-response branch.
-            inputs[i]=norm_move(xin,ev@block.attn.c_v.weight.float())
-            if has_ve(i,L):
-                inputs[i] = inputs[i] + self.gate_input_credit(i, raw_values[i], self._gate_rows[i])
-            if i: extra[i-1]=model.resid_lambdas[i].float()*(inputs[i]+extra[i])
-        return errors,raw_values,terminal_values,extra,inputs
+    def fused_descending_key_values(self, chain, targets, x0, outs):
+        """descending_key_values (batched keys on the side stream, batched values and gates) with the credits in the
+        layout their consumers read, and the chain's glue and path_scalar_credit in one compiled graph. Returns its
+        outputs and the path scalars."""
+        d, s, model = self.capture, self.s, self.model
+        L, h, t = model.config.n_layer, model.config.n_head, d.length
+        hd = self.width // h
+        errors, raw_values, terminal_values = {}, {}, {}
+        contexts, work = self.batched_key_contexts(targets)
+        # every layer's query, key and value credits by token, side by side: one batched reassembly GEMM
+        qkv = torch.empty(L, t, 3 * self.width, device=self.device)
+        maps = [self.layer_map(item[1]) for item in work]
+        main, side = torch.cuda.current_stream(), self._side_stream
+        side.wait_stream(main)
+        qkv.record_stream(side)
+        for item in work:
+            for z in item[2:]:
+                z.record_stream(side)
+        for inputs in self._moment_inputs.values():
+            for z in inputs:
+                z.record_stream(side)
+        with torch.cuda.stream(side):
+            keys = self.batched_key_scores_by_token(work, qkv, maps)
+        raws, place = {}, {}
+        for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
+            raw = moment_kernels.raw_value_credits_by_token(qp, kp, lse, hub, window, h)
+            for j, i in enumerate(layers):
+                raws[i], place[i] = raw[j], (g, j)
+        ve_layers = [i for i in range(L) if has_ve(i, L)]
+        gates = dict(zip(ve_layers, stacked_gate_input_responses(
+            [raws[i] for i in ve_layers], [d.outputs[f'value_embeds.{i}'][0] for i in ve_layers],
+            [d.blocks[i] for i in ve_layers], [model.transformer.h[i].attn.ve_gate.weight for i in ve_layers],
+            [self._gate_rows[i] for i in ve_layers], s.gate_path_sigma)))
+        input_list, extra_list, path = descending_inputs_eager(
+            [raws[i] for i in range(L)], [gates.get(i) for i in range(L)], [d.blocks[i] for i in range(L)],
+            [model.transformer.h[i].attn.c_v.weight.float() for i in range(L)], model.resid_lambdas.float(), x0,
+            outs)
+        corrected = [torch.empty(len(item[1]), t, self.width, device=self.device) for item in work]
+        for i in range(L):  # corrected by token, straight into the terminal pass's input
+            g, j = place[i]
+            torch.mm(chain[i] + extra_list[i], model.transformer.h[i].attn.c_proj.weight.float(), out=corrected[g][j])
+        w = self.width
+        for g, (window, layers, qp, kp, k_raw, values, hub, lse, center) in enumerate(work):
+            moment_kernels.terminal_value_credits_into(qp, kp, lse, corrected[g], window, qkv[:, :, 2 * w:], maps[g])
+            for i in layers:
+                terminal_values[i] = qkv[i, :, 2 * w:].view(1, t, h, hd)
+        self._qkv = qkv
+        for i in range(L):
+            raw_values[i] = raws[i].view(1, t, h, hd)
+        main.wait_stream(side)
+        for i in range(L):
+            keys[i].record_stream(main)
+            errors[f'transformer.h.{i}.attn.c_k'] = keys[i].unsqueeze(0)
+            self._query_moment_errors[f'transformer.h.{i}.attn.c_q'].record_stream(main)
+        return (errors, raw_values, terminal_values, dict(enumerate(extra_list)), dict(enumerate(input_list)),
+                path)
+    def layer_map(self, layers):
+        """The layers' indices as an int32 device tensor (made once, outside graph capture)."""
+        if not hasattr(self, '_layer_maps'):
+            self._layer_maps = {}
+        key = tuple(layers)
+        if key not in self._layer_maps:
+            self._layer_maps[key] = torch.tensor(key, device=self.device, dtype=torch.int32)
+        return self._layer_maps[key]
     def exact_values(self, i, credit, value_credit):
         d, cfg = self.capture, self.model.config
         b, t, h = d.batch, d.length, cfg.n_head
         prefix = f'transformer.h.{i}.attn.'
         errors = {prefix + 'c_v': value_credit.reshape(b, t, cfg.n_embd)}
         if has_ve(i, cfg.n_layer):
-            z = d.outputs[prefix + 've_gate'].float()
-            ve = d.outputs[f'value_embeds.{i}'].float().view(b, t, h, cfg.n_embd // h)
-            slope = (torch.sigmoid(z + 0.1) - torch.sigmoid(z - 0.1)) / 0.1
-            errors[prefix + 've_gate'] = slope * (ve * credit).sum(-1)
+            errors[prefix + 've_gate'] = gate_error(d.outputs[prefix + 've_gate'], d.outputs[f'value_embeds.{i}'],
+                                                    credit, h)
         return errors
-    def key_context(self, i, target):
-        d, model = self.capture, self.model
-        h, hd, t = model.config.n_head, self.width // model.config.n_head, d.length
-        cos, sin = model.cos[0, :t, 0].float(), model.sin[0, :t, 0].float()
-        rot = lambda z: torch.cat([z[..., :hd//2]*cos + z[..., hd//2:]*sin,
-        -z[..., :hd//2]*sin + z[..., hd//2:]*cos], -1)
-        unit = lambda z: z * torch.rsqrt(z.square().mean(-1, keepdim=True) + EPS)
-        prefix = f'transformer.h.{i}.attn.'
-        heads = lambda name: d.outputs[prefix+name][0].float().view(t, h, hd).transpose(0, 1)
-        q_raw, k_raw, values = heads('c_q'), heads('c_k'), heads('c_v')
-        if has_ve(i, model.config.n_layer):
-            ve = d.outputs[f'value_embeds.{i}'][0].float().view(t, h, hd).transpose(0, 1)
-            gate = 2 * torch.sigmoid(d.outputs[prefix+'ve_gate'][0].float().view(t, h)).T.unsqueeze(-1)
-            values = values + gate * ve
-        qp, kp = unit(rot(q_raw)), unit(rot(k_raw))
-        hub = target[0].view(t, h, hd).transpose(0, 1)
-        lse, center = implicit_key_context(qp, kp, values, hub, model.window_sizes[i][0])
-        return qp, kp, k_raw, cos, sin, lse, (values, hub, center)
-    def probe(self, x, y):
-        """Readout credit: PR #44's Cut probe, forward differences along a full Hadamard cycle."""
-        weight = self.model.lm_head.weight.float()
-        H = self.basis()
-        stream_dirs = H.T
-        C = (weight @ stream_dirs).T.contiguous()
-        dir_sq = stream_dirs.square().sum(0)
-        steps = 0.005 * x.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)  # #44 sigma
-        n, vocab = x.shape[0], C.shape[1]
-        credit = torch.empty(n, self.width, device=self.device)
-        per = max(1, 134217728 // (self.width * vocab))  # #44 chunk
-        for t0 in range(0, n, per):
-            xs, ys = x[t0:t0 + per], y[t0:t0 + per]
-            derivative = cycle_derivatives(xs @ weight.T, C, ys, steps[t0:t0 + per],
-                xs.square().sum(-1, keepdim=True), xs @ stream_dirs, dir_sq, self.width)
-            credit[t0:t0 + per] = derivative @ H / self.width
-        return credit
+    def probe_moments(self, x, y):
+        derivative, self._head_moments = probe_moment_terms(x, y, self.model.lm_head.weight.float(), self.basis())
+        return derivative
     def close(self):
         if self._estimate_graph is not None:
             torch.cuda.synchronize()
@@ -1368,41 +1132,19 @@ class Cut:
         graph.replay()
         torch.cuda.synchronize()
         restore_rng()
-    def gate_input_credit(self, i, raw_value, rows):
-        d, s = self.capture, self.s
-        heads = self.model.config.n_head
-        value = raw_value.reshape(-1, heads, self.width // heads)
-        ve = d.outputs[f'value_embeds.{i}'].float().reshape_as(value)
-        kappa = (value * ve).sum(-1)
-        xin = d.blocks[i].float().flatten(0, 1)
-        weight = self.model.transformer.h[i].attn.ve_gate.weight.float()
-        projected = F.linear(rows[:, :weight.shape[1]], weight)
-        row_square = rows.square().mean(-1)
-        result = torch.empty_like(xin)
-        for t0 in range(0, len(xin), s.chain_tokens):
-            sl = slice(t0, t0 + s.chain_tokens)
-            result[sl] = prepared_gate_input_response(
-                xin[sl], weight, kappa[sl], rows, projected, row_square, s.gate_path_sigma)
-        return result
-    @staticmethod
-    def path_scalar_credit(inputs, extra, x0, outs):
-        credits = []
-        for i in range(len(outs)):
-            credit = inputs[i]+extra[i]
-            previous = x0 if i == 0 else outs[i-1]
-            credits.append(torch.stack([(credit*previous).sum(), (credit*x0).sum()]))
-        return torch.stack(credits, dim=1)
     def chain_credits(self, e, x0, mids, outs, routes, y, g_top):
         model, s = self.model, self.s
         L = model.config.n_layer
         weight = model.lm_head.weight.float()
-        w_fc = [blk.mlp.c_fc.weight.to(torch.bfloat16) for blk in model.transformer.h]
-        w_out_t = [blk.mlp.c_proj.weight.to(torch.bfloat16).T.contiguous() for blk in model.transformer.h]
+        # the bf16 weights cast_weights made; c_proj's transposed once more
+        names = [f'transformer.h.{i}.mlp.' for i in range(L)]
+        w_fc = [self._bf16_weights[p + 'c_fc'] for p in names]
+        w_out_t = chain_transposes([self._bf16_weights[p + 'c_proj'] for p in names])
         lam_r, lam_0 = model.resid_lambdas.float(), model.x0_lambdas.float()
         xL = outs[-1]
         base = xL @ weight.T
         target_w = weight[y.clamp(min=0)]
-        moments = head_moments(xL, base, weight)
+        moments = self._head_moments
         n, m = e.shape[0], s.chain_tokens
         by_site = {}
         for site in s.chain_depth_roots:
@@ -1411,63 +1153,54 @@ class Cut:
             by_site[site] = (H, steps, torch.empty(n, self.width, device=self.device))
         signed_steps = {}
         controls = {}
-        for group in s.joint_root_groups:
+        groups = tuple((root,) for root in s.chain_depth_roots)  # (each root replays alone)
+        for group in groups:
             for site in group:
                 steps = by_site[site][1]
                 sign = (torch.randint(0, 2, (n, 1), device=self.device) * 2 - 1).float()
                 signed_steps[site] = steps * sign
                 factor = lam_r[site + 1:].prod()
                 controls[site] = g_top * factor
-        root_projections = {group[0]: (w_fc[group[0]].float() @ by_site[group[0]][0].T).contiguous()
-        for group in s.joint_root_groups}
-        active_query_layers = tuple(sorted({b for group in s.joint_root_groups
-          for b in attention_replay_layers(group, L, s.query_replay_long_layers)}))
+        roots = list(s.chain_depth_roots)
+        root_projections = dict(zip(roots, root_projections_of([w_fc[r] for r in roots],
+                                                               [by_site[r][0] for r in roots])))
+        replay_layers = lambda group: (attention_replay_layers(group, L, s.query_replay_long_layers))
+        active_query_layers = tuple(sorted({b for group in groups for b in replay_layers(group)}))
         own = self.own_query_inputs(active_query_layers)
         own = self.strong_keys(own, s.query_keys)
-        for t0 in range(0, n, m):
-            sl = slice(t0, t0 + m)
+        boost = 1.0
+        chunks = [slice(t0, t0 + m) for t0 in range(0, n, m)]
+        for sl in chunks:
             own_sl = (own[0][sl], [None if z is None else z[sl] for z in own[1]], own[2]) + tuple(
                 [None if z is None else z[sl] for z in part] for part in own[3:6]) + own[6:]
-            for group in s.joint_root_groups:
+            for group in groups:
                 site = group[0]
                 H = by_site[site][0]
                 steps = signed_steps[site][sl]
-                injections = tuple((other, signed_steps[other][sl], by_site[other][0])
-          for other in group[1:])
                 loss_change = chain_chunk(
-                    site, (steps, H), [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
-                    [r[1][sl] for r in routes], lam_r, w_fc, w_out_t, base[sl], target_w[sl], y[sl], own_sl,
+                    site, (steps, H), [z[sl] for z in mids], xL[sl], [None if r[0] is None else r[0][sl] for r in routes],
+                    [None if r[1] is None else r[1][sl] for r in routes], lam_r, w_fc, w_out_t, base[sl], target_w[sl], y[sl], own_sl,
                     moments=tuple(z[sl] for z in moments),
-                    root_projection=root_projections[site], injections=injections,
-                    query_layers=attention_replay_layers(group, L, s.query_replay_long_layers),
+                    root_projection=root_projections[site], query_layers=replay_layers(group),
                 )
-                residual = loss_change
-                for other in group:
-                    frame = by_site[other][0]
-                    residual = residual - signed_steps[other][sl] * (controls[other][sl] @ frame.T)
-                for other in group:
-                    frame, _, result = by_site[other]
-                    result[sl] = controls[other][sl] + ((residual / signed_steps[other][sl]) @ frame / self.width)
+                news = group_credits(loss_change, [signed_steps[o][sl] for o in group],
+                                     [controls[o][sl] for o in group], [by_site[o][0] for o in group], boost)
+                for other, new in zip(group, news):
+                    by_site[other][2][sl] = new
+                continue
         del own_sl, own
         credits = {site: credit for site, (_, _, credit) in by_site.items()}
-        for i in reversed(range(L - 1)):
-            if i not in credits:
-                credits[i] = lam_r[i + 1] * credits[i + 1]
+        measured = [credits.get(i) for i in range(L)]
+        mids_c, lams, x0_credit = chain_tail(measured, g_top, lam_r, lam_0, x0, outs)
+        credits = dict(enumerate(mids_c))
         for i in range(L):
-            previous = x0 if i == 0 else outs[i - 1]
-            credits['lam', i] = torch.stack([(credits[i] * previous).sum(),
-          (credits[i] * x0).sum()])
-        # x0 = norm(e) enters every block input (x_in_i = lam_r[i] * prev_i + lam_0[i] * x0), so each block's mid
-        # credit (measured at a root, else carried from the next block) reaches x0 along its linear skip; one finite
-        # step through the norm follows.
-        x0_credit = lam_r[0] * credits[0] + sum(lam_0[i] * credits[i] for i in range(L))
+            credits['lam', i] = lams[i]
         credits['emb'] = norm_input_credit(e, x0_credit, s.chain_sigma,
-      hadamard(self.width, self.device, torch.float32))
+                                           hadamard(self.width, self.device, torch.float32))
         return credits
     def own_query_inputs(self, active_layers):
         d, model = self.capture, self.model
         length, heads = d.length, model.config.n_head
-        width = self.width // heads
         cos, sin = model.cos[0, :length, 0].float(), model.sin[0, :length, 0].float()
         inputs, w_q, keys, values, w_proj_t, windows = [], [], [], [], [], []
         for i, block in enumerate(model.transformer.h):
@@ -1476,60 +1209,61 @@ class Cut:
                 w_proj_t.append(None), windows.append(model.window_sizes[i][0])
                 continue
             prefix = f'transformer.h.{i}.attn.'
-            k = d.outputs[prefix + 'c_k'][0].float().view(length, heads, width)
-            k1, k2 = k[..., :width // 2], k[..., width // 2:]
-            c, s = cos[:, None], sin[:, None]
-            k = norm(torch.cat([k1 * c + k2 * s, k1 * -s + k2 * c], -1))
-            v = d.outputs[prefix + 'c_v'][0].float().view(length, heads, width)
-            if block.attn.ve_gate is not None:
-                gate = 2 * torch.sigmoid(d.outputs[prefix + 've_gate'][0].float().view(length, heads, 1))
-                v = v + gate * d.outputs[f'value_embeds.{i}'][0].float().view(length, heads, width)
+            gated = block.attn.ve_gate is not None
+            k, v = own_query_tensors(d.outputs[prefix + 'c_k'][0], d.outputs[prefix + 'c_v'][0],
+                                     d.outputs[prefix + 've_gate'][0] if gated else None,
+                                     d.outputs[f'value_embeds.{i}'][0] if gated else None, cos, sin, heads)
             inputs.append(d.blocks[i][0].float())
             w_q.append(block.attn.c_q.weight.float())
-            keys.append(k.transpose(0, 1).to(torch.bfloat16).contiguous())
-            values.append(v.transpose(0, 1).to(torch.bfloat16).contiguous())
+            keys.append(k)
+            values.append(v)
             w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
             windows.append(model.window_sizes[i][0])
+            continue
         return (torch.arange(length, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
     @staticmethod
     def strong_keys(own, k):
         pos, inputs, w_q, keys, values, w_proj_t, cos, sin, windows = own
-        length = len(pos)
         top_keys, top_values, top_p = [], [], []
         for x, wq, kk, vv, window, wp in zip(inputs, w_q, keys, values, windows, w_proj_t):
             if x is None:
                 top_keys.append(None), top_values.append(None), top_p.append(None)
                 continue
             heads, _, width = kk.shape
-            c, s = cos[:, None], sin[:, None]
-            r = (norm(x) @ wq.T).view(length, heads, width)
-            q = norm(torch.cat([r[..., :width // 2] * c + r[..., width // 2:] * s,
-          r[..., :width // 2] * -s + r[..., width // 2:] * c], -1))
+            q = strong_queries(x, wq, cos, sin, heads)
             p, idx, out, all_keys = stream_route_moments(q, kk, vv, window, k)
-            gather = lambda z: z.unsqueeze(1).expand(-1, length, -1, -1).gather(
-          2, idx.unsqueeze(-1).expand(-1, -1, -1, width))
-            ktop, vtop = gather(kk), gather(vv)
-            rest = out - torch.einsum('htk,htkd->htd', p, vtop.float())
-            mass = (1 - p.sum(-1, keepdim=True)).clamp_min(0)
-            tail_keys = all_keys - torch.einsum('htk,htkd->htd', p, ktop.float())
-            centroid = torch.where(mass > 1e-5, tail_keys / mass.clamp_min(1e-5), 0)
-            ktop = (ktop.float() - centroid.unsqueeze(-2)).to(kk.dtype)
-            top_keys.append(ktop.transpose(0, 1).contiguous())
-            vtop = preproject_routed_values(vtop, p, rest, wp)
-            top_values.append(vtop.transpose(0, 1).contiguous())
+            ktop, vtop, rest = strong_key_tensors(kk, vv, idx, p, out, all_keys)
+            top_keys.append(ktop)
+            top_values.append(project_routed_values_token_major(vtop, p, rest, wp))
             top_p.append(p.transpose(0, 1).contiguous())
         return (pos, inputs, w_q, top_keys, top_values, top_p, (cos, sin))
-    def select_mlp_routes(self, layer, hpre):
-        mlp = self.model.transformer.h[layer].mlp
-        weight = mlp.c_proj.weight.float()
-        radius = self.s.chain_sigma * mlp.c_fc.weight.float().norm(dim=1)
-        plus = F.relu(hpre + radius).square()
-        minus = F.relu(hpre - radius).square()
-        response = (plus - minus).abs()
-        return (response * weight.norm(dim=0)).topk(self.s.route_k, dim=-1).indices
     @torch.no_grad()
+    def cast_weights(self):
+        """Every Linear's bf16 weight in persistent buffers, by one multi-tensor copy (the capture forward
+        and chain_credits read them instead of casting their own)."""
+        if not hasattr(self, '_bf16_weights'):
+            linears = {n: m.weight for n, m in self.capture.modules.items() if isinstance(m, nn.Linear)}
+            assert all(m.bias is None for m in self.capture.modules.values() if isinstance(m, nn.Linear))
+            self._bf16_weights = {}
+            # each block's c_q / c_k / c_v buffers: row blocks of one (3 C, C) buffer, 'attn.qkv'
+            for i in range(self.model.config.n_layer):
+                p = f'transformer.h.{i}.attn.'
+                parts = [linears[p + n] for n in ('c_q', 'c_k', 'c_v')]
+                cat = torch.empty((sum(w.shape[0] for w in parts), parts[0].shape[1]), device=parts[0].device,
+                                  dtype=torch.bfloat16)
+                self._bf16_weights[p + 'qkv'] = cat
+                for n, rows in zip(('c_q', 'c_k', 'c_v'), cat.split([w.shape[0] for w in parts])):
+                    self._bf16_weights[p + n] = rows
+            for n, w in linears.items():
+                if n not in self._bf16_weights:
+                    self._bf16_weights[n] = torch.empty_like(w, dtype=torch.bfloat16)
+            self._bf16_targets = [self._bf16_weights[n] for n in linears]
+            self._fp32_weights = list(linears.values())
+        torch._foreach_copy_(self._bf16_targets, self._fp32_weights)
+        self.capture.weights = self._bf16_weights
     def estimate(self, x, y):
         d, model = self.capture, self.model
+        self.cast_weights()
         d.capture(x, y)
         L = model.config.n_layer
         b, t = x.shape
@@ -1539,42 +1273,49 @@ class Cut:
         gradients['lm_head.weight'] = d.reassemble('lm_head', head)
         e = d.outputs['transformer.wte'].float().flatten(0, 1)
         x0 = norm(e)
-        mids, outs, routes = [], [], []
-        for i in range(L):
-            p = f'transformer.h.{i}.'
-            mid = d.blocks[i].float().flatten(0, 1) + d.outputs[p + 'attn.c_proj'].float().flatten(0, 1)
-            mlp = model.transformer.h[i].mlp
-            hpre = F.linear(norm(mid), mlp.c_fc.weight.float())
-            r = F.relu(hpre).square()
-            out = mid + F.linear(r, mlp.c_proj.weight.float())
-            top = self.select_mlp_routes(i, hpre)
-            mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
-        g_top = self.probe(outs[-1], yf)
+        first = min(self.s.chain_depth_roots)
+        mids, routes, outs, scores = block_recompute(
+            [d.blocks[i] for i in range(L)], [d.outputs[f'transformer.h.{i}.attn.c_proj'] for i in range(L)],
+            [blk.mlp.c_fc.weight for blk in model.transformer.h],
+            [blk.mlp.c_proj.weight for blk in model.transformer.h], first, self.s.chain_sigma)
+        # one top-k over every replayed block's scores
+        hpres = routes
+        count = self.s.route_k
+        if self.s.route_k_late and first >= self.s.route_split:
+            count = self.s.route_k_late  # every scored block keeps only its strongest route_k_late
+        tops = route_topk(scores, count)
+        tops = [None] * first + list(tops)
+        # the strongest route_k_late of them from block route_split on
+        tops = [top if top is None or i < self.s.route_split else top[:, :self.s.route_k_late].contiguous()
+                for i, top in enumerate(tops)]
+        routes = [(None, None) if top is None else (top, h.gather(1, top)) for top, h in zip(tops, hpres)]
+        g_top = self.probe_moments(outs[-1], yf)
         chain = self.chain_credits(e, x0, mids, outs, routes, yf, g_top)
         lam_r = model.resid_lambdas.float()
         targets = {i: (chain[i] @ block.attn.c_proj.weight.float()).view(b, t, self.width)
         for i, block in enumerate(model.transformer.h)}
-        key_errors,raw_values,terminal_values,extra,inputs=self.descending_key_values(chain,targets)
+        key_errors, raw_values, terminal_values, extra, inputs, path = self.fused_descending_key_values(
+            chain, targets, x0, outs)
         scalars = torch.empty(2, L, device=self.device)
+        # every block's weight credits from three batched GEMMs
+        blocks = model.transformer.h
+        attn_proj, mlp_proj, fc = weight_credits(
+            [chain[i] for i in range(L)], g_top, lam_r, [extra[i] for i in range(L)],
+            d.inputs['stack:attn.c_proj'], d.inputs['stack:mlp.c_proj'],
+            [d.outputs[f'transformer.h.{i}.mlp.c_fc'] for i in range(L)], d.inputs['stack:mlp.c_fc'],
+            [blk.mlp.c_proj.weight for blk in blocks], self.s.fc_sigma)
         for i in range(L):
             p = f'transformer.h.{i}.'
-            block = model.transformer.h[i]
-            d_mid = chain[i]
-            if i == L - 1:
-                d_out = g_top
-            else:
-                d_out = lam_r[i + 1] * chain[i + 1]
-            x_mid, x_out = d_mid + extra[i], d_out + extra[i]
-            gradients[p + 'attn.c_proj.weight'] = x_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
-            gradients[p + 'mlp.c_proj.weight'] = x_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
-            u = d.outputs[p + 'mlp.c_fc'].float().flatten(0, 1)
-            hidden = self.hidden_credit(u, d_out, block.mlp.c_proj.weight)
-            gradients[p + 'mlp.c_fc.weight'] = hidden.T @ d.inputs[p + 'mlp.c_fc'].flatten(0, 1)
+            gradients[p + 'attn.c_proj.weight'], gradients[p + 'mlp.c_proj.weight'] = attn_proj[i], mlp_proj[i]
+            gradients[p + 'mlp.c_fc.weight'] = fc[i]
             scalars[:, i] = chain['lam', i]
-        scalars += self.path_scalar_credit(inputs, extra, x0, outs)
+        scalars += path
         self.internals(gradients, targets, b, t, key_errors, raw_values, terminal_values)
         gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', chain['emb'].view(b, t, self.width))
         gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
+        # Cut.step's flat buffer (and bf16 copy) formed here, inside the estimate graph
+        self._packed = pack_gradients([gradients[name] for name, _ in self._flat_order],
+                                      (y != -1).sum() * self.world, True)
         return gradients
 
 
@@ -1633,6 +1374,42 @@ def anvil_update(g, w, fast, slow, energy, beta, fast_beta, slow_beta, weight, l
     return w - lr * ratio * (update + decay)
 
 
+@torch.compile(dynamic=False)
+def anvil_update_merged(gs, ws, fasts, slows, energies, beta, fast_beta, slow_beta, weight, lane_beta, lr, wd,
+                        lanes: tuple, ratios: tuple, margin: float):
+    """anvil_update for several batches whose polar inputs share a (non-square) shape after polar_batch's transpose:
+    their Gram Newton-Schulz iterations run as one batched polar."""
+    inputs, talls = [], []
+    for g, fast, slow in zip(gs, fasts, slows):
+        fast.lerp_(g, 1 - fast_beta)
+        slow.lerp_(g, 1 - slow_beta)
+        x = g.lerp(weight * fast + (1 - weight) * slow, beta)
+        talls.append(x.size(1) > x.size(2))
+        x = x.transpose(1, 2) if talls[-1] else x
+        inputs.append(x / (margin * x.norm(dim=(1, 2), keepdim=True) + 1e-6))
+    polar = gram_newton_schulz(torch.cat(inputs)).float().split([len(g) for g in gs])
+    news = []
+    for update, tall, w, slow, energy, lane, ratio in zip(polar, talls, ws, slows, energies, lanes, ratios):
+        update = update.transpose(1, 2) if tall else update
+        energy.lerp_(update.square().mean(lane + 1, keepdim=True), 1 - lane_beta)
+        gained = update * energy.clamp_min(1e-10).rsqrt()
+        update = gained * (update.norm(dim=(1, 2), keepdim=True)
+                           / gained.norm(dim=(1, 2), keepdim=True).clamp_min(1e-10))
+        decay = (slow * w >= 0) * w * (wd * lr)
+        news.append(w - lr * ratio * (update + decay))
+    return news
+
+
+def stacked_view(tensors):
+    """The (n, *shape) tensor whose rows are `tensors`, as a view when they are consecutive in memory, else a copy."""
+    first = tensors[0]
+    n = first.numel()
+    if all(t.is_contiguous() and t.data_ptr() == first.data_ptr() + i * n * t.element_size()
+           for i, t in enumerate(tensors)):
+        return first.as_strided((len(tensors), *first.shape), (n, *first.stride()))
+    return torch.stack(tensors)
+
+
 class BatchedAnvil(torch.optim.Optimizer):
     def __init__(self, params, lr, weight_decay, steps, polar_margin, fast_weight):
         super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
@@ -1640,7 +1417,7 @@ class BatchedAnvil(torch.optim.Optimizer):
         self.polar_margin, self.fast_weight = polar_margin, fast_weight
         self.t = 0
 
-    def prepare_scalar_schedule(self, warmdown, final, decay_factors):
+    def prepare_scalar_schedule(self, warmdown, final, decay_factors, warmup=0):
         group = self.param_groups[0]
         device = group['params'][0].device
         rows = []
@@ -1651,7 +1428,7 @@ class BatchedAnvil(torch.optim.Optimizer):
                 beta = hi - (hi - lo) * (t - cool) / self.cooldown
             fast_beta, weight = (.85, self.fast_weight) if t >= self.engage else (beta, 1.0)
             left = (self.total - (t + 1) + 1) / self.total
-            factor = final + (1 - final) * min(1.0, left / warmdown)
+            factor = (final + (1 - final) * min(1.0, left / warmdown)) * (min(1.0, (t + 1) / warmup) if warmup else 1.0)
             rows.append([beta, fast_beta, .98, weight, .9,
                 group['lr'] * factor, group['weight_decay'] * decay_factors[t]])
         self.scalar_schedule = torch.tensor(rows, dtype=torch.float32, device=device)
@@ -1661,18 +1438,71 @@ class BatchedAnvil(torch.optim.Optimizer):
         self.batches = []
         for shape, params in by_shape.items():
             lanes = 1 if shape[0] >= shape[1] else 0
+            # the group's weights become views of one stacked tensor
+            stacked = torch.stack([p.data for p in params])
+            for i, p in enumerate(params):
+                p.data = stacked[i]
             fast = torch.zeros(len(params), *shape, device=device)
             state = dict(fast=fast, slow=torch.zeros_like(fast),
                 energy=torch.zeros_like(fast.mean(lanes + 1, keepdim=True)))
             self.batches.append((params, state, lanes, max(1, shape[0] / shape[1]) ** .5))
 
+    def polar_partners(self):
+        """Groups of batch indices whose polar inputs (polar_batch's transpose of tall shapes) share a non-square
+        shape: each group's polar runs as one."""
+        groups = {}
+        for k, (params, *_) in enumerate(self.batches):
+            rows, cols = params[0].shape
+            if rows != cols:
+                groups.setdefault((min(rows, cols), max(rows, cols)), []).append(k)
+        return [ks for ks in groups.values() if len(ks) > 1]
+
+    def merged_shard_step(self, ks, scalars):
+        """The sharded step of batches ks (polar partners) with one polar: wait each shard, update, all-gather."""
+        world, rank = dist.get_world_size(), dist.get_rank()
+        gs, ws, views, fasts, slows, energies, lanes, ratios = [], [], [], [], [], [], [], []
+        for k in ks:
+            params, state, lane, ratio = self.batches[k]
+            per = len(params) // world
+            sl = slice(rank * per, (rank + 1) * per)
+            w = stacked_view([p.data for p in params])
+            self.shard_works[k].wait()
+            gs.append(self.shard_grads[k].float())
+            ws.append(w[sl].float())
+            views.append(w)
+            fasts.append(state['fast'][sl])
+            slows.append(state['slow'][sl])
+            energies.append(state['energy'][sl])
+            lanes.append(lane)
+            ratios.append(ratio)
+        news = anvil_update_merged(gs, ws, fasts, slows, energies, *scalars, tuple(lanes), tuple(ratios),
+                                   self.polar_margin)
+        for w, new in zip(views, news):
+            work = dist.all_gather_into_tensor(w, new.to(w.dtype).contiguous(), async_op=True)
+            self.gather_works = getattr(self, 'gather_works', []) + [work]
+
     @torch.no_grad()
     def step(self):
+        """Each batch from the shard of its gradient that Cut.step reduce-scattered to this rank (shard_grads, waited
+        for in shard_works): this rank updates its 1/world of the batch and all-gathers it (gather_works); polar
+        partners share one polar."""
         scalars = self.scalar_schedule[self.t].unbind()
-        for params, state, lanes, ratio in self.batches:
-            new = anvil_update(torch.stack([p.grad.float() for p in params]), torch.stack([p.float() for p in params]),
-                state['fast'], state['slow'], state['energy'], *scalars, lanes, ratio, self.polar_margin)
-            torch._foreach_copy_(params, list(new.to(params[0].dtype).unbind(0)))
+        merged = {k: ks for ks in self.polar_partners() for k in ks}
+        world, rank = dist.get_world_size(), dist.get_rank()
+        for k, (params, state, lanes, ratio) in enumerate(self.batches):
+            if k in merged:
+                if k == merged[k][-1]:  # one polar for the whole group, at its last batch
+                    self.merged_shard_step(merged[k], scalars)
+                continue
+            per = len(params) // world
+            sl = slice(rank * per, (rank + 1) * per)
+            w = stacked_view([p.data for p in params])
+            self.shard_works[k].wait()
+            new = anvil_update(self.shard_grads[k].float(), w[sl].float(), state['fast'][sl], state['slow'][sl],
+                               state['energy'][sl], *scalars, lanes, ratio, self.polar_margin)
+            work = dist.all_gather_into_tensor(w, new.to(w.dtype).contiguous(), async_op=True)
+            self.gather_works = getattr(self, 'gather_works', []) + [work]
+        self.shard_grads = None
         self.t += 1
 
 
@@ -1682,12 +1512,14 @@ class Optimizers:
     def zero_grad(self, set_to_none):
         for o in self.optimizers:
             o.zero_grad(set_to_none=set_to_none)
-    def step(self):
+    def step(self, between=None):
         enabled = torch.are_deterministic_algorithms_enabled()
         warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
         try:
             torch.use_deterministic_algorithms(True)
-            for o in self.optimizers:
+            for k, o in enumerate(self.optimizers):
+                if k == 1 and between is not None:
+                    between()
                 o.step()
         finally:
             torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
@@ -1722,22 +1554,23 @@ def make_optimizer(model, recipe, steps):
         groups.setdefault(scale, []).append(parameter)
     adam = torch.optim.AdamW(
       [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
-      betas=recipe.betas, eps=1e-8, weight_decay=0.0,
+      betas=recipe.betas, eps=1e-8, weight_decay=0.0, fused=True,
     )
     anvil = BatchedAnvil(matrices, recipe.anvil_lr, recipe.anvil_wd, steps,
       polar_margin=recipe.polar_margin, fast_weight=recipe.fast_weight)
     # ANVIL weight decay is scaled by late_cut_decay_multiplier (zero) after the first 275/1043 of the Cut updates.
     late_from = round(275 / 1043 * steps)
     decay_factors = tuple(recipe.late_cut_decay_multiplier if t >= late_from else 1.0 for t in range(steps))
-    anvil.prepare_scalar_schedule(recipe.warmdown, recipe.final, decay_factors)
+    anvil.prepare_scalar_schedule(recipe.warmdown, recipe.final, decay_factors, recipe.cut_warmup)
     return Optimizers(anvil, adam)
 
 
-def set_rate(optimizer, step, steps, warmdown, final):
+def set_rate(optimizer, step, steps, warmdown, final, warmup=0):
     left = (steps - step + 1) / steps
+    ramp = min(1.0, step / warmup) if warmup else 1.0
     for group in optimizer.optimizers[1].param_groups:  # AdamW; ANVIL's rates are precomputed in its scalar schedule
         group.setdefault('initial_lr', group['lr'])
-        group['lr'] = group['initial_lr'] * (final + (1 - final) * min(1.0, left / warmdown))
+        group['lr'] = group['initial_lr'] * ramp * (final + (1 - final) * min(1.0, left / warmdown))
 
 
 def merge_part(name):
@@ -1747,9 +1580,9 @@ def merge_part(name):
 
 
 HOLDOUT = 64
-MERGE_FROM, MERGE_EVERY = 0.6, 5
-MERGE_DECAYS = (0.5, 0.3, 0.2, 0.12, 0.08, 0.05, 0.03, 0.02, 0.01)
-MERGE_RHOS = (0.0, 0.5, 1.0)
+MERGE_FROM, MERGE_EVERY = 0.3, 5
+MERGE_DECAYS = (0.03, 0.02)
+MERGE_RHOS = (1.0,)
 MERGE_K, MERGE_TOKENS = 64, 512
 
 
@@ -1826,7 +1659,7 @@ def subspace_move(name, move, bases, order):
     return move
 
 
-MERGE_COEFS = (0.75, 1.0, 1.25)
+MERGE_COEFS = (0.75, 1.0)
 
 
 @torch.no_grad()
@@ -1987,7 +1820,7 @@ def end_merge(model, means, rows, rank, scorer, settings):
     named = list(model.named_parameters())
     params = [q for _, q in named]
     final = [q.detach().float().clone() for q in params]
-    bases, order = curvature_bases(model, rows, rank)
+    bases, order = curvature_bases(model, rows, rank) if any(rho < 1 for rho in MERGE_RHOS) else ({}, None)
     candidates = [(rho, j) for rho in MERGE_RHOS for j in range(len(means))]
     def move(i, rho, j):
         full = means[j][i] - final[i]
@@ -1996,199 +1829,7 @@ def end_merge(model, means, rows, rank, scorer, settings):
         inside = subspace_move(named[i][0], full, bases, order)
         return inside + rho * (full - inside)
     plain = scorer.score(HOLDOUT).item()
-    return joint_parts(named, params, final, move, candidates, plain, scorer, settings)
-
-
-@triton.jit
-def _side_features(side_ptr, offs, part, D: tl.constexpr, J: tl.constexpr, offs_j, scale):
-    i = (part * J + offs_j) % (D // 2)
-    x = tl.load(side_ptr + offs[:, None] * D + i[None, :]) * scale
-    y = tl.load(side_ptr + offs[:, None] * D + (i + D // 2)[None, :]) * scale
-    return x, y
-
-
-@triton.jit
-def _closed_coefficients(raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr, row, BH, T, offs, part, M, RAW_GPU,
-    RAW_STRIDE, D: tl.constexpr, J: tl.constexpr, offs_j):
-    d = part * J + offs_j
-    i = d % (D // 2)
-    n = (row % BH).to(tl.int64) * T + offs
-    raw = tl.load(raw_ptr + (n // M * RAW_GPU + n % M * RAW_STRIDE)[:, None] + d[None, :]).to(tl.float32)
-    sq = tl.load(sq_ptr + row * T + offs)[:, None]
-    steps = tl.load(steps_ptr + row * T + offs)[:, None]
-    change = (2 * steps * raw + steps * steps) / D / (sq / D + 1e-6)
-    a = libdevice.expm1(-0.5 * libdevice.log1p(change))
-    b = steps * libdevice.rsqrt(sq / D + 1e-6) * (1 + a)
-    cos = tl.load(cos_ptr + offs[:, None] * (D // 2) + i[None, :])
-    sin = tl.load(sin_ptr + offs[:, None] * (D // 2) + i[None, :])
-    first = (d < D // 2)[None, :]
-    return a, b * tl.where(first, cos, sin), b * tl.where(first, -sin, cos)
-
-
-@triton.jit
-def _store_by_token(out_ptr, x, row, BH, T, offs, part, M, W_STRIDE, D: tl.constexpr, J: tl.constexpr, offs_j):
-    n = (row % BH).to(tl.int64) * T + offs
-    tl.store(out_ptr + (n // M * W_STRIDE + n % M * D + part * J)[:, None] + offs_j[None, :], x)
-
-
-@triton.jit
-def _split4(acc, BLOCK: tl.constexpr, J: tl.constexpr):
-    first, second = tl.split(tl.reshape(acc, (BLOCK, J, 2, 2)))
-    x, y = tl.split(first)
-    xx, yy = tl.split(second)
-    return x, y, xx, yy
-
-
-@triton.jit
-def _moment_queries_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr, cos_ptr, sin_ptr, lse_ptr,
-    hubout_ptr, steps_ptr, out_ptr, BH, T, scale, REPEAT, RAW_BLK, RAW_GPU,
-    RAW_STRIDE, M, OUT_BLK, W_STRIDE,
-    D: tl.constexpr, J: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr):
-    i, s0 = tl.program_id(0), (tl.num_programs(1) - 1 - tl.program_id(1)) * BLOCK_S
-    row, part = i // REPEAT, i % REPEAT
-    blk = row // BH
-    raw_ptr += blk.to(tl.int64) * RAW_BLK
-    out_ptr += blk.to(tl.int64) * OUT_BLK
-    offs_s = s0 + tl.arange(0, BLOCK_S)
-    offs_d = tl.arange(0, D)
-    offs_j = tl.arange(0, J)
-    base = row.to(tl.int64) * T * D
-    q = tl.load(q_ptr + base + offs_s[:, None] * D + offs_d[None, :])
-    hub = tl.load(hub_ptr + base + offs_s[:, None] * D + offs_d[None, :])
-    lse = tl.load(lse_ptr + row * T + offs_s)
-    hub_out = tl.load(hubout_ptr + row * T + offs_s)
-    side = side_ptr + base
-    n4 = tl.zeros((BLOCK_S, 4 * J), tl.float32)
-    d4 = tl.zeros((BLOCK_S, 4 * J), tl.float32)
-    nxy = tl.zeros((BLOCK_S, J), tl.float32)
-    dxy = tl.zeros((BLOCK_S, J), tl.float32)
-    l2 = tl.zeros((BLOCK_S, 2 * J), tl.float32)
-    m2 = tl.zeros((BLOCK_S, 2 * J), tl.float32)
-    s1n = tl.zeros((BLOCK_S,), tl.float32)
-    s2n = tl.zeros((BLOCK_S,), tl.float32)
-    s1d = tl.zeros((BLOCK_S,), tl.float32)
-    s2d = tl.zeros((BLOCK_S,), tl.float32)
-    last = (s0 + BLOCK_S - 1) // BLOCK_T + 1
-    for it in range(last):
-        offs_t = it * BLOCK_T + tl.arange(0, BLOCK_T)
-        k = tl.load(k_ptr + base + offs_t[:, None] * D + offs_d[None, :])
-        v = tl.load(v_ptr + base + offs_t[:, None] * D + offs_d[None, :])
-        logits = tl.dot(q, tl.trans(k)) * scale
-        lag = offs_s[:, None] - offs_t[None, :]
-        a = tl.where(lag >= 0, tl.exp2((logits - lse[:, None]) * 1.4426950408889634), 0.0)
-        c = tl.dot(hub, tl.trans(v)) - hub_out[:, None]
-        x, y = _side_features(side, offs_t, part, D, J, offs_j, scale)
-        f2 = tl.reshape(tl.join(x, y), (BLOCK_T, 2 * J)).to(tl.bfloat16)
-        f4 = tl.reshape(tl.join(tl.join(x, y), tl.join(x * x, y * y)), (BLOCK_T, 4 * J)).to(tl.bfloat16)
-        fxy = (x * y).to(tl.bfloat16)
-        wn = a * c
-        wnl = (wn * logits).to(tl.bfloat16)
-        al = (a * logits).to(tl.bfloat16)
-        wnb, ab = wn.to(tl.bfloat16), a.to(tl.bfloat16)
-        n4 += tl.dot(wnb, f4)
-        nxy += tl.dot(wnb, fxy)
-        l2 += tl.dot(wnl, f2)
-        d4 += tl.dot(ab, f4)
-        dxy += tl.dot(ab, fxy)
-        m2 += tl.dot(al, f2)
-        s1n += tl.sum(wn * logits, axis=1)
-        s2n += tl.sum(wn * logits * logits, axis=1)
-        s1d += tl.sum(a * logits, axis=1)
-        s2d += tl.sum(a * logits * logits, axis=1)
-    ca, bu, bw = _closed_coefficients(raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr, row, BH, T, offs_s, part, M,
-      RAW_GPU, RAW_STRIDE, D, J, offs_j)
-    nx0, ny0, nx1, ny1 = _split4(n4, BLOCK_S, J)
-    dx0, dy0, dx1, dy1 = _split4(d4, BLOCK_S, J)
-    lx0, ly0 = tl.split(tl.reshape(l2, (BLOCK_S, J, 2)))
-    mx0, my0 = tl.split(tl.reshape(m2, (BLOCK_S, J, 2)))
-    zn = (nx0 * bu + ny0 * bw + 0.5 * (nx1 * bu * bu + ny1 * bw * bw) + nxy * bu * bw
-      + ca * (lx0 * bu + ly0 * bw) + s1n[:, None] * ca + s2n[:, None] * (0.5 * ca * ca))
-    zd = (dx0 * bu + dy0 * bw + 0.5 * (dx1 * bu * bu + dy1 * bw * bw) + dxy * bu * bw
-      + ca * (mx0 * bu + my0 * bw) + s1d[:, None] * ca + s2d[:, None] * (0.5 * ca * ca))
-    steps = tl.load(steps_ptr + row * T + offs_s)
-    _store_by_token(out_ptr, zn / (1.0 + zd) / steps[:, None], row, BH, T, offs_s, part, M, W_STRIDE, D, J, offs_j)
-
-
-def moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat):
-    rows, t, d = q.shape
-    blocks = raw.shape[1]
-    _moment_queries_kernel[(rows * repeat, t // 64)](q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps,
-      out, rows // blocks, t, d ** -0.5, repeat,
-      raw.stride(1), raw.stride(0), raw.stride(2), out.shape[2],
-      out.stride(1), out.stride(0), D=d, J=d // repeat,
-      BLOCK_T=32, BLOCK_S=64, num_warps=4, num_stages=3)
-
-
-@triton.jit
-def _moment_keys_kernel(q_ptr, k_ptr, v_ptr, hub_ptr, raw_ptr, sq_ptr, side_ptr, cos_ptr, sin_ptr, lse_ptr, hubout_ptr,
-    steps_ptr, out_ptr, value_ptr, BH, T, scale, REPEAT, RAW_BLK, RAW_GPU,
-    RAW_STRIDE, M, OUT_BLK, W_STRIDE,
-    D: tl.constexpr, J: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_S: tl.constexpr):
-    i, t0 = tl.program_id(0), tl.program_id(1) * BLOCK_T
-    row, part = i // REPEAT, i % REPEAT
-    blk = row // BH
-    raw_ptr += blk.to(tl.int64) * RAW_BLK
-    out_ptr += blk.to(tl.int64) * OUT_BLK
-    offs_t = t0 + tl.arange(0, BLOCK_T)
-    offs_d = tl.arange(0, D)
-    offs_j = tl.arange(0, J)
-    base = row.to(tl.int64) * T * D
-    k = tl.load(k_ptr + base + offs_t[:, None] * D + offs_d[None, :])
-    v = tl.load(v_ptr + base + offs_t[:, None] * D + offs_d[None, :])
-    side = side_ptr + base
-    p2 = tl.zeros((BLOCK_T, 2 * J), tl.float32)
-    q2 = tl.zeros((BLOCK_T, 2 * J), tl.float32)
-    qxy = tl.zeros((BLOCK_T, J), tl.float32)
-    r2 = tl.zeros((BLOCK_T, 2 * J), tl.float32)
-    val = tl.zeros((BLOCK_T, J), tl.float32)
-    s1 = tl.zeros((BLOCK_T,), tl.float32)
-    s2 = tl.zeros((BLOCK_T,), tl.float32)
-    first = t0 // BLOCK_S
-    last = T // BLOCK_S
-    for it in range(first, last):
-        offs_s = it * BLOCK_S + tl.arange(0, BLOCK_S)
-        q = tl.load(q_ptr + base + offs_s[:, None] * D + offs_d[None, :])
-        hub = tl.load(hub_ptr + base + offs_s[:, None] * D + offs_d[None, :])
-        hub_part = tl.load(hub_ptr + base + offs_s[:, None] * D + part * J + offs_j[None, :])
-        lse = tl.load(lse_ptr + row * T + offs_s)
-        hub_out = tl.load(hubout_ptr + row * T + offs_s)
-        logits = tl.dot(k, tl.trans(q)) * scale
-        lag = offs_s[None, :] - offs_t[:, None]
-        a = tl.where(lag >= 0, tl.exp2((logits - lse[None, :]) * 1.4426950408889634), 0.0)
-        c = tl.dot(v, tl.trans(hub)) - hub_out[None, :]
-        x, y = _side_features(side, offs_s, part, D, J, offs_j, scale)
-        w1 = a * c
-        w2 = (0.5 * a - a * a) * c
-        w1b, w2b, w2lb = w1.to(tl.bfloat16), w2.to(tl.bfloat16), (w2 * logits).to(tl.bfloat16)
-        f2 = tl.reshape(tl.join(x, y), (BLOCK_S, 2 * J)).to(tl.bfloat16)
-        g2 = tl.reshape(tl.join(x * x, y * y), (BLOCK_S, 2 * J)).to(tl.bfloat16)
-        val += tl.dot(a.to(tl.bfloat16), hub_part)
-        p2 += tl.dot(w1b, f2)
-        q2 += tl.dot(w2b, g2)
-        qxy += tl.dot(w2b, (x * y).to(tl.bfloat16))
-        r2 += tl.dot(w2lb, f2)
-        s1 += tl.sum(w1 * logits, axis=1)
-        s2 += tl.sum(w2 * logits * logits, axis=1)
-    ca, bu, bw = _closed_coefficients(raw_ptr, sq_ptr, steps_ptr, cos_ptr, sin_ptr, row, BH, T, offs_t, part, M,
-      RAW_GPU, RAW_STRIDE, D, J, offs_j)
-    px, py = tl.split(tl.reshape(p2, (BLOCK_T, J, 2)))
-    qx, qy = tl.split(tl.reshape(q2, (BLOCK_T, J, 2)))
-    rx, ry = tl.split(tl.reshape(r2, (BLOCK_T, J, 2)))
-    z = (px * bu + py * bw + qx * bu * bu + qy * bw * bw + qxy * (2.0 * bu * bw) + 2.0 * ca * (rx * bu + ry * bw)
-      + s1[:, None] * ca + s2[:, None] * (ca * ca))
-    steps = tl.load(steps_ptr + row * T + offs_t)
-    _store_by_token(out_ptr, z / steps[:, None], row, BH, T, offs_t, part, M, W_STRIDE, D, J, offs_j)
-    _store_by_token(value_ptr + blk.to(tl.int64) * OUT_BLK, val, row, BH, T, offs_t, part, M, W_STRIDE, D, J, offs_j)
-
-
-def moment_key_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, values, repeat):
-    rows, t, d = q.shape
-    blocks = raw.shape[1]
-    _moment_keys_kernel[(rows * repeat, t // 64)](q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out,
-      values, rows // blocks, t, d ** -0.5, repeat,
-      raw.stride(1), raw.stride(0), raw.stride(2), out.shape[2],
-      out.stride(1), out.stride(0), D=d, J=d // repeat,
-      BLOCK_T=64, BLOCK_S=32, num_warps=4, num_stages=3)
+    return joint_parts(named, params, final, move, candidates, plain, scorer, settings, sweeps=settings.merge_sweeps)
 
 
 F32, BF16 = torch.float32, torch.bfloat16
@@ -2198,8 +1839,8 @@ VOCAB, L, H, D = 4096, 8, 8, 512
 HD = D // H
 LR, BETA1, BETA2, ADAM_EPS = 0.006, 0.7, 0.98, 1e-8
 LR_WTE, LR_VE, LR_LAMBDAS = 1.8, 1.8, 0.006
-ANVIL_LR, ANVIL_WD = 0.032, 2.25
-ANVIL_DECAY = float(np.float32(ANVIL_WD) * np.float32(ANVIL_LR))  # the fp32 product, 1 ulp above fp32(0.072)
+ANVIL_LR, ANVIL_WD = 0.04, 2.25
+ANVIL_DECAY = 0.09  # identity-phase ANVIL decay (lr x wd for this rate)
 GATE_CHANNELS, SOFTCAP = 32, 15.0
 NORM_EPS = 1e-6
 SIGMA, FC_SIGMA, KEY_SIGMA, HEAD_SIGMA, GATE_STEP = 0.005, 0.05, 0.003, 0.1, 0.1
@@ -2247,6 +1888,7 @@ def pair_value_output(model):
 
 
 SHAPING_UPDATES = 195  # the four update-shaping mechanisms below act on identity updates 0..194
+SHAPING_ON = True  # (set while each graph is traced: False drops the mechanisms, a no-op from update 195 on)
 VE_COMMON_GAIN = 4.0
 
 
@@ -2263,6 +1905,8 @@ WTE_GATE_ENERGY = 0.00390625  # 1/256 of each wte row's energy in its GATE_CHANN
 
 
 def constrain_wte_gate_energy(wte, step_t):
+    if not SHAPING_ON:
+        return
     x = wte.float()
     sector = torch.arange(D, device=x.device) < GATE_CHANNELS
     inside = torch.where(sector, x.square(), 0.0).sum(-1, keepdim=True)
@@ -2281,6 +1925,8 @@ constrain_wte_gate_energy_compiled = torch.compile(constrain_wte_gate_energy, dy
 def pool_gate_credits(grads, step_t):
     # Acts on the all-reduced gate credits, which feed only Adam: each VE gate's head-mean credit becomes the mean
     # over the four VE layers.
+    if not SHAPING_ON:
+        return
     common = torch.stack(grads).mean(dim=(0, 2))[:, None]
     for grad in grads:
         pooled = grad - grad.mean(dim=1, keepdim=True) + common
@@ -2470,6 +2116,10 @@ def rope_norm(raw, cos, sin):
     return (rot * torch.rsqrt(rot.square().mean(-1, keepdim=True) + NORM_EPS)).to(BF16).transpose(1, 2).contiguous()
 
 
+# the identity forward's flex attention kernel_options (None: the defaults; BLOCK_N 128 as the default keeps it bitwise)
+ID_FLEX_TILES = dict(BLOCK_M=64, BLOCK_N=128, num_warps=4, num_stages=3)
+
+
 def forward_impl(model, idx, targets, cos, sin):
     b, t = idx.shape
     cache = {}
@@ -2488,7 +2138,7 @@ def forward_impl(model, idx, targets, cos, sin):
             cache[f'h{i}.ve_gate'], cache[f'h{i}.ve'] = z, ve
         qp, kp = rope_norm(q.view(b, t, H, HD), cos, sin), rope_norm(k.view(b, t, H, HD), cos, sin)
         o, aux = flex_attention(qp, kp, values.transpose(1, 2).contiguous(), block_mask=model.mask,
-        return_aux=AuxRequest(lse=True))
+        return_aux=AuxRequest(lse=True), kernel_options=ID_FLEX_TILES)
         lse = aux.lse
         o = o.transpose(1, 2).reshape(b, t, D)
         cache.update({f'h{i}.in.attn': n1, f'h{i}.q': q, f'h{i}.k': k, f'h{i}.values': values,
@@ -2507,7 +2157,7 @@ def forward_impl(model, idx, targets, cos, sin):
     return cache, loss
 
 
-forward = torch.compile(forward_impl, dynamic=False)
+forward = torch.compile(forward_impl, dynamic=False, options={'combo_kernels': True})
 
 
 @torch.compile(dynamic=False)
@@ -2533,26 +2183,66 @@ def step_signs(step_t, device):
 
 
 @torch.compile(dynamic=False)
-def cycle_weights(x, base, h):
+def cycle_scales(x, h):
+    """cycle_weights' per-token step, norm inverses and their ratios."""
     steps = SIGMA * torch.clamp(torch.sqrt(x.square().mean(-1, keepdim=True)), min=1e-6)
     sq = x.square().sum(-1, keepdim=True)
     dots = x @ h.T
     inv = torch.rsqrt((sq + 2 * steps * dots + steps * steps * D) / D + EPS)
     inv0 = torch.rsqrt(sq / D + EPS)
     delta, sigma = inv / inv0 - 1, steps * inv
-    z = base * inv0
-    t = torch.tanh(z / SOFTCAP)
-    f = torch.exp(SOFTCAP * t)
-    g1 = 1 - t * t
-    d1 = -2 * t * g1 / SOFTCAP
-    d2 = -2 * g1 * (1 - 3 * t * t) / SOFTCAP ** 2
-    g2, g3 = g1 * g1 + d1, g1 * g1 * g1 + 3 * g1 * d1 + d2
-    fz, fzz = f * z, f * z * z
-    total = f.sum(-1, keepdim=True)
-    rows = torch.cat([(fz * g1).sum(-1, keepdim=True), (fzz * g2).sum(-1, keepdim=True),
-      (fzz * z * g3).sum(-1, keepdim=True)], 1)
-    fast = torch.stack([fz * g2, fzz * g3, f * g2, fz * g3, f * g3]).to(BF16)
-    return f * g1, fast, rows, total, steps, inv, inv0, delta, sigma
+    return steps, inv, inv0, delta, sigma
+
+
+@triton.jit
+def _cycle_weights_kernel(Base, Inv0, FG1, Fast, Rows, Total, T: tl.constexpr, V: tl.constexpr,
+    BLOCK: tl.constexpr, CAP: tl.constexpr):
+    """cycle_weights' per-logit part for one token in one pass: f g1 (fp32), the five bf16 weight rows, and the row
+    sums (total, and rows' three)."""
+    token = tl.program_id(0).to(tl.int64)
+    inv0 = tl.load(Inv0 + token)
+    total = tl.zeros((BLOCK,), tl.float32)
+    r1 = tl.zeros((BLOCK,), tl.float32)
+    r2 = tl.zeros((BLOCK,), tl.float32)
+    r3 = tl.zeros((BLOCK,), tl.float32)
+    for v0 in range(0, V, BLOCK):
+        cols = v0 + tl.arange(0, BLOCK)
+        z = tl.load(Base + token * V + cols) * inv0
+        t = libdevice.tanh(z / CAP)
+        f = libdevice.exp(CAP * t)
+        g1 = 1 - t * t
+        d1 = -2 * t * g1 / CAP
+        d2 = -2 * g1 * (1 - 3 * t * t) / (CAP * CAP)
+        g2, g3 = g1 * g1 + d1, g1 * g1 * g1 + 3 * g1 * d1 + d2
+        fz, fzz = f * z, f * z * z
+        total += f
+        r1 += fz * g1
+        r2 += fzz * g2
+        r3 += fzz * z * g3
+        out = token * V + cols
+        tl.store(FG1 + out, f * g1)
+        tl.store(Fast + out, (fz * g2).to(tl.bfloat16))
+        tl.store(Fast + T * V + out, (fzz * g3).to(tl.bfloat16))
+        tl.store(Fast + 2 * T * V + out, (f * g2).to(tl.bfloat16))
+        tl.store(Fast + 3 * T * V + out, (fz * g3).to(tl.bfloat16))
+        tl.store(Fast + 4 * T * V + out, (f * g3).to(tl.bfloat16))
+    tl.store(Total + token, tl.sum(total, 0))
+    tl.store(Rows + token * 3, tl.sum(r1, 0))
+    tl.store(Rows + token * 3 + 1, tl.sum(r2, 0))
+    tl.store(Rows + token * 3 + 2, tl.sum(r3, 0))
+
+
+def cycle_weights_fused(x, base, h):
+    """cycle_weights (same outputs) with its per-logit part in one kernel pass."""
+    steps, inv, inv0, delta, sigma = cycle_scales(x, h)
+    tokens, vocab = base.shape
+    fg1 = torch.empty_like(base)
+    fast = torch.empty((5, tokens, vocab), device=base.device, dtype=BF16)
+    rows = torch.empty((tokens, 3), device=base.device)
+    total = torch.empty((tokens, 1), device=base.device)
+    _cycle_weights_kernel[(tokens,)](base.contiguous(), inv0.contiguous(), fg1, fast, rows, total, T=tokens, V=vocab,
+                                     BLOCK=1024, CAP=SOFTCAP, num_warps=4)
+    return fg1, fast, rows, total, steps, inv, inv0, delta, sigma
 
 
 @torch.compile(dynamic=False)
@@ -2578,10 +2268,15 @@ def top_credit(model, x, y):
     h = model.H * step_signs(model.step_t, x.device)[None, :]
     c = h @ model.lm_head
     base = x @ model.lm_head
-    fg1, fast, rows, total, steps, inv, inv0, delta, sigma = cycle_weights(x, base, h)
+    fg1, fast, rows, total, steps, inv, inv0, delta, sigma = cycle_weights_fused(
+        x, base, h)
     exact = fg1 @ c.T
     cb, c2, c3 = cycle_powers(c)
-    prods = [fast[0] @ cb.T, fast[1] @ cb.T, fast[2] @ c2.T, fast[3] @ c2.T, fast[4] @ c3.T]
+    # the products sharing a right operand as one GEMM (stacked along tokens; bitwise the same)
+    n = x.shape[0]
+    p01 = (fast[:2].reshape(2 * n, -1) @ cb.T).view(2, n, -1)
+    p23 = (fast[2:4].reshape(2 * n, -1) @ c2.T).view(2, n, -1)
+    prods = [p01[0], p01[1], p23[0], p23[1], fast[4] @ c3.T]
     return cycle_finish(exact, prods, rows, total, base, c, y, steps, inv, inv0, delta, sigma, h)
 
 
@@ -2595,35 +2290,102 @@ REPEAT, REPEAT_K = HD // 16, HD // 32
 PACK = 5 * HD + 2
 
 
-@torch.compile(dynamic=False)
-def pack_heads(qs, ks, vals, outs, targets, lse_bits):
-    parts = []
-    for q, k, v, o, tg, lb in zip(qs, ks, vals, outs, targets, lse_bits):
-        m = q.shape[0]
-        bits = lb.view(m, H, 2)
-        parts.append(torch.cat([q.view(m, H, HD), k.view(m, H, HD), v.view(m, H, HD), o.view(m, H, HD),
-        tg.view(m, H, HD), bits], -1))
-    return torch.stack(parts).permute(2, 0, 1, 3).contiguous()
+@triton.jit
+def _pack_heads_kernel(Q, K, V, O, TG, LSE, Out16, Out32, layer, sq, sk, sv, so, st, L: tl.constexpr,
+                       M: tl.constexpr, T: tl.constexpr, H: tl.constexpr, PACK: tl.constexpr, BM: tl.constexpr):
+    """One layer's rows of pack_heads' (H, L, M, PACK) output for BM tokens of head h: the five 64-wide pieces and
+    the lse's fp32 bits (LSE (rows, H, T) fp32 as int32), copied as raw 16-bit words."""
+    tile, h = tl.program_id(0), tl.program_id(1)
+    tok = (tile * BM + tl.arange(0, BM)).to(tl.int64)
+    d = tl.arange(0, 64)
+    row = (h * L + layer) * M + tok
+    dst = Out16 + row[:, None] * PACK + d[None, :]
+    col = h * 64 + d[None, :]
+    tl.store(dst, tl.load(Q + tok[:, None] * sq + col))
+    tl.store(dst + 64, tl.load(K + tok[:, None] * sk + col))
+    tl.store(dst + 128, tl.load(V + tok[:, None] * sv + col))
+    tl.store(dst + 192, tl.load(O + tok[:, None] * so + col))
+    tl.store(dst + 256, tl.load(TG + tok[:, None] * st + col))
+    lse = tl.load(LSE + ((tok // T) * H + h) * T + tok % T)
+    tl.store(Out32 + row * (PACK // 2) + 5 * 32, lse)
 
 
-@torch.compile(dynamic=False)
-def head_prep(got, lse, cos, sin, b: int, t: int):
-    k = got.shape[1]
-    whole, lse = got.transpose(0, 1).reshape(k * b, t, PACK), lse.transpose(0, 1).reshape(k * b, t)
-    q_raw, k_raw, values, out, hub = (whole[..., j * HD:(j + 1) * HD].float() for j in range(5))
-    q1, k1 = rope32(q_raw, cos, sin), rope32(k_raw, cos, sin)
-    sq_q, sq_k = (q_raw * q_raw).sum(-1), (k_raw * k_raw).sum(-1)
-    steps = lambda sq: KEY_SIGMA * torch.clamp(torch.sqrt(sq / HD), min=1e-6)
-    return (q1.to(BF16), k1.to(BF16), values.to(BF16), hub.to(BF16), q1, k1, lse.contiguous(), (hub * out).sum(-1),
-      sq_q, sq_k, steps(sq_q), steps(sq_k))
+def pack_heads_kernel(qs, ks, vals, outs, targets, lses):
+    """pack_heads (bitwise) from each layer's (tokens, D) pieces and its lse (rows, H, t), one launch per layer."""
+    n, t = qs[0].shape[0], lses[0].shape[-1]
+    out = torch.empty(H, len(qs), n, PACK, device=qs[0].device, dtype=BF16)
+    o16, o32 = out.view(torch.int16), out.view(torch.int32)
+    for i, (q, k, v, o, tg, lse) in enumerate(zip(qs, ks, vals, outs, targets, lses)):
+        assert all(z.stride(1) == 1 for z in (q, k, v, o, tg)) and n % 16 == 0
+        _pack_heads_kernel[(n // 16, H)](q.view(torch.int16), k.view(torch.int16), v.view(torch.int16),
+                                         o.view(torch.int16), tg.view(torch.int16), lse.contiguous().view(torch.int32),
+                                         o16, o32, i, q.stride(0), k.stride(0), v.stride(0), o.stride(0), tg.stride(0),
+                                         L=len(qs), M=n, T=t, H=H, PACK=PACK, BM=16, num_warps=1)
+    return out
+
+
+@triton.jit
+def _head_prep_kernel(Got, Got32, Cos, Sin, Q16, K16, V16, Hub16, Q32, K32, LSE, HubOut, SqQ, SqK, StepsQ, StepsK,
+                      W: tl.constexpr, L: tl.constexpr, N: tl.constexpr, T: tl.constexpr, PACK: tl.constexpr,
+                      SIGMA: tl.constexpr, EPS: tl.constexpr, BM: tl.constexpr):
+    """head_prep for BM tokens of rank w's layer l (got (W, L, N, PACK)): output token (l * W + w) * N + i."""
+    tile, wl = tl.program_id(0), tl.program_id(1)
+    w, layer = wl % W, wl // W
+    i = tile * BM + tl.arange(0, BM)
+    src = ((w * L + layer) * N + i).to(tl.int64)
+    dst = ((layer * W + w) * N + i).to(tl.int64)
+    pos = i % T
+    half = tl.arange(0, 32)
+    dims = tl.arange(0, 64)
+    c = tl.load(Cos + pos[:, None] * 32 + half[None, :])
+    s = tl.load(Sin + pos[:, None] * 32 + half[None, :])
+    row = Got + src[:, None] * PACK
+    for j in tl.static_range(2):
+        x1 = tl.load(row + j * 64 + half[None, :]).to(tl.float32)
+        x2 = tl.load(row + j * 64 + 32 + half[None, :]).to(tl.float32)
+        r1 = x1 * c + x2 * s
+        r2 = x1 * -s + x2 * c
+        inv = tl.rsqrt((tl.sum(r1 * r1, 1) + tl.sum(r2 * r2, 1)) / 64 + EPS)
+        r1, r2 = r1 * inv[:, None], r2 * inv[:, None]
+        sq = tl.sum(x1 * x1, 1) + tl.sum(x2 * x2, 1)
+        out16 = (Q16 if j == 0 else K16) + dst[:, None] * 64 + half[None, :]
+        out32 = (Q32 if j == 0 else K32) + dst[:, None] * 64 + half[None, :]
+        tl.store(out16, r1.to(tl.bfloat16))
+        tl.store(out16 + 32, r2.to(tl.bfloat16))
+        tl.store(out32, r1)
+        tl.store(out32 + 32, r2)
+        tl.store((SqQ if j == 0 else SqK) + dst, sq)
+        tl.store((StepsQ if j == 0 else StepsK) + dst, SIGMA * tl.maximum(tl.sqrt(sq / 64), 1e-6))
+    v = tl.load(row + 128 + dims[None, :])
+    o = tl.load(row + 192 + dims[None, :]).to(tl.float32)
+    hub = tl.load(row + 256 + dims[None, :])
+    tl.store(V16 + dst[:, None] * 64 + dims[None, :], v)
+    tl.store(Hub16 + dst[:, None] * 64 + dims[None, :], hub)
+    tl.store(HubOut + dst, tl.sum(hub.to(tl.float32) * o, 1))
+    tl.store(LSE + dst, tl.load(Got32 + src * (PACK // 2) + 160))
+
+
+def head_prep_fused(got, cos, sin, b: int, t: int):
+    """head_prep's outputs (the same up to summation order) from got in one kernel pass."""
+    w, layers, n, _ = got.shape
+    rows = layers * b
+    new = lambda *s, dtype=torch.float32: torch.empty(*s, device=got.device, dtype=dtype)
+    q16, k16, v16, hub16 = (new(rows, t, HD, dtype=BF16) for _ in range(4))
+    q32, k32 = new(rows, t, HD), new(rows, t, HD)
+    lse, hub_out, sq_q, sq_k, steps_q, steps_k = (new(rows, t) for _ in range(6))
+    _head_prep_kernel[(n // 32, w * layers)](got, got.view(torch.float32), cos, sin, q16, k16, v16, hub16, q32, k32,
+                                             lse, hub_out, sq_q, sq_k, steps_q, steps_k, W=w, L=layers, N=n, T=t,
+                                             PACK=PACK, SIGMA=KEY_SIGMA, EPS=NORM_EPS, BM=32, num_warps=4)
+    return q16, k16, v16, hub16, q32, k32, lse, hub_out, sq_q, sq_k, steps_q, steps_k
 
 
 def id_head_scores(got, rope32, back, b, t):
-    lse_bits = got[..., 5 * HD:].view(F32)[..., 0]
-    q1, k1, values, hub, q1f, k1f, lse, hub_out, sq_q, sq_k, steps_q, steps_k = head_prep(got, lse_bits, *rope32, b, t)
-    moment_query_scores(q1, k1, values, hub, got, sq_q, k1f, *rope32, lse, hub_out, steps_q, back[:, :, 0], REPEAT)
-    moment_key_scores(q1, k1, values, hub, got[..., HD:], sq_k, q1f, *rope32, lse, hub_out, steps_k, back[:, :, 1],
-      back[:, :, 2], REPEAT_K)
+    q1, k1, values, hub, q1f, k1f, lse, hub_out, sq_q, sq_k, steps_q, steps_k = head_prep_fused(got, *rope32, b, t)
+    queries = moment_kernels.moment_query_scores
+    keys = moment_kernels.moment_key_scores
+    queries(q1, k1, values, hub, got, sq_q, k1f, *rope32, lse, hub_out, steps_q, back[:, :, 0], REPEAT)
+    keys(q1, k1, values, hub, got[..., HD:], sq_k, q1f, *rope32, lse, hub_out, steps_k, back[:, :, 1], back[:, :, 2],
+         REPEAT_K)
 
 
 @torch.compile(dynamic=False)
@@ -2684,6 +2446,10 @@ def value_embed_credits(z, ve, vcredit, n1):
     return gate, (vcredit * 2 * torch.sigmoid(z)[..., None]).view(-1, D)
 
 
+# identity_grad's collectives overlap: the wide gradients (hidden credits + two bmms) in heads_in's window (False) or in
+# heads_out's (True); the order of the other independent work is fixed (numerically identical either way)
+
+
 def identity_grad(model, idx, targets, rows_total):
     """#29's identity-path estimate: the clean pass on this GPU's rows idx [b, t], the readout cycle and the MLP steps
     on its tokens, one head's queries, keys and values over the batch. The ANVIL matrices' gradients stay this
@@ -2697,41 +2463,43 @@ def identity_grad(model, idx, targets, rows_total):
     mine = lambda a: a.reshape(-1, a.shape[-1] if a.dim() < 4 else a.shape[-2] * a.shape[-1])
     stream = lambda name: mine(cache[name]).float()
     y, tokens = targets.reshape(-1), idx.reshape(-1)
-    coords = coordinate_change(cache['lm_head'], y)
-    credit_top = top_credit(model, stream(f'h{L - 1}.stream'), y)
     gsq, gwide = model.grad['square'], model.grad['wide']
+    # heads_in's payload first (it needs the readout credit for targets_o); the work that does not feed it runs while
+    # it is in flight (same calls as before, reordered: numerically identical)
+    credit_top = top_credit(model, stream(f'h{L - 1}.stream'), y)
+    cred, credb = block_credits(credit_top, model.lam_r)
+    targets_o = torch.bmm(credb, model.square_bf[3 * L:].transpose(1, 2))
+    send = pack_heads_kernel([mine(cache[f'h{i}.q']) for i in range(L)], [mine(cache[f'h{i}.k']) for i in range(L)],
+                             [mine(cache[f'h{i}.values']) for i in range(L)],
+                             [mine(cache[f'h{i}.in.attn.c_proj']) for i in range(L)],
+                             [targets_o[i] for i in range(L)], [cache[f'h{i}.lse'] for i in range(L)])
+    got = torch.empty_like(send)
+    heads_in = dist.all_to_all_single(got, send, async_op=True)
+    coords = coordinate_change(cache['lm_head'], y)
     prevs = f32_stack([cache['x0']] + [cache[f'h{i}.stream'] for i in range(L - 1)])
     n1s, os_, n2s, acts = bf16_stacks([cache[f'h{i}.in.attn'] for i in range(L)],
       [cache[f'h{i}.in.attn.c_proj'] for i in range(L)],
       [cache[f'h{i}.in.mlp.c_fc'] for i in range(L)],
       [cache[f'h{i}.in.mlp.c_proj'] for i in range(L)])
-    cred, credb = block_credits(credit_top, model.lam_r)
-    targets_o = torch.bmm(credb, model.square_bf[3 * L:].transpose(1, 2))
-    send = pack_heads([mine(cache[f'h{i}.q']) for i in range(L)], [mine(cache[f'h{i}.k']) for i in range(L)],
-    [mine(cache[f'h{i}.values']) for i in range(L)],
-    [mine(cache[f'h{i}.in.attn.c_proj']) for i in range(L)], [targets_o[i] for i in range(L)],
-    [cache[f'h{i}.lse'].transpose(1, 2).reshape(-1, H).view(BF16)
-    for i in range(L)])
-    got = torch.empty_like(send)
-    heads_in = dist.all_to_all_single(got, send, async_op=True)
-    hidden = hidden_credits([cache[f'h{i}.mlp.c_fc'] for i in range(L)], credb, model.wide_bf[L:])
-    torch.bmm(n2s.transpose(1, 2), hidden, out=gwide[:L])
+    wide = lambda: (torch.bmm(n2s.transpose(1, 2), hidden_credits([cache[f'h{i}.mlp.c_fc'] for i in range(L)], credb,
+      model.wide_bf[L:]), out=gwide[:L]), torch.bmm(credb.transpose(1, 2), acts, out=gwide[L:]))
+    wide()
+    torch.mm(cache['in.lm_head'].float().T, coords, out=model.grad['lm_head'])
     works = {}
     heads_in.wait()
     back = torch.empty(world, L, 3, m, HD, device=idx.device, dtype=BF16)
     id_head_scores(got, rope32, back, rows_total, t)
     got2 = torch.empty_like(back)
     heads_out = dist.all_to_all_single(got2, back, async_op=True)
-    torch.mm(cache['in.lm_head'].float().T, coords, out=model.grad['lm_head'])
+    # the wide gradients are complete: their reduce-scatter queues right behind heads_out
+    works['wide'] = dist.reduce_scatter_tensor(model.owned['wide'], model.grad['wide'], async_op=True)
     scal_r, scal_0, credit_x0 = scalar_credits(cred, prevs, model.lam_r, model.lam_0)
     model.grad['wte'].zero_().index_add_(0, tokens, credit_x0)
     model.grad['lam_r'].copy_(scal_r)
     model.grad['lam_0'].copy_(scal_0)
+    torch.bmm(os_.transpose(1, 2), credb, out=gsq[3 * L:])
     heads_out.wait()
     by_token, vcredits = credit_stacks(got2, VE_BLOCKS)
-    torch.bmm(credb.transpose(1, 2), acts, out=gwide[L:])
-    torch.bmm(os_.transpose(1, 2), credb, out=gsq[3 * L:])
-    works['wide'] = dist.reduce_scatter_tensor(model.owned['wide'], model.grad['wide'], async_op=True)
     for j in range(3):
         torch.bmm(n1s.transpose(1, 2), by_token[j], out=gsq[j * L:(j + 1) * L])
     works['square'] = dist.reduce_scatter_tensor(model.owned['square'], model.grad['square'], async_op=True)
@@ -2800,14 +2568,15 @@ def adam_math(ps, gs, n: int, ms, vs, lrs: tuple, step_t, frames):
         v_new = BETA2 * v + (1 - BETA2) * g.square()
         if 8 <= index < 12:  # the value-embedding tables
             delta = lr * (m_new / c1) / (torch.sqrt(v_new) / torch.sqrt(c2) + ADAM_EPS)
-            amplified = amplify_common_motion(delta)
-            delta = torch.where(step_t < SHAPING_UPDATES, amplified, delta)
+            if SHAPING_ON:
+                amplified = amplify_common_motion(delta)
+                delta = torch.where(step_t < SHAPING_UPDATES, amplified, delta)
             value_deltas.append(delta)
         else:
             p.copy_((p.float() - lr * (m_new / c1) / (torch.sqrt(v_new) / torch.sqrt(c2) + ADAM_EPS)).to(p.dtype))
         m.copy_(m_new)
         v.copy_(v_new)
-    transferred = transfer_partner_motion(torch.stack(value_deltas), frames, step_t)
+    transferred = transfer_partner_motion(torch.stack(value_deltas), frames, step_t) if SHAPING_ON else value_deltas
     for i in range(4):
         ps[8 + i].copy_((ps[8 + i].float() - transferred[i]).to(ps[8 + i].dtype))
 
@@ -2857,6 +2626,20 @@ class IdentityPhase:
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
             train_step(model)
+        # the same step without the shaping mechanisms (no-ops from update SHAPING_UPDATES on)
+        global SHAPING_ON
+        SHAPING_ON = False
+        try:
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    train_step(model)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            self.plain_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.plain_graph, pool=self.graph.pool()):
+                train_step(model)
+        finally:
+            SHAPING_ON = True
         # Restore the fresh state: weights, optimizer state, bf16 copies and the update counter.
         with torch.no_grad():
             for x, saved in zip(model.tensors(), snapshot):
@@ -2884,11 +2667,11 @@ class IdentityPhase:
         lr=LR, betas=[BETA1, BETA2], lr_wte=LR_WTE, lr_value_embeds=LR_VE, lr_lambdas=LR_LAMBDAS,
         anvil_lr=ANVIL_LR, anvil_wd=ANVIL_WD)
     def run(self):
-        for _ in range(IDENTITY_UPDATES):
-            self.graph.replay()
+        for i in range(IDENTITY_UPDATES):
+            (self.plain_graph if i >= SHAPING_UPDATES else self.graph).replay()
         self.model.gather_fp32()
     def close(self):
-        self.graph = None
+        self.graph = self.plain_graph = None
         self.model = None
         torch.cuda.empty_cache()
 
@@ -2932,16 +2715,19 @@ def train_stages(args, settings, device, rank, world):
             json.dumps(
                 dict(
                     script=__file__, world=world, seed=SEED, recipe=asdict(settings), steps=stop + IDENTITY_UPDATES,
+                    overrides=args.set,
                     epoch_updates=horizon + IDENTITY_UPDATES,
                     train_rows=train_count + IDENTITY_UPDATES * BATCH,
                     upstream='qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e',
                     additions=[
-                        'identity_handoff_at_300', 'identity_init_and_early_update_shaping',
-                        'difficulty_balanced_row_order', 'joint_partial_chain_roots', 'reduced_forward_replay',
+                        'identity_handoff_at_355', 'identity_init_and_early_update_shaping',
+                        'difficulty_balanced_row_order', 'single_chain_roots_4_6', 'reduced_forward_replay',
                         'diagonal_readout_moments', 'x0_skip_embedding_credit', 'fused_forward_kernels',
-                        'late_zero_anvil_decay', 'sketched_screened_merge', 'cut_key_degree2_moments',
+                        'late_zero_anvil_decay', 'screened_merge', 'cut_key_degree2_moments',
+                        'cut_query_degree2_moments', 'readout_probe_moments', 'factored_query_replay',
                         'cut_mixing_scalar_contraction', 'cut_estimate_cuda_graph', 'resident_merge_scorer',
-                        'response_ranked_mlp_routes', 'batched_update_telemetry',
+                        'response_ranked_mlp_routes', 'batched_update_telemetry', 'fused_gluon_chain_kernels',
+                        'sharded_anvil_bf16_async_collectives', 'split_identity_graph',
                     ],
                     torch_version=torch.__version__,
                     merge_sketch=dict(columns=MERGE_SKETCH_COLUMNS, output_rank=MERGE_K, seed=SEED),
@@ -2983,6 +2769,7 @@ def train_stages(args, settings, device, rank, world):
         Cut(model, settings, SEED, rank, world),
     )
     graph_batch = rank_slice(noise)
+    estimator.bind_flat_layout(optimizer)  # (the graph packs the gradients in step's layout)
     estimator.capture_estimate_graph(graph_batch[:, :-1].contiguous(), graph_batch[:, 1:].contiguous())
     log = (args.output / 'metrics.jsonl').open('w') if rank == 0 else None
     scorer = prepare_resident_merge_score(model, settings, rank, world)
@@ -3034,7 +2821,7 @@ def train_stages(args, settings, device, rank, world):
         pending_records = []
         for step in range(1, stop + 1):
             begin, end = (step - 1) * settings.cut_batch, step * settings.cut_batch
-            set_rate(optimizer, step, horizon, settings.warmdown, settings.final)
+            set_rate(optimizer, step, horizon, settings.warmdown, settings.final, settings.cut_warmup)
             batch = rank_slice(training[begin:end])
             loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
             record = dict(step=step + IDENTITY_UPDATES, phase='cut', phase_step=step,
@@ -3047,7 +2834,8 @@ def train_stages(args, settings, device, rank, world):
                 if not bool(torch.stack(estimator._telemetry_health).all()):
                     raise FloatingPointError('Non-finite estimator credit')
                 estimator._telemetry_health.clear()
-                losses = torch.stack([entry['train_loss'] for entry in pending_records]).cpu().tolist()
+                losses = torch.stack([entry['train_loss'] for entry in pending_records])
+                losses = losses.cpu().tolist()
                 if any(not math.isfinite(value) for value in losses):
                     raise FloatingPointError('Non-finite training loss')
                 torch.cuda.synchronize()
@@ -3107,10 +2895,27 @@ def main():
     parser.add_argument('--no-ckpt', action='store_true')
     parser.add_argument('--steps', type=int,
                         help='Cut updates to run after the identity phase; preserves the full-epoch LR schedule.')
+    parser.add_argument('--set', nargs='*', default=[], metavar='KEY=VALUE',
+                        help='screening overrides: a Settings field (lower case) or a module constant (upper case)')
     args = parser.parse_args()
     if args.steps is not None and args.steps < 1:
         parser.error('steps must be positive')
     settings = Settings()
+    for item in args.set:
+        key, text = item.split('=', 1)
+        try:
+            value = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            value = text
+        if key.isupper():
+            if key not in globals():
+                parser.error(f'unknown constant {key}')
+            globals()[key] = value
+        else:
+            if not hasattr(settings, key):
+                parser.error(f'unknown setting {key}')
+            setattr(settings, key, value)
+    settings.__post_init__()
     rank, world = int(os.environ['RANK']), int(os.environ['WORLD_SIZE'])
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     device = torch.device('cuda', torch.cuda.current_device())

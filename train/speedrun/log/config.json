@@ -1,5 +1,5 @@
 {
-  "script": "/repo/train/speedrun/run.py",
+  "script": "train/speedrun/run.py",
   "world": 8,
   "seed": 0,
   "recipe": {
@@ -14,48 +14,32 @@
     },
     "late_cut_decay_multiplier": 0.0,
     "cut_batch": 8,
-    "lr": 0.0021,
+    "lr": 0.0028,
     "betas": [
       0.5,
       0.98
     ],
-    "warmdown": 0.4,
-    "final": 0.3,
-    "anvil_lr": 0.026,
+    "warmdown": 0.5,
+    "cut_warmup": 0,
+    "final": 0.5,
+    "anvil_lr": 0.036,
     "anvil_wd": 2.25,
     "fast_weight": 1.0,
     "polar_margin": 1.1,
     "telemetry_batch": 16,
     "fc_sigma": 0.05,
-    "query_draws": 64,
-    "query_sigma": 0.1,
+    "route_k_late": 64,
+    "route_split": 2,
+    "query_moment_sigma": 0.003,
     "chain_sigma": 0.01,
     "chain_depth_roots": [
-      0,
-      1,
-      2,
       4,
-      6,
-      7
-    ],
-    "joint_root_groups": [
-      [
-        0,
-        1
-      ],
-      [
-        2,
-        4
-      ],
-      [
-        6,
-        7
-      ]
+      6
     ],
     "route_k": 128,
-    "chain_tokens": 1024,
+    "chain_tokens": 2048,
     "query_replay_long_layers": [
-      3
+      5
     ],
     "gate_path_sigma": 0.01,
     "query_keys": 16,
@@ -63,31 +47,39 @@
     "merge_screen_rows": 8,
     "merge_screen_global": 16,
     "merge_screen_coordinate": 2,
-    "merge_keys": 8,
+    "merge_keys": 4,
+    "merge_sweeps": 0,
     "emb_scale": 750.0,
     "lambda_scale": 15.0
   },
   "steps": 1823,
+  "overrides": [],
   "epoch_updates": 1823,
   "train_rows": 14584,
   "upstream": "qlabs-eng/noise@3343973b6f1af119effcdea2622f1fe672c51b1e",
   "additions": [
-    "identity_handoff_at_300",
+    "identity_handoff_at_355",
     "identity_init_and_early_update_shaping",
     "difficulty_balanced_row_order",
-    "joint_partial_chain_roots",
+    "single_chain_roots_4_6",
     "reduced_forward_replay",
     "diagonal_readout_moments",
     "x0_skip_embedding_credit",
     "fused_forward_kernels",
     "late_zero_anvil_decay",
-    "sketched_screened_merge",
+    "screened_merge",
     "cut_key_degree2_moments",
+    "cut_query_degree2_moments",
+    "readout_probe_moments",
+    "factored_query_replay",
     "cut_mixing_scalar_contraction",
     "cut_estimate_cuda_graph",
     "resident_merge_scorer",
     "response_ranked_mlp_routes",
-    "batched_update_telemetry"
+    "batched_update_telemetry",
+    "fused_gluon_chain_kernels",
+    "sharded_anvil_bf16_async_collectives",
+    "split_identity_graph"
   ],
   "torch_version": "2.10.0+cu128",
   "merge_sketch": {
@@ -96,7 +88,7 @@
     "seed": 0
   },
   "identity": {
-    "updates": 300,
+    "updates": 355,
     "schedule_updates": 1831,
     "batch": 8,
     "sequence_len": 1024,
@@ -147,13 +139,13 @@
     "lr_wte": 1.8,
     "lr_value_embeds": 1.8,
     "lr_lambdas": 0.006,
-    "anvil_lr": 0.032,
+    "anvil_lr": 0.04,
     "anvil_wd": 2.25
   },
   "cut_anvil_decay": {
     "early_multiplier": 1.0,
     "late_multiplier": 0.0,
-    "late_after_updates": 402,
-    "horizon": 1523
+    "late_after_updates": 387,
+    "horizon": 1468
   }
 }
