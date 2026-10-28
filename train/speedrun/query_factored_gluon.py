@@ -1,5 +1,8 @@
-"""Gluon (Hopper) factored query replay: query_factored.fused_query_replay_factored's math with the K = 64 GEMM on
-wgmma and several CTAs per SM to hide the replay epilogue.
+"""Gluon (Hopper) factored query replay: the routed query replay right after a root, from the root's factors. The root
+output is delta = bf16(bf16(step * frame + bf16(change @ Wo[routes])) * scale), so its raw queries delta @ w_q^T are,
+up to delta's two bf16 roundings, scale * (change @ A_t + step * F[move]) with A_t = Wo[routes_t] @ w_q^T (64 x C per
+token) and F = frame @ w_q^T (P x C): a K = 64 GEMM per tile (on wgmma) instead of K = C, and no delta read; several
+CTAs per SM hide the replay epilogue.
 
 A CTA (one warpgroup) takes BM = 64 moves x one head pair for TOK consecutive tokens: per token the change tile
 (BM x 64) and the token's transposed factor slice A_t^T (2 D x 64, w_q's rows interleaved per head so each RoPE pair
@@ -19,7 +22,6 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from query_gluon import EPS, _replay_pair, interleave_wq
 
 CONFIG = dict(BM=64, TOK=8, STAGES=1, num_warps=4)  # one TMA stage: 49 KB, 4 CTAs/SM (two stages, 3 CTAs: 0.78 ms)
-_SMS = {}
 
 
 @gluon.jit
@@ -156,7 +158,7 @@ def _(wo, routes, basis, w_q):
 def fused_query_replay_factored_gluon(change: torch.Tensor, steps: torch.Tensor, scale: torch.Tensor,
     at: torch.Tensor, f: torch.Tensor, r0: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inv: torch.Tensor,
     shift: torch.Tensor, keys: torch.Tensor, prob: torch.Tensor) -> torch.Tensor:
-    """query_factored.fused_query_replay_factored with at / f from query_factors_t -> weights (n, P, H * K) bf16."""
+    """The factored replay's response weights (n, P, H * K) bf16, at / f from query_factors_t."""
     n, p, r = change.shape
     _, heads, count, width = keys.shape
     c = heads * width

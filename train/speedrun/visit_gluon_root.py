@@ -232,36 +232,3 @@ def _(steps, basis, projection, wo, routes, clean, inv0, inv, scale, next_x, del
       torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32))
 
 
-@torch.library.custom_op('visit_kernel::fused_root_visit_fast', mutates_args=())
-def fused_root_visit_fast(steps: torch.Tensor, basis: torch.Tensor, projection: torch.Tensor, wo: torch.Tensor,
-    routes: torch.Tensor, clean: torch.Tensor, inv0: torch.Tensor, inv: torch.Tensor, scale: torch.Tensor,
-    next_x: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """fused_root_visit: out (n, P, D) bf16 and, with next_x, the query-norm sums (n, P, 2, 1); basis is the signed
-    Hadamard frame, read as bf16 (exact: its entries are +-1)."""
-    n, p, d, r = steps.shape[0], basis.shape[0], wo.shape[1], routes.shape[1]
-    assert p % 64 == 0 and d % 64 == 0
-    cfg = dict(ROOT_CONFIGS[r])
-    ctas = cfg.pop('CTAS')
-    out = torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16)
-    stats = torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32)
-    layout = gl.NVMMASharedLayout.get_default_for([64, 64], gl.bfloat16)
-    out_desc = TensorDescriptor.from_tensor(out.view(n * p, d), [64, 64], layout)
-    dev = wo.device.index
-    if dev not in _SMS:
-        _SMS[dev] = (132 if wo.device.type == 'cpu'
-          else torch.cuda.get_device_properties(wo.device).multi_processor_count)
-    tiles = n * (p // 64)
-    f32 = lambda z: z.float().contiguous()
-    frame_desc = TensorDescriptor.from_tensor(basis.to(torch.bfloat16).contiguous(), [64, 64], layout)
-    _root_kernel[(min(tiles, ctas * _SMS[dev]),)](out_desc, frame_desc, out_desc, f32(steps),
-      f32(projection), wo.contiguous(), routes.contiguous(), f32(clean), f32(inv0), f32(inv), scale,
-      f32(next_x) if next_x is not None else out, stats, tiles, p, d, r, QSTATS=next_x is not None, num_warps=4,
-      **cfg)
-    return out, stats
-
-
-@fused_root_visit_fast.register_fake
-def _(steps, basis, projection, wo, routes, clean, inv0, inv, scale, next_x):
-    n, p, d = steps.shape[0], basis.shape[0], wo.shape[1]
-    return (torch.empty((n, p, d), device=wo.device, dtype=torch.bfloat16),
-      torch.empty((n, p, 2, 1), device=wo.device, dtype=torch.float32))

@@ -395,27 +395,6 @@ def launch_chain(n, p, d, block_a, block_b, vectors, stats, root=None, **overrid
     return stats
 
 
-@torch.library.custom_op('visit_kernel::fused_visit_readout_fast', mutates_args=())
-def fused_visit_readout_fast(delta: torch.Tensor, x_a: torch.Tensor, fc_a: torch.Tensor, wo_a: torch.Tensor,
-    routes_a: torch.Tensor, clean_a: torch.Tensor, scale_a: torch.Tensor, x_b: torch.Tensor, fc_b: torch.Tensor,
-    wo_b: torch.Tensor, routes_b: torch.Tensor, clean_b: torch.Tensor, xl: torch.Tensor, target: torch.Tensor,
-    mu: torch.Tensor, nu: torch.Tensor, diag: torch.Tensor) -> torch.Tensor:
-    """fused_readout_visit_fast(fused_visit_fast(delta, x_a, fc_a, wo_a, routes_a, clean_a, scale_a), x_b, fc_b,
-    wo_b, routes_b, clean_b, xl, target, mu, nu, diag) in one kernel: the readout moments (n, P, 6) fp32."""
-    f32 = lambda z: z.float().contiguous()
-    n, p, d = delta.shape
-    stats = torch.empty((n, p, 6), device=delta.device, dtype=torch.float32)
-    return launch_chain(n, p, d, (delta.contiguous(), f32(x_a), fc_a.contiguous(), wo_a.contiguous(),
-      routes_a.contiguous(), f32(clean_a), scale_a), (f32(x_b), fc_b.contiguous(), wo_b.contiguous(),
-      routes_b.contiguous(), f32(clean_b)), tuple(f32(z) for z in (xl, target, mu, nu, diag)), stats)
-
-
-@fused_visit_readout_fast.register_fake
-def _(delta, x_a, fc_a, wo_a, routes_a, clean_a, scale_a, x_b, fc_b, wo_b, routes_b, clean_b, xl, target, mu, nu,
-    diag):
-    return torch.empty((*delta.shape[:2], 6), device=delta.device, dtype=torch.float32)
-
-
 @torch.library.custom_op('visit_kernel::fused_root_readout_fast', mutates_args=())
 def fused_root_readout_fast(steps: torch.Tensor, basis: torch.Tensor, projection: torch.Tensor, wo_a: torch.Tensor,
     routes_a: torch.Tensor, clean_a: torch.Tensor, inv0: torch.Tensor, inv: torch.Tensor, scale_a: torch.Tensor,

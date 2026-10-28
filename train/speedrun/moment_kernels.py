@@ -76,39 +76,6 @@ def _by_token(row, H: tl.constexpr, LAYER, TOKEN, C: tl.constexpr, Map=None, MAP
 
 # --- lse and center ------------------------------------------------------------------------------------------------
 
-@triton.jit
-def _implicit_key_statistics(Q, K, Values, Hub, LSE, Center, T: tl.constexpr, Window: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, PREC: tl.constexpr):
-    tile, head = tl.program_id(0), tl.program_id(1)
-    query = tile * BM + tl.arange(0, BM)
-    dims = tl.arange(0, 64)
-    src = tl.arange(0, BN)
-    base = head * T * 64
-    q = tl.load(Q + base + query[:, None] * 64 + dims[None, :])
-    hub = tl.load(Hub + base + query[:, None] * 64 + dims[None, :])
-    maximum = tl.full((BM,), float('-inf'), tl.float32)
-    total = tl.zeros((BM,), tl.float32)
-    score_sum = tl.zeros((BM,), tl.float32)
-    first = tl.maximum(tile * BM - Window, 0) // BN
-    last = tl.cdiv((tile + 1) * BM, BN)
-    for block in range(first, last):
-        source = block * BN + src
-        k = tl.load(K + base + source[:, None] * 64 + dims[None, :])
-        v = tl.load(Values + base + source[:, None] * 64 + dims[None, :])
-        logits = tl.dot(q, tl.trans(k), input_precision=PREC) * 0.125
-        scores = tl.dot(hub, tl.trans(v), input_precision=PREC)
-        allowed = (source[None, :] <= query[:, None]) & (query[:, None] - source[None, :] <= Window)
-        logits = tl.where(allowed, logits, float('-inf'))
-        next_max = tl.maximum(maximum, tl.max(logits, 1))
-        safe_max = tl.where(next_max == float('-inf'), 0.0, next_max)
-        rescale = tl.exp(maximum - safe_max)
-        prob = tl.exp(logits - safe_max[:, None])
-        total = total * rescale + tl.sum(prob, 1)
-        score_sum = score_sum * rescale + tl.sum(prob * scores, 1)
-        maximum = next_max
-    tl.store(LSE + head * T + query, maximum + tl.log(total))
-    tl.store(Center + head * T + query, score_sum / total)
-
 
 @triton.jit
 def _implicit_block(q, hub, K, Values, base, query, block, maximum, total, score_sum, Window: tl.constexpr,
@@ -165,39 +132,23 @@ def _implicit_key_statistics_edges(Q, K, Values, Hub, LSE, Center, T: tl.constex
 
 
 def _implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
-                          window: int, edges: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+                          window: int) -> tuple[torch.Tensor, torch.Tensor]:
     h, t, _ = q.shape
     q, k, values, hub = (z.contiguous() for z in (q, k, values, hub))
     lse = torch.empty((h, t), device=q.device)
     center = torch.empty_like(lse)
     c = IMPLICIT_CONFIG
-    if edges:
-        assert c['BM'] == c['BN'] and window % c['BN'] == 0 and t % c['BM'] == 0
-        _implicit_key_statistics_edges[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window,
-            B=c['BM'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
-    else:
-        _implicit_key_statistics[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window, BM=c['BM'],
-            BN=c['BN'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
+    assert c['BM'] == c['BN'] and window % c['BN'] == 0 and t % c['BM'] == 0
+    _implicit_key_statistics_edges[(t // c['BM'], h)](q, k, values, hub, lse, center, T=t, Window=window,
+        B=c['BM'], PREC=PREC, num_warps=c['num_warps'], num_stages=c['num_stages'])
     return lse, center
-
-
-@torch.library.custom_op('moment_kernels::implicit_key_context', mutates_args=())
-def implicit_key_context(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
-                         window: int) -> tuple[torch.Tensor, torch.Tensor]:
-    return _implicit_key_context(q, k, values, hub, window)
-
-
-@implicit_key_context.register_fake
-def _(q, k, values, hub, window):
-    h, t, _ = q.shape
-    return q.new_empty((h, t)), q.new_empty((h, t))
 
 
 @torch.library.custom_op('moment_kernels::implicit_key_context_edges', mutates_args=())
 def implicit_key_context_edges(q: torch.Tensor, k: torch.Tensor, values: torch.Tensor, hub: torch.Tensor,
                                window: int) -> tuple[torch.Tensor, torch.Tensor]:
     """implicit_key_context (same outputs up to summation order) masking only the key blocks the window cuts."""
-    return _implicit_key_context(q, k, values, hub, window, edges=True)
+    return _implicit_key_context(q, k, values, hub, window)
 
 
 @implicit_key_context_edges.register_fake
@@ -358,25 +309,6 @@ def moment_query_scores(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: 
 @moment_query_scores.register_fake
 def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, repeat, window=None):
     return None
-
-
-@torch.library.custom_op('moment_kernels::moment_query_scores_by_token', mutates_args=())
-def moment_query_scores_by_token(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, hub: torch.Tensor,
-                                 raw: torch.Tensor, sq: torch.Tensor, side: torch.Tensor, cos: torch.Tensor,
-                                 sin: torch.Tensor, lse: torch.Tensor, hub_out: torch.Tensor, steps: torch.Tensor,
-                                 heads: int, window: int | None = None) -> torch.Tensor:
-    """moment_query_scores' credits as (layers, T, heads * D) fp32 (the rows are heads of rows // heads layers):
-    out[j] is layer j's query credit as the reference's out[0, rows].float().transpose(0, 1).reshape(T, -1)."""
-    rows, t, d = q.shape
-    out = torch.empty((rows // heads, t, heads * d), device=q.device)
-    _moment_query_scores(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, out, d // 16, window, heads)
-    return out
-
-
-@moment_query_scores_by_token.register_fake
-def _(q, k, v, hub, raw, sq, side, cos, sin, lse, hub_out, steps, heads, window=None):
-    rows, t, d = q.shape
-    return q.new_empty((rows // heads, t, heads * d), dtype=torch.float32)
 
 
 @torch.library.custom_op('moment_kernels::moment_query_scores_into', mutates_args=('out',))
@@ -602,49 +534,9 @@ def _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, 
     return key.view(h, t, d) if out_heads == 1 else key, raw_value.view(h, t, d) if out_heads == 1 else raw_value
 
 
-@torch.library.custom_op('moment_kernels::key_credits', mutates_args=())
-def key_credits(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor, values: torch.Tensor,
-                hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, window: int,
-                sigma: float) -> torch.Tensor:
-    """batched_key_scores' key scan: (heads, tokens, head_dim) contiguous inputs, any number of stacked heads."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, False)[0]
-
-
-@key_credits.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma):
-    return torch.empty_like(k_raw)
-
-
-@torch.library.custom_op('moment_kernels::key_and_raw_value_credits', mutates_args=())
-def key_and_raw_value_credits(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                              values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor,
-                              sin: torch.Tensor, window: int, sigma: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """key_credits and the raw value credit (value_credits' first output) in one pass."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, True)
-
-
-@key_and_raw_value_credits.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma):
-    return torch.empty_like(k_raw), torch.empty_like(hub)
-
-
 def _by_token_shape(x, heads):
     rows, t, d = x.shape
     return (rows // heads, t, heads * d)
-
-
-@torch.library.custom_op('moment_kernels::key_credits_by_token', mutates_args=())
-def key_credits_by_token(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                         values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor, cos: torch.Tensor,
-                         sin: torch.Tensor, window: int, sigma: float, heads: int) -> torch.Tensor:
-    """key_credits as (layers, T, heads * D) (the rows are heads of rows // heads layers): out[j] is layer j's key
-    credit as key[rows of j].transpose(0, 1).reshape(T, -1)."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, False, heads)[0]
-
-
-@key_credits_by_token.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, heads):
-    return k_raw.new_empty(_by_token_shape(k_raw, heads))
 
 
 @torch.library.custom_op('moment_kernels::key_credits_into', mutates_args=('out',))
@@ -660,21 +552,6 @@ def key_credits_into(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, ls
 @key_credits_into.register_fake
 def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, out, layers=None):
     return None
-
-
-@torch.library.custom_op('moment_kernels::key_and_raw_value_credits_by_token', mutates_args=())
-def key_and_raw_value_credits_by_token(qp: torch.Tensor, kp: torch.Tensor, k_raw: torch.Tensor, lse: torch.Tensor,
-                                       values: torch.Tensor, hub: torch.Tensor, center: torch.Tensor,
-                                       cos: torch.Tensor, sin: torch.Tensor, window: int, sigma: float,
-                                       heads: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """key_and_raw_value_credits, both as (layers, T, heads * D)."""
-    return _key_scan(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, True, heads)
-
-
-@key_and_raw_value_credits_by_token.register_fake
-def _(qp, kp, k_raw, lse, values, hub, center, cos, sin, window, sigma, heads):
-    shape = _by_token_shape(k_raw, heads)
-    return k_raw.new_empty(shape), k_raw.new_empty(shape)
 
 
 # --- value credits -------------------------------------------------------------------------------------------------
@@ -725,30 +602,6 @@ def _value_pass(q, k, lse, source, window, in_heads=1, out_heads=1, out=None, la
     return out
 
 
-@torch.library.custom_op('moment_kernels::raw_value_credits', mutates_args=())
-def raw_value_credits(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, hub: torch.Tensor,
-                      window: int) -> torch.Tensor:
-    """sum_s p * hub (value_credits' raw output) for (heads, tokens, 64) contiguous inputs, heads stacked freely."""
-    return _value_pass(q, k, lse, hub, window)
-
-
-@raw_value_credits.register_fake
-def _(q, k, lse, hub, window):
-    return torch.empty_like(hub)
-
-
-@torch.library.custom_op('moment_kernels::terminal_value_credits', mutates_args=())
-def terminal_value_credits(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, corrected: torch.Tensor,
-                           window: int) -> torch.Tensor:
-    """sum_s p * corrected (value_credits' terminal output), heads stacked freely."""
-    return _value_pass(q, k, lse, corrected.contiguous(), window)
-
-
-@terminal_value_credits.register_fake
-def _(q, k, lse, corrected, window):
-    return torch.empty_like(corrected)
-
-
 @torch.library.custom_op('moment_kernels::raw_value_credits_by_token', mutates_args=())
 def raw_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, hub: torch.Tensor, window: int,
                                heads: int) -> torch.Tensor:
@@ -760,20 +613,6 @@ def raw_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tens
 @raw_value_credits_by_token.register_fake
 def _(q, k, lse, hub, window, heads):
     return hub.new_empty(_by_token_shape(hub, heads))
-
-
-@torch.library.custom_op('moment_kernels::terminal_value_credits_by_token', mutates_args=())
-def terminal_value_credits_by_token(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor, corrected: torch.Tensor,
-                                    window: int) -> torch.Tensor:
-    """terminal_value_credits with corrected and the output by token, (layers, T, heads * 64) contiguous: corrected[j]
-    is layer j's (chain + extra) @ c_proj^T as the matmul writes it."""
-    heads = corrected.shape[-1] // q.shape[-1]
-    return _value_pass(q, k, lse, corrected.contiguous(), window, heads, heads)
-
-
-@terminal_value_credits_by_token.register_fake
-def _(q, k, lse, corrected, window):
-    return torch.empty_like(corrected)
 
 
 @torch.library.custom_op('moment_kernels::terminal_value_credits_into', mutates_args=('out',))
@@ -790,9 +629,3 @@ def _(q, k, lse, corrected, window, out, layers=None):
     return None
 
 
-def value_credits(context, corrected, window):
-    """Drop-in for run.py's value_credits: (raw, terminal) for one layer."""
-    q, k, raw, cos, sin, lse, (v, hub, center) = context
-    paired = torch.cat((hub.contiguous(), corrected.contiguous()), dim=-1)
-    out = _value_pass(q.contiguous(), k.contiguous(), lse.contiguous(), paired, window)
-    return out[..., :64].contiguous(), out[..., 64:].contiguous()
